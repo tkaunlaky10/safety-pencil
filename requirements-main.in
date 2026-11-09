@@ -1,0 +1,16 @@
+# Main venv (Python 3.12). Lock with: uv pip compile requirements-main.in --python-version 3.12 -o requirements-main.lock.txt
+# transformers is pinned below 5.22 because AuditKIT requires it; the Lexsi repos are pinned to the commits read on 9 Nov.
+transformers==5.21.1
+peft
+accelerate
+datasets
+huggingface_hub
+safetune @ git+https://github.com/Lexsi-Labs/SafeTune@1d824f026742fe2ce58491a8414f51a264931840
+auditkit[transformers,interop] @ git+https://github.com/Lexsi-Labs/AuditKIT@9da5838e61ef54d560a37605ddbcb19aceded9b3
+curatorkit[hf,generation] @ git+https://github.com/Lexsi-Labs/CuratorKIT@cee1aed21d14992f650c5dfe09094b9625d0ce87
+scipy
+numpy
+pandas
+matplotlib
+python-dotenv
+pytest

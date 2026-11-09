@@ -1,0 +1,5 @@
+# CircuitKIT venv (Python 3.12), kept separate because CircuitKIT pins transformer-lens==3.8.0.
+# Always import circuitkit before transformer_lens.
+circuitkit @ git+https://github.com/Lexsi-Labs/CircuitKIT@227fafdaf1ae78ac1de492da07d8173d16f8863c
+scipy
+python-dotenv

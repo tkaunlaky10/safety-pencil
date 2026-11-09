@@ -1,0 +1,30 @@
+Patch for Lexsi-Labs/CircuitKIT at 227fafdaf1ae78ac1de492da07d8173d16f8863c (LSAL; modified copy).
+Made for the safety-pencil hackathon entry, 9 Nov 2026. See patches/README.md for what it changes.
+Apply with: git -C <clone at that commit> apply CircuitKIT.patch
+
+diff --git a/src/circuitkit/backends/eap/attribute_node.py b/src/circuitkit/backends/eap/attribute_node.py
+index ad665ae..3a781ad 100644
+--- a/src/circuitkit/backends/eap/attribute_node.py
++++ b/src/circuitkit/backends/eap/attribute_node.py
+@@ -167,7 +167,7 @@ def make_hooks_and_matrices(
+         fwd_index = graph.forward_index(node)
+         fwd_hooks_corrupted.append((node.out_hook, partial(activation_hook, fwd_index)))
+         fwd_hooks_clean.append((node.out_hook, partial(activation_hook, fwd_index, add=False)))
+-        bwd_hooks.append((node.in_hook, partial(gradient_hook, fwd_index, fwd_index)))
++        bwd_hooks.append((node.out_hook, partial(gradient_hook, fwd_index, fwd_index)))
+ 
+     return (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference
+ 
+diff --git a/tests/backends/tl_compat/test_cohere_parity.py b/tests/backends/tl_compat/test_cohere_parity.py
+index 03ee41e..e14d4df 100644
+--- a/tests/backends/tl_compat/test_cohere_parity.py
++++ b/tests/backends/tl_compat/test_cohere_parity.py
+@@ -36,7 +36,7 @@ import pytest
+ import torch
+ import torch.nn.functional as F
+ 
+-MODEL_NAME = "CohereLabs/tiny-aya-base"
++MODEL_NAME = os.environ.get("CIRCUITKIT_PARITY_MODEL", "CohereLabs/tiny-aya-base")
+ 
+ # Next-token distribution tolerances (the plan's gate: KL < 1e-4).
+ KL_TOL = 1e-4

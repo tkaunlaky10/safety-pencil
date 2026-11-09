@@ -1,0 +1,454 @@
+Patch for Lexsi-Labs/CuratorKIT at cee1aed21d14992f650c5dfe09094b9625d0ce87 (LSAL; modified copy).
+Made for the safety-pencil hackathon entry, 9 Nov 2026. See patches/README.md for what it changes.
+Apply with: git -C <clone at that commit> apply CuratorKIT.patch
+
+diff --git a/curatorkit/config.py b/curatorkit/config.py
+index 535172f..658119d 100644
+--- a/curatorkit/config.py
++++ b/curatorkit/config.py
+@@ -433,11 +433,11 @@ class ExporterConfig(BaseModel):
+     """One output format in the pipeline YAML (`exporters:` list).
+ 
+     `type` selects the exporter: "alpaca", "sharegpt", "messages", "grpo", "ppo",
+-    "dpo", or "corpus". Each exporter writes accepted samples to its own
+-    JSONL file in the output directory.
++    "dpo", "corpus", or "prompts_meta". Each exporter writes accepted samples
++    to its own JSONL file in the output directory.
+     """
+ 
+-    type: Literal["alpaca", "sharegpt", "messages", "grpo", "ppo", "dpo", "corpus"]
++    type: Literal["alpaca", "sharegpt", "messages", "grpo", "ppo", "dpo", "corpus", "prompts_meta"]
+ 
+ 
+ class PipelineConfig(BaseModel):
+diff --git a/curatorkit/connectors/pdf.py b/curatorkit/connectors/pdf.py
+index 36b24f9..59b4c74 100644
+--- a/curatorkit/connectors/pdf.py
++++ b/curatorkit/connectors/pdf.py
+@@ -29,7 +29,9 @@ from typing import Any
+ # Matches a sentence boundary: punctuation followed by whitespace followed by
+ # a capital letter. Avoids splitting on decimal numbers (3.14), abbreviations
+ # (U.S.), and lowercase continuations — all of which lack the capital lookahead.
+-_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
++# Devanagari has no capitals, so a danda (।) or double danda (॥) followed by
++# whitespace is a boundary on its own.
++_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z])|(?<=[।॥])\s+")
+ 
+ from curatorkit.interfaces import BaseReader
+ from curatorkit.schema import DataSample, ProvenanceRecord, RejectedSample
+@@ -313,6 +315,8 @@ class PDFReader(BaseReader):
+                         | "grpo" | "multiturn". Modes other than "chunk"
+                         trigger LLM generation per chunk (requires llm_model).
+       llm_model       — LiteLLM model string for generation modes.
++      ocr_lang        — MinerU OCR language (default "en"), passed as its
++                        lang_list entry.
+     """
+ 
+     def __init__(
+@@ -329,6 +333,7 @@ class PDFReader(BaseReader):
+         llm_temperature: float = 0.7,
+         llm_max_tokens: int = 1024,
+         llm_api_key: str | None = None,
++        ocr_lang: str = "en",
+     ) -> None:
+         self.path = Path(path)
+         self.chunk_strategy = chunk_strategy
+@@ -342,6 +347,7 @@ class PDFReader(BaseReader):
+         self.llm_temperature = llm_temperature
+         self.llm_max_tokens = llm_max_tokens
+         self.llm_api_key = llm_api_key
++        self.ocr_lang = ocr_lang
+ 
+         self.chunker = PDFChunker(
+             strategy=chunk_strategy,
+@@ -392,6 +398,8 @@ class PDFReader(BaseReader):
+                 "extract_tables": self.extract_tables,
+                 "output_mode": self.output_mode,
+                 "llm_model": self.llm_model,
++                # Only when non-default, so existing "en" hashes stay the same.
++                **({"ocr_lang": self.ocr_lang} if self.ocr_lang != "en" else {}),
+             },
+             sort_keys=True,
+         )
+@@ -570,7 +578,7 @@ class PDFReader(BaseReader):
+         doc_analyze_streaming(
+             pdf_bytes_list=[pdf_bytes],
+             image_writer_list=[image_writer],
+-            lang_list=["en"],
++            lang_list=[self.ocr_lang],
+             on_doc_ready=on_doc_ready,
+             parse_method=parse_method,
+             formula_enable=False,
+diff --git a/curatorkit/curator.py b/curatorkit/curator.py
+index 7b780d5..6740817 100644
+--- a/curatorkit/curator.py
++++ b/curatorkit/curator.py
+@@ -395,6 +395,7 @@ class CuratorConfig:
+     pdf_chunk_overlap_tokens: int = 50
+     pdf_extract_tables: bool = False
+     pdf_ocr: bool = False
++    pdf_ocr_lang: str = "en"  # MinerU OCR language
+     pdf_min_section_tokens: int = 30  # heading strategy: merge sections shorter than this
+ 
+     # ── Diagnostic probe ─────────────────────────────────────────────────────
+@@ -1626,6 +1627,7 @@ class Curator:
+                 chunk_overlap_tokens=cfg.pdf_chunk_overlap_tokens,
+                 extract_tables=cfg.pdf_extract_tables,
+                 ocr=cfg.pdf_ocr,
++                ocr_lang=cfg.pdf_ocr_lang,
+                 min_section_tokens=cfg.pdf_min_section_tokens,
+                 output_mode=cfg.pdf_output_mode,
+                 llm_model=cfg.llm_model,
+@@ -1763,9 +1765,13 @@ class Curator:
+         provenance = build_provenance(
+             method=cfg.generation_task or "curate",
+             inputs=[
+-                dataset_input(s["name"], s.get("subset") or cfg.hf_subset or cfg.subset)
++                dataset_input(
++                    s["name"],
++                    s.get("subset") or cfg.hf_subset or cfg.subset,
++                    s.get("split") or cfg.split,
++                )
+                 if isinstance(s, dict)
+-                else dataset_input(s, cfg.hf_subset or cfg.subset)
++                else dataset_input(s, cfg.hf_subset or cfg.subset, cfg.split)
+                 for s in sources
+                 if s
+             ],
+diff --git a/curatorkit/exporters/__init__.py b/curatorkit/exporters/__init__.py
+index a41ff37..c5e19b7 100644
+--- a/curatorkit/exporters/__init__.py
++++ b/curatorkit/exporters/__init__.py
+@@ -4,6 +4,7 @@ from curatorkit.exporters.dpo import DPOExporter
+ from curatorkit.exporters.grpo import GRPOExporter
+ from curatorkit.exporters.messages import MessagesExporter
+ from curatorkit.exporters.ppo import PPOExporter
++from curatorkit.exporters.prompts_meta import PromptsMetaExporter
+ from curatorkit.exporters.sharegpt import ShareGPTExporter
+ 
+ # export_formats name -> exporter. The stem of each exporter's `filename` is the
+@@ -16,6 +17,7 @@ EXPORTERS = {
+     "grpo": GRPOExporter,
+     "ppo": PPOExporter,
+     "corpus": CorpusExporter,
++    "prompts_meta": PromptsMetaExporter,
+ }
+ 
+ __all__ = [
+@@ -26,5 +28,6 @@ __all__ = [
+     "GRPOExporter",
+     "MessagesExporter",
+     "PPOExporter",
++    "PromptsMetaExporter",
+     "ShareGPTExporter",
+ ]
+diff --git a/curatorkit/exporters/compatibility.py b/curatorkit/exporters/compatibility.py
+index 17efbd5..9fe88d3 100644
+--- a/curatorkit/exporters/compatibility.py
++++ b/curatorkit/exporters/compatibility.py
+@@ -56,6 +56,11 @@ TASK_TYPE_EXPORT_FORMATS: dict[str, list[str]] = {
+     "source_chunk": ["corpus"],
+ }
+ 
++# Formats compatible with every task_type in TASK_TYPE_EXPORT_FORMATS but kept
++# out of its lists, so resolve_export_formats() never auto-selects them — they
++# are opt-in via an explicit export_formats list.
++ANY_TASK_TYPE_EXPORT_FORMATS: frozenset[str] = frozenset({"prompts_meta"})
++
+ # generation_task -> the task_type it produces.
+ GENERATION_TASK_OUTPUT_TYPE: dict[str, str] = {
+     "qa": "instruction_following",
+@@ -87,12 +92,16 @@ def is_compatible(task_type: str, export_format: str) -> bool:
+     task_type is never compatible with anything (conservative default —
+     silently accepting an unknown shape is how the original instruction_
+     following-into-grpo/ppo/corpus bug happened)."""
++    if export_format.lower() in ANY_TASK_TYPE_EXPORT_FORMATS:
++        return task_type in TASK_TYPE_EXPORT_FORMATS
+     return export_format.lower() in TASK_TYPE_EXPORT_FORMATS.get(task_type, [])
+ 
+ 
+ def task_types_for(export_format: str) -> list[str]:
+     """Task_types one export format accepts — the inverse of
+     compatible_formats_for(), used to phrase each exporter's skip warning."""
++    if export_format.lower() in ANY_TASK_TYPE_EXPORT_FORMATS:
++        return sorted(TASK_TYPE_EXPORT_FORMATS)
+     return sorted(
+         task_type
+         for task_type, formats in TASK_TYPE_EXPORT_FORMATS.items()
+@@ -129,5 +138,5 @@ def misaligned_formats(generation_task: str, export_formats: list[str]) -> list[
+     task_type = GENERATION_TASK_OUTPUT_TYPE.get(generation_task)
+     if task_type is None:
+         return []
+-    compatible = set(compatible_formats_for(task_type))
++    compatible = set(compatible_formats_for(task_type)) | ANY_TASK_TYPE_EXPORT_FORMATS
+     return [fmt for fmt in export_formats if fmt.lower() not in compatible]
+diff --git a/curatorkit/manifest.py b/curatorkit/manifest.py
+index 9ab96d2..a488242 100644
+--- a/curatorkit/manifest.py
++++ b/curatorkit/manifest.py
+@@ -81,9 +81,15 @@ def read_provenance(path: Any) -> dict[str, Any] | None:
+         return None
+ 
+ 
+-def dataset_input(ref: Any, config: str | None = None) -> dict[str, Any]:
++def dataset_input(ref: Any, config: str | None = None, split: str | None = None) -> dict[str, Any]:
+     """One `inputs[]` entry, carrying the parent's provenance when it has one."""
+-    return {"kind": "dataset", "ref": str(ref), "config": config, "provenance": read_provenance(ref)}
++    return {
++        "kind": "dataset",
++        "ref": str(ref),
++        "config": config,
++        "split": split,
++        "provenance": read_provenance(ref),
++    }
+ 
+ 
+ def step_models(steps: list) -> dict[str, str | None]:
+diff --git a/tests/unit/test_hf_interop.py b/tests/unit/test_hf_interop.py
+index 70acdb0..6465b7c 100644
+--- a/tests/unit/test_hf_interop.py
++++ b/tests/unit/test_hf_interop.py
+@@ -146,7 +146,8 @@ def test_curator_run_writes_loadable_folder_and_provenance(tmp_path):
+     assert prov["version"] == curatorkit.__version__ == importlib.metadata.version("curatorkit")
+     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", prov["created_at"])
+     assert prov["base_model"] is None and prov["method"] == "curate"
+-    assert prov["inputs"] == [{"kind": "dataset", "ref": str(seed), "config": None, "provenance": parent}]
++    assert prov["inputs"] == [{"kind": "dataset", "ref": str(seed), "config": None, "split": "train",
++                               "provenance": parent}]
+     # No generation task and no judge gate ran, so no model is claimed.
+     assert prov["params"]["generator_model"] is None and prov["params"]["judge_model"] is None
+     assert "lexsi_provenance.json" in (out / "checksums.txt").read_text()
+@@ -173,7 +174,8 @@ def test_provenance_records_generator_and_judge(tmp_path):
+     assert prov["params"]["generator_model"] == "openai/gen"
+     assert prov["params"]["judge_model"] == "openai/judge"
+     assert prov["params"]["export_formats"] == ["alpaca", "sharegpt", "messages"]  # auto for qa
+-    assert prov["inputs"] == [{"kind": "dataset", "ref": "org/data", "config": "en", "provenance": None}]
++    assert prov["inputs"] == [{"kind": "dataset", "ref": "org/data", "config": "en", "split": "train",
++                               "provenance": None}]
+ 
+ 
+ @pytest.mark.parametrize("filename", ["sft_messages.jsonl", "sft_sharegpt.jsonl"])
+diff --git a/tests/unit/test_pdf_chunker.py b/tests/unit/test_pdf_chunker.py
+index b219abd..b2e0f2f 100644
+--- a/tests/unit/test_pdf_chunker.py
++++ b/tests/unit/test_pdf_chunker.py
+@@ -96,3 +96,24 @@ class TestSentenceChunker:
+         chunker = PDFChunker(strategy="sentence", max_tokens=10, overlap_tokens=0)
+         chunks = chunker.chunk(blocks)
+         assert len(chunks) > 1
++
++    def test_splits_on_devanagari_danda(self):
++        text = "यह पहला वाक्य है। यह दूसरा वाक्य है॥ यह तीसरा वाक्य है।"
++        blocks = [{"type": "paragraph", "text": text, "page": 1}]
++        chunker = PDFChunker(strategy="sentence", max_tokens=5, overlap_tokens=0)
++        assert [c["text"] for c in chunker.chunk(blocks)] == [
++            "यह पहला वाक्य है।",
++            "यह दूसरा वाक्य है॥",
++            "यह तीसरा वाक्य है।",
++        ]
++
++    def test_english_boundaries_unchanged(self):
++        from curatorkit.connectors.pdf import _SENTENCE_BOUNDARY
++
++        text = "Pi is 3.14 in the U.S. too. lowercase stays. Next one! Done? Yes"
++        assert _SENTENCE_BOUNDARY.split(text) == [
++            "Pi is 3.14 in the U.S. too. lowercase stays.",
++            "Next one!",
++            "Done?",
++            "Yes",
++        ]
+diff --git a/curatorkit/exporters/prompts_meta.py b/curatorkit/exporters/prompts_meta.py
+new file mode 100644
+index 0000000..9a0705d
+--- /dev/null
++++ b/curatorkit/exporters/prompts_meta.py
+@@ -0,0 +1,84 @@
++"""
++PromptsMetaExporter — serialize prompts with their id, source and metadata.
++
++Output: {output_dir}/prompts_meta.jsonl
++Each line:
++    {
++        "id":         "<DataSample.id>",
++        "prompt":     "<DataSample.instruction>",
++        "task_type":  "prompt_only",
++        "source_uri": "<DataSample.source_uri>",
++        "metadata":   {"language": "...", "harm_category": "...", ...},
++        "input":      "...",   # only when the sample has a non-empty input
++        "output":     "..."    # only when the sample has a non-empty output
++    }
++
++PPOExporter writes only {"prompt"}, dropping the id, source and metadata
++(language, harm_category, ...) needed to stratify, split or audit a prompt
++set afterwards; this exporter keeps them.
++
++Every task_type in curatorkit.exporters.compatibility is accepted (see
++ANY_TASK_TYPE_EXPORT_FORMATS), but the format is never auto-selected: add
++"prompts_meta" to export_formats to get it. Samples with an empty
++instruction (e.g. language_modeling chunks) are skipped and counted in a
++warning.
++"""
++
++from __future__ import annotations
++
++import json
++import warnings
++from pathlib import Path
++
++from curatorkit.exporters.compatibility import is_compatible, task_types_for
++from curatorkit.interfaces import BaseExporter
++from curatorkit.schema import DataSample
++
++_FORMAT = "prompts_meta"
++
++
++class PromptsMetaExporter(BaseExporter):
++    """Export prompts with id, task_type, source_uri and metadata."""
++
++    filename = "prompts_meta.jsonl"
++    columns = {
++        "id, prompt, task_type, source_uri": "string",
++        "metadata": "object (DataSample.metadata as-is)",
++        "input, output": "string (only on rows whose sample has one)",
++    }
++
++    def export(self, samples: list[DataSample], output_dir: Path) -> None:
++        output_path = output_dir / self.filename
++        skipped = 0
++        exported = 0
++
++        with open(output_path, "w", encoding="utf-8") as f:
++            for sample in samples:
++                if not is_compatible(sample.task_type, _FORMAT) or not sample.instruction.strip():
++                    skipped += 1
++                    continue
++                record = {
++                    "id": sample.id,
++                    "prompt": sample.instruction,
++                    "task_type": sample.task_type,
++                    "source_uri": sample.source_uri,
++                    "metadata": sample.metadata or {},
++                }
++                if sample.input:
++                    record["input"] = sample.input
++                if sample.output:
++                    record["output"] = sample.output
++                # metadata is passed through from the source row, so it may hold
++                # values json can't encode natively (dates, ...): fall back to str.
++                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
++                exported += 1
++
++        if skipped:
++            task_types = {s.task_type for s in samples}
++            warnings.warn(
++                f"PromptsMetaExporter skipped {skipped}/{len(samples)} samples (wrote {exported}) — "
++                f"not task_type {task_types_for(_FORMAT)}, or empty instruction (sample "
++                f"task_type(s) seen: {sorted(task_types)}).",
++                UserWarning,
++                stacklevel=2,
++            )
+diff --git a/tests/unit/test_prompts_meta_exporter.py b/tests/unit/test_prompts_meta_exporter.py
+new file mode 100644
+index 0000000..e0c2dd9
+--- /dev/null
++++ b/tests/unit/test_prompts_meta_exporter.py
+@@ -0,0 +1,99 @@
++"""Tests for PromptsMetaExporter (export_formats "prompts_meta"): prompts keep
++their id, task_type, source_uri and metadata, unlike ppo.jsonl's bare prompt."""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from curatorkit.exporters import EXPORTERS
++from curatorkit.exporters.compatibility import (
++    TASK_TYPE_EXPORT_FORMATS,
++    is_compatible,
++    misaligned_formats,
++    resolve_export_formats,
++)
++from curatorkit.exporters.prompts_meta import PromptsMetaExporter
++from curatorkit.schema import DataSample
++
++
++def _rows(path):
++    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
++
++
++def test_registered_under_prompts_meta():
++    assert EXPORTERS["prompts_meta"] is PromptsMetaExporter
++
++
++def test_prompt_only_row_keeps_id_source_and_metadata(tmp_path):
++    sample = DataSample(
++        id="aya-hi-7",
++        source_uri="CohereForAI/aya_redteaming",
++        instruction="कोई हानिकारक प्रश्न?",
++        task_type="prompt_only",
++        metadata={"language": "Hindi", "harm_category": ["Violence"]},
++    )
++    PromptsMetaExporter().export([sample], tmp_path)
++    assert _rows(tmp_path / "prompts_meta.jsonl") == [
++        {
++            "id": "aya-hi-7",
++            "prompt": "कोई हानिकारक प्रश्न?",
++            "task_type": "prompt_only",
++            "source_uri": "CohereForAI/aya_redteaming",
++            "metadata": {"language": "Hindi", "harm_category": ["Violence"]},
++        }
++    ]
++    assert "कोई" in (tmp_path / "prompts_meta.jsonl").read_text(encoding="utf-8")
++
++
++def test_input_and_output_written_only_when_present(tmp_path):
++    samples = [
++        DataSample(source_uri="t", instruction="Q?", input="ctx", output="A.",
++                   task_type="instruction_following"),
++        DataSample(source_uri="t", instruction="Prompt", task_type="prompt_only"),
++    ]
++    PromptsMetaExporter().export(samples, tmp_path)
++    first, second = _rows(tmp_path / "prompts_meta.jsonl")
++    assert (first["input"], first["output"]) == ("ctx", "A.")
++    assert "input" not in second and "output" not in second
++
++
++def test_every_known_task_type_is_compatible_but_unknown_is_not():
++    for task_type in TASK_TYPE_EXPORT_FORMATS:
++        assert is_compatible(task_type, "prompts_meta")
++    assert not is_compatible("some_custom_type", "prompts_meta")
++    assert misaligned_formats("qa", ["alpaca", "prompts_meta"]) == []
++
++
++def test_never_auto_selected():
++    assert "prompts_meta" not in resolve_export_formats(None, {"prompt_only"})
++    assert "prompts_meta" not in resolve_export_formats("qa")
++
++
++def test_empty_prompt_and_unknown_task_type_are_skipped_and_warn(tmp_path):
++    samples = [
++        DataSample(source_uri="t", output="chunk text", task_type="language_modeling"),
++        DataSample(source_uri="t", instruction="Q?", task_type="some_custom_type"),
++        DataSample(source_uri="t", instruction="Keep me", task_type="prompt_only"),
++    ]
++    with pytest.warns(UserWarning, match=r"PromptsMetaExporter skipped 2/3"):
++        PromptsMetaExporter().export(samples, tmp_path)
++    assert [r["prompt"] for r in _rows(tmp_path / "prompts_meta.jsonl")] == ["Keep me"]
++
++
++def test_output_split_writes_prompts_meta_per_split(tmp_path):
++    from curatorkit.curator import Curator, CuratorConfig
++
++    samples = [
++        DataSample(source_uri="t", instruction=f"P{i}", task_type="prompt_only",
++                   metadata={"language": "English"})
++        for i in range(10)
++    ]
++    curator = Curator(CuratorConfig(
++        output_dir=str(tmp_path), export_formats=["prompts_meta"],
++        output_split={"factor": 0.6, "dev": 0.2, "test": 0.2},
++    ))
++    curator._export_splits(samples, tmp_path)
++    counts = {s: len(_rows(tmp_path / s / "prompts_meta.jsonl")) for s in ("factor", "dev", "test")}
++    assert counts == {"factor": 6, "dev": 2, "test": 2}

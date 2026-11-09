@@ -1,0 +1,165 @@
+Patch for Lexsi-Labs/SafeTune at 1d824f026742fe2ce58491a8414f51a264931840 (LSAL; modified copy).
+Made for the safety-pencil hackathon entry, 9 Nov 2026. See patches/README.md for what it changes.
+Apply with: git -C <clone at that commit> apply SafeTune.patch
+
+diff --git a/examples/demos/compare_recover.py b/examples/demos/compare_recover.py
+index eab2aa6..ad051fb 100644
+--- a/examples/demos/compare_recover.py
++++ b/examples/demos/compare_recover.py
+@@ -63,7 +63,7 @@ def main() -> int:
+          "Layer · task arithmetic"),
+         ("LoX", lambda: apply_lox(model=drift, base=base, aligned=aligned, rank=64),
+          "Low-rank · max safety"),
+-        ("C-Θ", lambda: apply_ctheta(target=drift, positive=base, negative=aligned,
++        ("C-Θ", lambda: apply_ctheta(target=drift, positive=aligned, negative=base,
+                                      circuit_info=None, strength=1.0),
+          "Circuit · balanced"),
+     ]
+diff --git a/src/safetune/core/optim/resta.py b/src/safetune/core/optim/resta.py
+index cbbd26f..325a867 100644
+--- a/src/safetune/core/optim/resta.py
++++ b/src/safetune/core/optim/resta.py
+@@ -54,6 +54,13 @@ class RESTAWrapper:
+         self._base = base_state_dict
+         self.keys = [k for k in aligned_state_dict
+                      if k in base_state_dict and self._matches_filter(k)]
++        for k in self.keys:
++            if aligned_state_dict[k].shape != base_state_dict[k].shape:
++                raise ValueError(
++                    f"RESTA: aligned and base tensors for {k!r} differ in shape "
++                    f"({tuple(aligned_state_dict[k].shape)} vs {tuple(base_state_dict[k].shape)}); "
++                    "the safety vector aligned - base needs the same architecture and vocabulary."
++                )
+         logger.info("RESTA: safety vector over %d parameters.", len(self.keys))
+ 
+     def _matches_filter(self, name: str) -> bool:
+diff --git a/src/safetune/interventions/recover/ctheta.py b/src/safetune/interventions/recover/ctheta.py
+index 81b2df3..62cd080 100644
+--- a/src/safetune/interventions/recover/ctheta.py
++++ b/src/safetune/interventions/recover/ctheta.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import logging
+ from typing import Iterable, List, Optional, Sequence
+ 
++import torch
+ import torch.nn as nn
+ 
+ from ._invariant import assert_mutates
+@@ -81,8 +82,9 @@ def apply_ctheta(
+         tp = sd_t[k]
+         if not (tp.shape == sd_p[k].shape == sd_n[k].shape):
+             continue
+-        delta = sd_p[k].to(tp.device, dtype=tp.dtype) - sd_n[k].to(tp.device, dtype=tp.dtype)
+-        sd_t[k] = tp + strength * delta
++        # Difference and update in fp32 (not the bf16 parameter dtype); cast only on write.
++        delta = sd_p[k].to(tp.device, dtype=torch.float32) - sd_n[k].to(tp.device, dtype=torch.float32)
++        sd_t[k] = (tp.float() + strength * delta).to(tp.dtype)
+         n_applied += 1
+ 
+     target.load_state_dict(sd_t, strict=False)
+diff --git a/src/safetune/interventions/recover/lox.py b/src/safetune/interventions/recover/lox.py
+index d8b2515..ad6f66d 100644
+--- a/src/safetune/interventions/recover/lox.py
++++ b/src/safetune/interventions/recover/lox.py
+@@ -105,8 +105,16 @@ def apply_lox(
+     new_state_dict = {}
+     n_extrapolated = 0
+     n_svd_failed = 0
++    # A tied weight (embed_tokens / lm_head) appears under several names but is one
++    # tensor: extrapolate it once and give its aliases the same result, so a later
++    # alias cannot overwrite it (load_state_dict: last write wins).
++    processed = {}  # (data_ptr, shape) -> name
+ 
+     for name, w in w_model.items():
++        key = (w.data_ptr(), w.shape) if torch.is_tensor(w) else None
++        if key in processed:
++            new_state_dict[name] = new_state_dict[processed[key]]
++            continue
+         # Default: keep the model's own weight (the LoX base point).
+         new_state_dict[name] = w
+ 
+@@ -143,6 +151,7 @@ def apply_lox(
+         m_device = m.to(w.device)
+         extrapolated = w.to(torch.float32) + coef * m_device
+         new_state_dict[name] = extrapolated.to(dtype)
++        processed[key] = name
+         n_extrapolated += 1
+ 
+     model.load_state_dict(new_state_dict, strict=False)
+diff --git a/src/safetune/runner/recover/_layer.py b/src/safetune/runner/recover/_layer.py
+index 92cba1e..6402317 100644
+--- a/src/safetune/runner/recover/_layer.py
++++ b/src/safetune/runner/recover/_layer.py
+@@ -108,12 +108,16 @@ class SafeLoRATrainer(_RecoverBase):
+ # ── SafeMergeTrainer ──────────────────────────────────────────────────────────
+ 
+ class SafeMergeTrainer(_RecoverBase):
+-    """SafeMERGE: Fisher-weighted safety merge.
++    """SafeMERGE: selective layer-wise safety merge.
++
++    A layer is merged with the aligned model when the cosine similarity between its
++    fine-tuning update and that update's projection onto the Safe-LoRA safety subspace
++    (built from aligned - base) is below ``threshold``.
+ 
+     Args:
+         base_model: base model.
+         aligned_model: aligned reference.
+-        threshold: Fisher mask threshold. Default 0.35.
++        threshold: cosine-similarity threshold. Default 0.35.
+         alpha: merge coefficient. Default 0.5.
+     """
+ 
+@@ -144,21 +148,25 @@ class SafeDeltaTrainer(_RecoverBase):
+     Args:
+         aligned_model: aligned model (source of safety delta).
+         strength: edit strength. Default 0.1.
++        hessian_inputs: optional ``{param_name: H or Hinv_diag}`` curvature passed to
++            ``apply_safe_delta``. Default None: data-free (H = I).
+     """
+ 
+     METHOD = "SafeDeltaTrainer"
+ 
+     def __init__(self, model=None, *, aligned_model=None,
+-                 strength: float = 0.1, **kwargs):
++                 strength: float = 0.1, hessian_inputs=None, **kwargs):
+         super().__init__(model, **kwargs)
+         self.aligned_model = aligned_model
+         self.strength = strength
++        self.hessian_inputs = hessian_inputs
+ 
+-    def apply(self, *, strength: float = None, **kwargs):
++    def apply(self, *, strength: float = None, hessian_inputs=None, **kwargs):
+         return R.apply_safe_delta(
+             self.model,
+             aligned=self.aligned_model,
+             strength=strength if strength is not None else self.strength,
++            hessian_inputs=hessian_inputs if hessian_inputs is not None else self.hessian_inputs,
+         )
+ 
+ # ── QReSafeTrainer ────────────────────────────────────────────────────────────
+diff --git a/src/safetune/runner/steer/_activation.py b/src/safetune/runner/steer/_activation.py
+index 1196023..e4fbcec 100644
+--- a/src/safetune/runner/steer/_activation.py
++++ b/src/safetune/runner/steer/_activation.py
+@@ -27,17 +27,19 @@ class RefusalDirectionTrainer(_SteerBase):
+ 
+     def __init__(self, model=None, tokenizer=None, *,
+                  layers=None, alpha: float = 20.0,
+-                 orthogonalize: bool = False, **kwargs):
++                 orthogonalize: bool = False, config=None, **kwargs):
+         super().__init__(model, tokenizer, **kwargs)
+         self.layers = layers
+         self.alpha = alpha
+         self.orthogonalize = orthogonalize
++        self.config = config  # optional RefusalDirectionConfig (pick_layer etc.); None -> defaults
+ 
+     def _do_calibrate(self, harmful=None, harmless=None, *, calib_n: int = 256,
+                   alpha: float = None, **kwargs):
+         if harmful is None or harmless is None:
+             harmful, harmless = self._default_calib(calib_n)
+-        direction, _, _ = S.extract_refusal_direction(self.model, self.tok, harmful, harmless)
++        direction, _, _ = S.extract_refusal_direction(self.model, self.tok, harmful, harmless,
++                                                      config=self.config)
+         strength = alpha if alpha is not None else self.alpha
+         return S.RefusalDirectionModel(
+             self.model,

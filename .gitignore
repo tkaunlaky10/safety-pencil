@@ -1,0 +1,21 @@
+# secrets
+.env
+# environments
+.venv/
+.venv-circuit/
+# large or sensitive outputs: checkpoints, factors, generations (raw completions never go in git)
+outputs/
+data/raw/
+*.safetensors
+*.pt
+*.bin
+wandb/
+# temporary AuditKIT cache (it stores raw completions)
+.cache/
+# python and notebooks
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+# patched Lexsi clones made by scripts/setup_lexsi.sh
+third_party/

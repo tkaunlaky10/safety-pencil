@@ -1,0 +1,288 @@
+Patch for Lexsi-Labs/AuditKIT at 9da5838e61ef54d560a37605ddbcb19aceded9b3 (LSAL; modified copy).
+Made for the safety-pencil hackathon entry, 9 Nov 2026. See patches/README.md for what it changes.
+Apply with: git -C <clone at that commit> apply AuditKIT.patch
+
+diff --git a/docs/guard_models.md b/docs/guard_models.md
+index 79d8bbf..69d008c 100644
+--- a/docs/guard_models.md
++++ b/docs/guard_models.md
+@@ -230,7 +230,7 @@ WildGuard additionally exposes its three fields
+ for p in r.predictions:
+     g = next(s for s in p.metadata["scores"] if s["name"].startswith("guard_judge"))
+     if g["value"] == 1.0:
+-        print(p.input, "->", g["metadata"].get("categories"))
++        print(p.prompt, "->", g["metadata"].get("categories"))
+ ```
+ 
+ ---
+diff --git a/src/auditkit/cache.py b/src/auditkit/cache.py
+index 31ca9e4..6e876b5 100644
+--- a/src/auditkit/cache.py
++++ b/src/auditkit/cache.py
+@@ -8,6 +8,12 @@ from pathlib import Path
+ from .report import RunResult
+ 
+ 
++def run_cache_enabled() -> bool:
++    """False when ``AUDITKIT_DISABLE_RUN_CACHE`` is "1", "true" or "yes": runs then
++    neither read nor write the on-disk run cache (which holds raw model outputs)."""
++    return os.environ.get("AUDITKIT_DISABLE_RUN_CACHE", "").strip().lower() not in ("1", "true", "yes")
++
++
+ class DiskCache:
+     """Persist RunResult objects keyed by run fingerprint.
+ 
+diff --git a/src/auditkit/lmeval_engine.py b/src/auditkit/lmeval_engine.py
+index adf9a26..0319066 100644
+--- a/src/auditkit/lmeval_engine.py
++++ b/src/auditkit/lmeval_engine.py
+@@ -22,7 +22,7 @@ import os
+ import re
+ from typing import Any, Optional, Union
+ 
+-from .cache import DiskCache
++from .cache import DiskCache, run_cache_enabled
+ from .errors import AuditKitError, CapabilityError, ExtraNotInstalled
+ from .lexsi_login import _lexsi_login
+ from .report import Prediction, RunResult
+@@ -420,8 +420,8 @@ def run_benchmark(
+             kwargs.setdefault(k, v)
+ 
+     fingerprint = _fingerprint(kwargs, model)
+-    cache = DiskCache()
+-    cached = cache.get(fingerprint)
++    cache = DiskCache() if run_cache_enabled() else None
++    cached = cache.get(fingerprint) if cache is not None else None
+     if cached is not None:
+         return cached
+ 
+@@ -486,7 +486,8 @@ def run_benchmark(
+             relay_obj.stop()
+ 
+     result = _to_runresult(raw, tasks, model, cfg, run_name, fingerprint)
+-    cache.set(fingerprint, result)
++    if cache is not None:
++        cache.set(fingerprint, result)
+     return result
+ 
+ 
+diff --git a/src/auditkit/metrics/rag_judge.py b/src/auditkit/metrics/rag_judge.py
+index a5c69f3..30324aa 100644
+--- a/src/auditkit/metrics/rag_judge.py
++++ b/src/auditkit/metrics/rag_judge.py
+@@ -121,7 +121,7 @@ def judge_identity(spec: Any) -> Any:
+         if stable:
+             return {"module": getattr(spec, "__module__", None), "callable": _default_callable_name(spec)}
+     # ponytail: uncacheable judges still write a (never re-read) cache file;
+-    # add a Runner no-cache flag if that disk use matters.
++    # set AUDITKIT_DISABLE_RUN_CACHE=1 if that disk use matters.
+     return f"uncacheable:{uuid.uuid4().hex}"
+ 
+ 
+diff --git a/src/auditkit/model/__init__.py b/src/auditkit/model/__init__.py
+index b879e01..0ad9825 100644
+--- a/src/auditkit/model/__init__.py
++++ b/src/auditkit/model/__init__.py
+@@ -12,8 +12,10 @@ greys out for chat-only APIs.
+ 
+ from __future__ import annotations
+ 
++import fnmatch
+ import hashlib
+ import importlib
++import os
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass, field
+ from typing import Any, Callable, Optional
+@@ -427,8 +429,47 @@ class Model(ABC):
+         ``HFGenModel(model="gpt2-medium")``) then silently collide into one
+         cached result. Every real backend consistently stores its checkpoint
+         string in ``self._model_name``, so including it here fixes this for
+-        all of them at once, with no per-backend override needed."""
+-        return {"name": self.name, "model": getattr(self, "_model_name", None)}
++        all of them at once, with no per-backend override needed.
++
++        A local checkpoint path also folds in its weight files' names, sizes and
++        mtimes, so retraining in place changes the fingerprint; hub ids are unchanged."""
++        model = getattr(self, "_model_name", None)
++        ident = {"name": self.name, "model": model}
++        weights = _local_weights_signature(model)
++        if weights is not None:
++            ident["weights"] = weights
++        return ident
++
++
++_WEIGHT_FILE_PATTERNS = ("*.safetensors", "*.bin", "*.pt", "adapter_model.*",
++                         "adapter_config.json", "config.json")
++
++
++def _local_weights_signature(path: Any) -> Optional[list]:
++    """``[name, size, mtime_ns]`` per weight file at a local *path*, or None.
++
++    A cheap stand-in for hashing the weights: a file path signs itself, a
++    directory signs its top-level files matching ``_WEIGHT_FILE_PATTERNS``.
++    Anything that isn't an existing local path (a hub id, a URL) returns None,
++    as does a directory with no such files, leaving the identity unchanged.
++    """
++    if not isinstance(path, str) or not path:
++        return None
++    try:
++        if os.path.isfile(path):
++            st = os.stat(path)
++            return [[os.path.basename(path), st.st_size, st.st_mtime_ns]]
++        if not os.path.isdir(path):
++            return None
++        sig = []
++        with os.scandir(path) as entries:
++            for entry in entries:
++                if entry.is_file() and any(fnmatch.fnmatchcase(entry.name, p) for p in _WEIGHT_FILE_PATTERNS):
++                    st = entry.stat()
++                    sig.append([entry.name, st.st_size, st.st_mtime_ns])
++    except OSError:
++        return None
++    return sorted(sig) or None
+ 
+ 
+ def _stable_capture_repr(value: Any) -> Optional[str]:
+@@ -620,9 +661,10 @@ class AutoModel:
+                         backend_cls = getattr(m, cls_name)
+                     except ImportError:
+                         raise ExtraNotInstalled(extra, f"pip install auditkit[{extra}]")
++                    name = opts.pop("name", None) or spec   # a caller's name= wins over the spec
+                     if model_name is None and prefix not in _BARE_PASSES_NONE:
+-                        return backend_cls(name=spec, **opts)
+-                    return backend_cls(model=model_name, name=spec, **opts)
++                        return backend_cls(name=name, **opts)
++                    return backend_cls(model=model_name, name=name, **opts)
+             for prefix in _T1_PREFIXES:
+                 if spec.startswith(prefix):
+                     raise AuditKitError(
+diff --git a/src/auditkit/runner.py b/src/auditkit/runner.py
+index 8c3f5ee..7438b7e 100644
+--- a/src/auditkit/runner.py
++++ b/src/auditkit/runner.py
+@@ -22,7 +22,7 @@ from dataclasses import asdict
+ from typing import Any, Optional
+ 
+ from .adapter import Adapter
+-from .cache import DiskCache
++from .cache import DiskCache, run_cache_enabled
+ from .errors import CapabilityError, ExtraNotInstalled, ModelError, ModelTimeout
+ from .metric import Metric
+ from .metrics.perf import LatencyStats, Throughput
+@@ -583,8 +583,8 @@ class Runner:
+         if isinstance(model_ref, str):
+             inputs.append(input_ref("model", model_ref))
+ 
+-        cache = DiskCache()
+-        cached = cache.get(fingerprint)
++        cache = DiskCache() if run_cache_enabled() else None
++        cached = cache.get(fingerprint) if cache is not None else None
+         if cached is not None:
+             cached.metadata = {**cached.metadata, "inputs": inputs}  # lineage of THIS call
+             return cached
+@@ -910,5 +910,6 @@ class Runner:
+             perf=perf,
+             metadata={"inputs": inputs, **notes},
+         )
+-        cache.set(fingerprint, result)
++        if cache is not None:
++            cache.set(fingerprint, result)
+         return result
+diff --git a/tests/test_fingerprint_stability.py b/tests/test_fingerprint_stability.py
+index c1eca5c..c42867a 100644
+--- a/tests/test_fingerprint_stability.py
++++ b/tests/test_fingerprint_stability.py
+@@ -11,6 +11,8 @@ model call instead of hitting the cache.
+ """
+ from __future__ import annotations
+ 
++import pytest
++
+ from auditkit.sample import Sample
+ from auditkit.scenario import ListScenario
+ 
+@@ -172,3 +174,66 @@ class TestAuditkitVersionInFingerprint:
+         monkeypatch.setattr(auditkit, "__version__", "0.0.0-test-b")
+         fp_b = rs.fingerprint()
+         assert fp_a != fp_b
++
++
++class TestLocalCheckpointWeightsInIdentity:
++    """A local checkpoint retrained in place keeps its path, so the model's
++    identity also folds in its weight files' names/sizes/mtimes."""
++
++    def test_retraining_in_place_changes_the_identity(self, tmp_path):
++        from auditkit.model import AutoModel
++
++        weights = tmp_path / "model.safetensors"
++        weights.write_bytes(b"old")
++        (tmp_path / "README.md").write_text("not a weight file")
++        before = AutoModel.resolve(f"hf:{tmp_path}").identity()
++        weights.write_bytes(b"retrained")
++        after = AutoModel.resolve(f"hf:{tmp_path}").identity()
++        assert before != after
++        assert [entry[0] for entry in after["weights"]] == ["model.safetensors"]
++        assert AutoModel.resolve(f"hf:{weights}").identity()["weights"][0][0] == "model.safetensors"
++
++    def test_hub_id_identity_is_unchanged(self):
++        from auditkit.model import AutoModel
++
++        assert AutoModel.resolve("hf:org/not-a-local-path").identity() == {
++            "name": "hf:org/not-a-local-path", "model": "org/not-a-local-path"}
++
++
++class TestRunCacheOptOut:
++    """AUDITKIT_DISABLE_RUN_CACHE skips both reading and writing the run cache."""
++
++    @pytest.mark.parametrize("value,enabled", [
++        (None, True), ("", True), ("0", True), ("false", True),
++        ("1", False), ("true", False), ("YES", False), (" yes ", False),
++    ])
++    def test_env_values(self, monkeypatch, value, enabled):
++        from auditkit.cache import run_cache_enabled
++
++        monkeypatch.delenv("AUDITKIT_DISABLE_RUN_CACHE", raising=False)
++        if value is not None:
++            monkeypatch.setenv("AUDITKIT_DISABLE_RUN_CACHE", value)
++        assert run_cache_enabled() is enabled
++
++    def test_disabled_run_neither_reads_nor_writes(self, monkeypatch, tmp_path):
++        import auditkit as ak
++        from auditkit.runspec import RunConfig
++
++        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
++        calls = []
++        model = lambda prompts: (calls.append(prompts), ["hi" for _ in prompts])[1]  # noqa: E731
++        cfg = RunConfig(concurrency=1)
++        samples = [Sample(input="hi", target="hi")]
++        ak.evaluate(samples, model=model, config=cfg)       # default: cache written
++        snapshot = lambda: {p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in tmp_path.rglob("*.json")}  # noqa: E731
++        files = snapshot()
++        assert len(files) == 1
++        first = len(calls)
++
++        monkeypatch.setenv("AUDITKIT_DISABLE_RUN_CACHE", "1")
++        ak.evaluate(samples, model=model, config=cfg)
++        assert len(calls) == 2 * first                       # cached result not read
++        assert snapshot() == files                           # nor rewritten
++        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "fresh"))
++        ak.evaluate(samples, model=model, config=cfg)
++        assert not (tmp_path / "fresh").exists()             # no cache dir created
+diff --git a/tests/test_model_backends.py b/tests/test_model_backends.py
+index cb430a7..a636949 100644
+--- a/tests/test_model_backends.py
++++ b/tests/test_model_backends.py
+@@ -108,6 +108,12 @@ class TestAutoModelResolve:
+     def test_hf_local_directory_still_resolves(self, tmp_path):
+         assert AutoModel.resolve(f"hf:{tmp_path}")._model_name == str(tmp_path)
+ 
++    def test_caller_name_is_honoured_not_a_duplicate_keyword(self, tmp_path):
++        m = AutoModel.resolve(f"hf:{tmp_path}", name="ckpt-a")
++        assert (m.name, m._model_name) == ("ckpt-a", str(tmp_path))
++        assert AutoModel.resolve("openai:", name="mine").name == "mine"   # bare-prefix branch
++        assert AutoModel.resolve("hf:gpt2").name == "hf:gpt2"            # default unchanged
++
+     def test_precomputed_and_echo_have_no_name_and_still_resolve(self):
+         assert AutoModel.resolve("precomputed").name == "precomputed"
+         assert AutoModel.resolve("echo").name == "echo"

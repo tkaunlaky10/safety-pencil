@@ -22,20 +22,20 @@ PAIRS = [
 
 
 @pytest.fixture(scope="module")
-def tok():
+def tokenizer():
     return tiny_tokenizer()
 
 
 @pytest.fixture(scope="module")
-def batch(tok):
-    off = user_content_offset(tok)
-    enc = [encode_chat(tok, p, r, user_offset=off) for p, r in PAIRS]
-    return collate(enc, tok.pad_token_id)
+def batch(tokenizer):
+    off = user_content_offset(tokenizer)
+    enc = [encode_chat(tokenizer, p, r, user_offset=off) for p, r in PAIRS]
+    return collate(enc, tokenizer.pad_token_id)
 
 
 def _capture(model, names):
     """Independent hooks: store each module's input and its output gradient."""
-    ins, grads, hs = {}, {}, []
+    ins, grads, handles = {}, {}, []
     mods = dict(model.named_modules())
     for n in names:
 
@@ -43,19 +43,19 @@ def _capture(model, names):
             ins[n] = i[0].detach().clone()
             o.register_hook(lambda g, n=n: grads.__setitem__(n, g.detach().clone()))
 
-        hs.append(mods[n].register_forward_hook(fwd))
-    return ins, grads, hs
+        handles.append(mods[n].register_forward_hook(fwd))
+    return ins, grads, handles
 
 
 def test_matches_hand_computation_and_respects_masks(batch):
     model = tiny_cohere2()
     names = list(target_modules(model))
-    with KFACCollector(model, diag=True, diag_row_set="all") as kc:
-        ins, grads, hs = _capture(model, names)
-        kc.collect(batch)
-        for h in hs:
+    with KFACCollector(model, diag=True, diag_row_set="all") as collector:
+        ins, grads, handles = _capture(model, names)
+        collector.collect(batch)
+        for h in handles:
             h.remove()
-    f = kc.finalize()
+    f = collector.finalize()
     masks = {"loss": batch["loss_mask"], "all": batch["rows_all"], "full": batch["rows_full"]}
     n_loss = int(batch["loss_mask"].sum())
     B = batch["input_ids"].shape[0]
@@ -174,7 +174,7 @@ def test_sampled_labels_are_unbiased_for_G():
     lm[0, loss_pos], ra[0, rows] = True, True
 
     # exact: sum over loss positions t and labels v of p_t(v) * sum_rows J J^T, per loss token
-    ins, grads, hs = _capture(model, names)
+    ins, grads, handles = _capture(model, names)
     for p in model.parameters():
         p.requires_grad_(False)
     emb = model.get_input_embeddings()(ids).detach().requires_grad_(True)
@@ -190,7 +190,7 @@ def test_sampled_labels_are_unbiased_for_G():
             for n in names:
                 g = grads[n][0, rows].double()
                 exact[n] += logp[t, v].exp().item() * g.T @ g
-    for h in hs:
+    for h in handles:
         h.remove()
     exact = {n: e / len(loss_pos) for n, e in exact.items()}
 
@@ -245,13 +245,15 @@ def test_memory_plan_matches_implementation_md():
     assert np.isclose(factor_bytes(2048, d, 16, 4, 128, n_row_sets=1) / 1e9, 0.89, atol=0.01)
 
 
-def test_truncation_keeps_turn_markers_and_response(tok):
+def test_truncation_keeps_turn_markers_and_response(tokenizer):
     from pencil.chat import prompt_suffix_len
 
-    full = encode_chat(tok, "abcdefghijklmnopqrstuvwxyz", "OK")
-    short = encode_chat(tok, "abcdefghijklmnopqrstuvwxyz", "OK", max_len=len(full.input_ids) - 5)
-    suf = prompt_suffix_len(tok)
-    assert suf == len(tok("<EOT><BOT>", add_special_tokens=False)["input_ids"])
+    full = encode_chat(tokenizer, "abcdefghijklmnopqrstuvwxyz", "OK")
+    short = encode_chat(tokenizer, "abcdefghijklmnopqrstuvwxyz", "OK", max_len=len(full.input_ids) - 5)
+    suf = prompt_suffix_len(tokenizer)
+    assert suf == len(tokenizer("<EOT><BOT>", add_special_tokens=False)["input_ids"])
     assert short.input_ids[short.response_start - suf :] == full.input_ids[full.response_start - suf :]
-    assert tok.decode(short.input_ids[short.user_start : short.response_start]) == "abcdefghijklmnopqrstu<EOT><BOT>"
+    assert (
+        tokenizer.decode(short.input_ids[short.user_start : short.response_start]) == "abcdefghijklmnopqrstu<EOT><BOT>"
+    )
     assert len(short.input_ids) == len(full.input_ids) - 5

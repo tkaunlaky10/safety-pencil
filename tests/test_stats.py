@@ -18,7 +18,7 @@ from pencil.stats import (
     wilson_ci,
 )
 
-NB = 500  # bootstrap replicates in tests (keeps the file fast)
+N_BOOT = 500  # bootstrap replicates in tests (keeps the file fast)
 
 
 # ------------------------------------------------------------------ Wilson
@@ -63,37 +63,37 @@ def test_wilson_edges():
 
 def _paired(n11, b, c, n00):
     a = [1] * n11 + [1] * b + [0] * c + [0] * n00
-    bb = [1] * n11 + [0] * b + [1] * c + [0] * n00
-    return a, bb
+    b_correct = [1] * n11 + [0] * b + [1] * c + [0] * n00
+    return a, b_correct
 
 
 def test_mcnemar_counts_and_p():
-    a, bb = _paired(20, 7, 2, 11)
-    r = mcnemar_exact(a, bb)
-    assert (r["b"], r["c"], r["n"]) == (7, 2, 40)
-    assert r["p_value"] == pytest.approx(sps.binomtest(7, 9, 0.5).pvalue, rel=1e-12)
-    assert r["p_value"] == pytest.approx(sps.binomtest(2, 9, 0.5).pvalue, rel=1e-12)
+    a, b_correct = _paired(20, 7, 2, 11)
+    result = mcnemar_exact(a, b_correct)
+    assert (result["b"], result["c"], result["n"]) == (7, 2, 40)
+    assert result["p_value"] == pytest.approx(sps.binomtest(7, 9, 0.5).pvalue, rel=1e-12)
+    assert result["p_value"] == pytest.approx(sps.binomtest(2, 9, 0.5).pvalue, rel=1e-12)
     # hand value: 2 * P(X <= 2 | 9, 1/2) = 2 * (1 + 9 + 36) / 512
-    assert r["p_value"] == pytest.approx(92 / 512, rel=1e-12)
+    assert result["p_value"] == pytest.approx(92 / 512, rel=1e-12)
 
 
 def test_mcnemar_bools_order_and_symmetry():
-    a, bb = _paired(5, 3, 12, 4)
+    a, b_correct = _paired(5, 3, 12, 4)
     rng = np.random.default_rng(1)
     perm = rng.permutation(len(a))
-    a_b = np.array(a, dtype=bool)[perm]
-    b_b = np.array(bb, dtype=bool)[perm]
-    r = mcnemar_exact(a_b, b_b)
-    r_swap = mcnemar_exact(b_b, a_b)
-    assert (r["b"], r["c"]) == (3, 12)
-    assert (r_swap["b"], r_swap["c"]) == (12, 3)
-    assert r["p_value"] == pytest.approx(r_swap["p_value"])
-    assert r["p_value"] == pytest.approx(sps.binomtest(3, 15, 0.5).pvalue)
+    a_bools = np.array(a, dtype=bool)[perm]
+    b_bools = np.array(b_correct, dtype=bool)[perm]
+    result = mcnemar_exact(a_bools, b_bools)
+    result_swapped = mcnemar_exact(b_bools, a_bools)
+    assert (result["b"], result["c"]) == (3, 12)
+    assert (result_swapped["b"], result_swapped["c"]) == (12, 3)
+    assert result["p_value"] == pytest.approx(result_swapped["p_value"])
+    assert result["p_value"] == pytest.approx(sps.binomtest(3, 15, 0.5).pvalue)
 
 
 def test_mcnemar_no_discordant_and_errors():
-    r = mcnemar_exact([1, 0, 1], [1, 0, 1])
-    assert r == {"b": 0, "c": 0, "p_value": 1.0, "n": 3}
+    result = mcnemar_exact([1, 0, 1], [1, 0, 1])
+    assert result == {"b": 0, "c": 0, "p_value": 1.0, "n": 3}
     with pytest.raises(ValueError):
         mcnemar_exact([1, 0], [1, 0, 1])
     with pytest.raises(ValueError):
@@ -103,7 +103,7 @@ def test_mcnemar_no_discordant_and_errors():
 # ------------------------------------------------------------------ Spearman bootstrap
 
 
-def _xy(n=48, seed=3):
+def _correlated_pair(n=48, seed=3):
     rng = np.random.default_rng(seed)
     x = rng.standard_normal(n)
     y = 0.7 * x + 0.5 * rng.standard_normal(n)
@@ -111,47 +111,47 @@ def _xy(n=48, seed=3):
 
 
 def test_spearman_point_matches_scipy_and_ci_contains_it():
-    x, y = _xy()
-    r = spearman_bootstrap_ci(x, y, n_boot=NB, seed=0)
-    assert r["rho"] == pytest.approx(sps.spearmanr(x, y).statistic, abs=1e-12)
-    assert r["n"] == 48 and r["n_boot_used"] == NB
-    assert -1.0 <= r["lo"] <= r["rho"] <= r["hi"] <= 1.0
-    assert r["lo"] > 0.0
+    x, y = _correlated_pair()
+    result = spearman_bootstrap_ci(x, y, n_boot=N_BOOT, seed=0)
+    assert result["rho"] == pytest.approx(sps.spearmanr(x, y).statistic, abs=1e-12)
+    assert result["n"] == 48 and result["n_boot_used"] == N_BOOT
+    assert -1.0 <= result["lo"] <= result["rho"] <= result["hi"] <= 1.0
+    assert result["lo"] > 0.0
 
 
 def test_spearman_bootstrap_replicates_match_scipy():
     # The vectorised replicate computation must equal spearmanr on the same resample.
-    x, y = _xy(n=20)
+    x, y = _correlated_pair(n=20)
     rng = np.random.default_rng(0)
-    idx = rng.integers(0, 20, size=(NB, 20))
+    idx = rng.integers(0, 20, size=(N_BOOT, 20))
     ref = np.array([sps.spearmanr(x[i], y[i]).statistic for i in idx])
     lo, hi = np.quantile(ref, [0.025, 0.975])
-    r = spearman_bootstrap_ci(x, y, n_boot=NB, seed=0)
-    assert r["lo"] == pytest.approx(lo, abs=1e-12)
-    assert r["hi"] == pytest.approx(hi, abs=1e-12)
+    result = spearman_bootstrap_ci(x, y, n_boot=N_BOOT, seed=0)
+    assert result["lo"] == pytest.approx(lo, abs=1e-12)
+    assert result["hi"] == pytest.approx(hi, abs=1e-12)
 
 
 def test_spearman_reproducible_with_seed():
-    x, y = _xy()
-    r1 = spearman_bootstrap_ci(x, y, n_boot=NB, seed=7)
-    r2 = spearman_bootstrap_ci(x, y, n_boot=NB, seed=7)
-    r3 = spearman_bootstrap_ci(x, y, n_boot=NB, seed=8)
-    assert r1 == r2
-    assert (r1["lo"], r1["hi"]) != (r3["lo"], r3["hi"])
+    x, y = _correlated_pair()
+    result1 = spearman_bootstrap_ci(x, y, n_boot=N_BOOT, seed=7)
+    result2 = spearman_bootstrap_ci(x, y, n_boot=N_BOOT, seed=7)
+    result3 = spearman_bootstrap_ci(x, y, n_boot=N_BOOT, seed=8)
+    assert result1 == result2
+    assert (result1["lo"], result1["hi"]) != (result3["lo"], result3["hi"])
 
 
 def test_spearman_degenerate_resamples_skipped():
     x = np.array([0.0] * 9 + [1.0])  # ~35% of resamples have constant x
     y = np.arange(10.0)
-    r = spearman_bootstrap_ci(x, y, n_boot=NB, seed=0)
-    assert 0 < r["n_boot_used"] < NB
-    assert np.isfinite(r["lo"]) and np.isfinite(r["hi"])
-    const = spearman_bootstrap_ci(np.ones(10), y, n_boot=NB, seed=0)
+    result = spearman_bootstrap_ci(x, y, n_boot=N_BOOT, seed=0)
+    assert 0 < result["n_boot_used"] < N_BOOT
+    assert np.isfinite(result["lo"]) and np.isfinite(result["hi"])
+    const = spearman_bootstrap_ci(np.ones(10), y, n_boot=N_BOOT, seed=0)
     assert math.isnan(const["rho"]) and math.isnan(const["lo"]) and const["n_boot_used"] == 0
     with pytest.raises(ValueError):
-        spearman_bootstrap_ci([1.0, 2.0], [1.0], n_boot=NB)
+        spearman_bootstrap_ci([1.0, 2.0], [1.0], n_boot=N_BOOT)
     with pytest.raises(ValueError):
-        spearman_bootstrap_ci([1.0, np.nan, 3.0], [1.0, 2.0, 3.0], n_boot=NB)
+        spearman_bootstrap_ci([1.0, np.nan, 3.0], [1.0, 2.0, 3.0], n_boot=N_BOOT)
 
 
 # ------------------------------------------------------------------ paired bootstrap
@@ -161,29 +161,29 @@ def test_paired_bootstrap_1d():
     rng = np.random.default_rng(0)
     b = rng.random(200)
     a = b + 0.1 + 0.05 * rng.standard_normal(200)
-    r = paired_bootstrap_diff(a, b, n_boot=NB, seed=0)
-    assert r["diff"] == pytest.approx(a.mean() - b.mean())
-    assert r["lo"] <= r["diff"] <= r["hi"]
-    assert r["lo"] > 0.0
-    assert r["p_two_sided"] < 0.01
-    assert r == paired_bootstrap_diff(a, b, n_boot=NB, seed=0)
+    result = paired_bootstrap_diff(a, b, n_boot=N_BOOT, seed=0)
+    assert result["diff"] == pytest.approx(a.mean() - b.mean())
+    assert result["lo"] <= result["diff"] <= result["hi"]
+    assert result["lo"] > 0.0
+    assert result["p_two_sided"] < 0.01
+    assert result == paired_bootstrap_diff(a, b, n_boot=N_BOOT, seed=0)
 
 
 def test_paired_bootstrap_matches_hand_loop():
     rng = np.random.default_rng(5)
     a, b = rng.random(30), rng.random(30)
-    r = paired_bootstrap_diff(a, b, n_boot=NB, seed=0)
-    idx = np.random.default_rng(0).integers(0, 30, size=(NB, 30))
+    result = paired_bootstrap_diff(a, b, n_boot=N_BOOT, seed=0)
+    idx = np.random.default_rng(0).integers(0, 30, size=(N_BOOT, 30))
     d = a[idx].mean(axis=1) - b[idx].mean(axis=1)
-    assert r["lo"] == pytest.approx(np.quantile(d, 0.025))
-    assert r["hi"] == pytest.approx(np.quantile(d, 0.975))
-    assert r["p_two_sided"] == pytest.approx(min(1.0, 2 * min((d <= 0).mean(), (d >= 0).mean())))
+    assert result["lo"] == pytest.approx(np.quantile(d, 0.025))
+    assert result["hi"] == pytest.approx(np.quantile(d, 0.975))
+    assert result["p_two_sided"] == pytest.approx(min(1.0, 2 * min((d <= 0).mean(), (d >= 0).mean())))
 
 
 def test_paired_bootstrap_identical_inputs():
     a = np.random.default_rng(0).random(50)
-    r = paired_bootstrap_diff(a, a.copy(), n_boot=NB)
-    assert r == {"diff": 0.0, "lo": 0.0, "hi": 0.0, "p_two_sided": 1.0}
+    result = paired_bootstrap_diff(a, a.copy(), n_boot=N_BOOT)
+    assert result == {"diff": 0.0, "lo": 0.0, "hi": 0.0, "p_two_sided": 1.0}
 
 
 def test_paired_bootstrap_2d_resamples_items():
@@ -192,33 +192,33 @@ def test_paired_bootstrap_2d_resamples_items():
     rng = np.random.default_rng(2)
     A = rng.random((40, 7)) + 0.05
     B = rng.random((40, 7))
-    r2 = paired_bootstrap_diff(A, B, n_boot=NB, seed=0)
-    r1 = paired_bootstrap_diff(A.mean(axis=1), B.mean(axis=1), n_boot=NB, seed=0)
+    result2 = paired_bootstrap_diff(A, B, n_boot=N_BOOT, seed=0)
+    result1 = paired_bootstrap_diff(A.mean(axis=1), B.mean(axis=1), n_boot=N_BOOT, seed=0)
     for key in ("diff", "lo", "hi", "p_two_sided"):
-        assert r2[key] == pytest.approx(r1[key], abs=1e-12)
-    rm = paired_bootstrap_diff(A, B, stat=np.median, n_boot=NB, seed=0)
-    assert rm["diff"] == pytest.approx(np.median(A) - np.median(B))
-    assert rm["lo"] <= rm["hi"]
+        assert result2[key] == pytest.approx(result1[key], abs=1e-12)
+    result_median = paired_bootstrap_diff(A, B, stat=np.median, n_boot=N_BOOT, seed=0)
+    assert result_median["diff"] == pytest.approx(np.median(A) - np.median(B))
+    assert result_median["lo"] <= result_median["hi"]
     with pytest.raises(ValueError):
-        paired_bootstrap_diff(A, B[:-1], n_boot=NB)
+        paired_bootstrap_diff(A, B[:-1], n_boot=N_BOOT)
 
 
 # ------------------------------------------------------------------ best_at_threshold
 
 
 def test_best_at_threshold():
-    pts = [
+    points = [
         {"mu": 0.0, "safety": 0.90, "utility": 0.80},
         {"mu": 0.5, "safety": 0.97, "utility": 0.70},  # boundary counts (inclusive)
         {"mu": 1.0, "safety": 0.99, "utility": 0.65},
         {"mu": 2.0, "safety": 1.00, "utility": 0.40},
         {"mu": 3.0, "safety": float("nan"), "utility": 0.99},
     ]
-    assert best_at_threshold(pts, 0.97) is pts[1]
-    assert best_at_threshold(pts, 97 / 100) is pts[1]
-    assert best_at_threshold(pts, 0.98) is pts[2]
-    assert best_at_threshold(pts, 0.0) is pts[0]
-    assert best_at_threshold(pts, 1.01) is None
+    assert best_at_threshold(points, 0.97) is points[1]
+    assert best_at_threshold(points, 97 / 100) is points[1]
+    assert best_at_threshold(points, 0.98) is points[2]
+    assert best_at_threshold(points, 0.0) is points[0]
+    assert best_at_threshold(points, 1.01) is None
     assert best_at_threshold([], 0.97) is None
 
 
@@ -229,18 +229,18 @@ def test_holm_textbook_example():
     # Four hypotheses at alpha = 0.05: sorted p = .005, .01, .03, .04 against .0125, .0167, .025:
     # the first two are rejected, then .03 > .025 stops the procedure.
     p = [0.01, 0.04, 0.03, 0.005]
-    adj = holm(p)
-    assert adj == pytest.approx([0.03, 0.06, 0.06, 0.02])
+    adjusted = holm(p)
+    assert adjusted == pytest.approx([0.03, 0.06, 0.06, 0.02])
     assert holm_reject(p, 0.05) == [True, False, False, True]
 
 
 def test_holm_monotone_clipped_and_edges():
     assert holm([0.5, 0.6, 0.7]) == [1.0, 1.0, 1.0]
     p = np.random.default_rng(0).random(12) ** 3
-    adj = np.array(holm(p))
+    adjusted = np.array(holm(p))
     order = np.argsort(p)
-    assert np.all(np.diff(adj[order]) >= 0)
-    assert np.all(adj >= p) and np.all(adj <= 1.0)
+    assert np.all(np.diff(adjusted[order]) >= 0)
+    assert np.all(adjusted >= p) and np.all(adjusted <= 1.0)
     assert holm([0.02]) == [0.02]
     assert holm([]) == [] and holm_reject([]) == []
     assert holm([0.01, 0.01]) == [0.02, 0.02]
@@ -265,10 +265,10 @@ def _from_table(table, labels):
 
 def _sklearn_kappa(table):
     # sklearn.metrics.cohen_kappa_score(weights=None), written out on the confusion matrix.
-    cm = np.asarray(table, dtype=float)
-    expected = np.outer(cm.sum(axis=1), cm.sum(axis=0)) / cm.sum()
-    w = np.ones_like(cm) - np.eye(cm.shape[0])
-    return 1.0 - (w * cm).sum() / (w * expected).sum()
+    confusion = np.asarray(table, dtype=float)
+    expected = np.outer(confusion.sum(axis=1), confusion.sum(axis=0)) / confusion.sum()
+    disagreement = np.ones_like(confusion) - np.eye(confusion.shape[0])
+    return 1.0 - (disagreement * confusion).sum() / (disagreement * expected).sum()
 
 
 def test_kappa_textbook_2x2():
@@ -306,18 +306,18 @@ def test_kappa_ci():
     perm = np.random.default_rng(1).permutation(len(y1))
     y1 = [y1[i] for i in perm]
     y2 = [y2[i] for i in perm]
-    r = cohen_kappa_ci(y1, y2, n_boot=NB, seed=0)
-    assert r["kappa"] == pytest.approx(_sklearn_kappa(table))
-    assert r["n"] == 70 and r["n_boot_used"] == NB
-    assert -1.0 <= r["lo"] <= r["kappa"] <= r["hi"] <= 1.0
-    assert r == cohen_kappa_ci(y1, y2, n_boot=NB, seed=0)
+    result = cohen_kappa_ci(y1, y2, n_boot=N_BOOT, seed=0)
+    assert result["kappa"] == pytest.approx(_sklearn_kappa(table))
+    assert result["n"] == 70 and result["n_boot_used"] == N_BOOT
+    assert -1.0 <= result["lo"] <= result["kappa"] <= result["hi"] <= 1.0
+    assert result == cohen_kappa_ci(y1, y2, n_boot=N_BOOT, seed=0)
 
 
 def test_kappa_ci_degenerate():
     # Perfect agreement with a rare label: resamples drawing only "a" have p_e = 1 and are skipped.
     y = ["a"] * 9 + ["b"]
-    r = cohen_kappa_ci(y, list(y), n_boot=NB, seed=0)
-    assert r["kappa"] == 1.0 and r["lo"] == 1.0 and r["hi"] == 1.0
-    assert 0 < r["n_boot_used"] < NB
-    r = cohen_kappa_ci(["a"] * 6, ["a"] * 6, n_boot=NB)
-    assert math.isnan(r["kappa"]) and math.isnan(r["lo"]) and r["n_boot_used"] == 0
+    result = cohen_kappa_ci(y, list(y), n_boot=N_BOOT, seed=0)
+    assert result["kappa"] == 1.0 and result["lo"] == 1.0 and result["hi"] == 1.0
+    assert 0 < result["n_boot_used"] < N_BOOT
+    result = cohen_kappa_ci(["a"] * 6, ["a"] * 6, n_boot=N_BOOT)
+    assert math.isnan(result["kappa"]) and math.isnan(result["lo"]) and result["n_boot_used"] == 0

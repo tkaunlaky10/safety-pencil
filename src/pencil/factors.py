@@ -21,6 +21,7 @@ no gradient checkpointing; small batches; hook a chunk of layers per pass if the
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import partial
 
 import torch
 from torch import nn
@@ -42,22 +43,52 @@ def sampled_label_backward(
 ) -> int:
     """Forward with differentiable input embeddings, sample one label per loss position from the model's
     softmax, and back-propagate the sum of those labels' log-probs. Returns the number of loss tokens."""
-    emb = model.get_input_embeddings()(input_ids).detach().requires_grad_(True)
-    hidden = decoder(model)(inputs_embeds=emb, attention_mask=attention_mask, use_cache=False).last_hidden_state
-    logp = lm_logits(model, hidden[loss_mask]).float().log_softmax(-1)
+    embeddings = model.get_input_embeddings()(input_ids).detach().requires_grad_(True)
+    body = decoder(model)
+    hidden = body(inputs_embeds=embeddings, attention_mask=attention_mask, use_cache=False).last_hidden_state
+    log_probs = lm_logits(model, hidden[loss_mask]).float().log_softmax(-1)
     with torch.no_grad():
-        labels = torch.multinomial(logp.exp(), 1, generator=generator)
-    logp.gather(-1, labels).sum().backward()
+        labels = torch.multinomial(log_probs.exp(), 1, generator=generator)
+    log_probs.gather(-1, labels).sum().backward()
     return int(loss_mask.sum())
 
 
-def _rows(x: torch.Tensor, mask: torch.Tensor, row_set: str, dtype, reduce_mean: bool) -> torch.Tensor:
-    """The rows of x (batch × time × d) a row set uses. Reduce sets give one row per sequence: the mean
-    over its rows for inputs, the sum for gradients."""
+def _input_rows(a: torch.Tensor, mask: torch.Tensor, row_set: str, dtype: torch.dtype) -> torch.Tensor:
+    """The rows of a layer input a (batch × time × d) that a row set uses, as (rows × d). A reduce set gives
+    one row per sequence: the mean input over the sequence's masked positions."""
     if row_set not in REDUCE_ROW_SETS:
-        return x[mask].to(dtype)
-    summed = (x.to(dtype) * mask[..., None]).sum(1)
-    return summed / mask.sum(1, keepdim=True).clamp_min(1) if reduce_mean else summed
+        return a[mask].to(dtype)
+    rows_per_sequence = mask.sum(1, keepdim=True).clamp_min(1)
+    return _per_sequence_sum(a, mask, dtype) / rows_per_sequence
+
+
+def _gradient_rows(g: torch.Tensor, mask: torch.Tensor, row_set: str, dtype: torch.dtype) -> torch.Tensor:
+    """The rows of an output gradient g (batch × time × d) that a row set uses, as (rows × d). A reduce set
+    gives one row per sequence: the summed gradient over the sequence's masked positions."""
+    if row_set not in REDUCE_ROW_SETS:
+        return g[mask].to(dtype)
+    return _per_sequence_sum(g, mask, dtype)
+
+
+def _per_sequence_sum(x: torch.Tensor, mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Σ over the masked positions of each sequence: (batch × time × d) -> (batch × d)."""
+    return (x.to(dtype) * mask[..., None]).sum(1)
+
+
+def _row_count(mask: torch.Tensor, row_set: str) -> int:
+    """How many rows a batch adds to a row set's A normalisation: one per non-empty sequence for a reduce
+    set, otherwise one per masked position."""
+    if row_set in REDUCE_ROW_SETS:
+        return int(mask.any(1).sum())
+    return int(mask.sum())
+
+
+def _accumulate(store: dict, key, M: torch.Tensor) -> None:
+    """store[key] += M, starting the entry if it is new."""
+    if key in store:
+        store[key] = store[key] + M
+    else:
+        store[key] = M
 
 
 class KFACCollector:
@@ -68,10 +99,20 @@ class KFACCollector:
                 kc.collect(batch)
         factors = kc.finalize()
 
-    In a parallel block (Tiny Aya), q/k/v/gate/up share one input factor; the first batch checks that they
-    really read the same tensor. `diag=True` also accumulates the per-sequence diagonal Fisher
-    Σ_seq (Σ_t g_t a_tᵀ)² / n_loss (the diagonal Fisher merge baseline) on `diag_row_set`.
-    Accumulators are fp32 by default; float64 is exact but slow on consumer GPUs."""
+    Data flow per collect(batch):
+      1. collect() builds the batch's row-set masks and stores them in `_masks` for the hooks.
+      2. Forward hook (one per linear layer): adds a aᵀ for each row set to A[input key][row set]. In a
+         parallel block (Tiny Aya) q/k/v/gate/up share one input factor, so only its owner module (the first
+         one) accumulates it; on the first batch the others check that they really read the same tensor.
+         The hook also registers a gradient hook on the layer's output.
+      3. Gradient hook (during backward): adds g gᵀ for each row set to G[module][row set].
+      4. collect() clears the per-batch state and adds the batch's row and loss-token counts.
+    finalize() divides by the counts and returns a Factors object.
+
+    `diag=True` also accumulates the per-sequence diagonal Fisher Σ_seq (Σ_t g_t a_tᵀ)² / n_loss (the
+    diagonal Fisher merge baseline) on `diag_row_set`: the forward hook keeps the masked input until the
+    gradient hook pairs it with the gradient. Accumulators are fp32 by default; float64 is exact but slow on
+    consumer GPUs."""
 
     def __init__(
         self,
@@ -92,113 +133,148 @@ class KFACCollector:
         self.model = model
         self.linears = target_modules(model, layers)
         self.row_sets = tuple(row_sets)
-        self.shared = is_parallel_block(model) if share_input_factor is None else share_input_factor
-        self.a_key = {n: input_factor_key(n, self.shared) for n in self.linears}
-        self.owner = {}  # the module that accumulates each input factor
-        for n, k in self.a_key.items():
-            self.owner.setdefault(k, n)
-        self.diag, self.diag_row_set = diag, diag_row_set
-        self.seed, self.accum_dtype = seed, accum_dtype
-        self.A = {k: {} for k in self.owner}
-        self.G = {n: {} for n in self.linears}
-        self.D = {}
+        if share_input_factor is None:
+            share_input_factor = is_parallel_block(model)
+        self.share_input_factor = share_input_factor
+        self.a_key = {module: input_factor_key(module, share_input_factor) for module in self.linears}
+        self.input_owner = {}  # input factor key -> the one module whose hook accumulates it
+        for module, input_key in self.a_key.items():
+            self.input_owner.setdefault(input_key, module)
+        self.diag = diag
+        self.diag_row_set = diag_row_set
+        self.seed = seed
+        self.accum_dtype = accum_dtype
+
+        # Accumulators (unnormalised until finalize) and the counts that normalise them.
+        self.A = {input_key: {} for input_key in self.input_owner}  # A[input key][row set]
+        self.G = {module: {} for module in self.linears}  # G[module][row set]
+        self.D = {}  # D[module]: the diagonal Fisher, d_out × d_in
         self.n_rows = dict.fromkeys(self.row_sets, 0)
-        self.n_loss = self.n_seqs = 0
-        self._generator = None
-        self._handles = []
-        self._masks = None  # set only while collect() runs, so hooks ignore other forwards
-        self._diag_inputs = {}
+        self.n_loss = 0
+        self.n_seqs = 0
+
+        self._generator = None  # label sampler, created on the model's device by the first collect()
+        self._handles = []  # forward hooks, registered by __enter__
+        self._masks = None  # row-set masks, set only while collect() runs, so hooks ignore other forwards
+        self._diag_inputs = {}  # module -> masked input, from its forward hook until its gradient hook
         self._first_batch = True
-        self._shared_inputs = {}
+        self._shared_inputs = {}  # first batch only: input key -> the owner's input, to check the others
 
     def __enter__(self):
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        self._handles = [m.register_forward_hook(self._forward_hook(n)) for n, m in self.linears.items()]
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+        self._handles = []
+        for module_name, linear in self.linears.items():
+            self._handles.append(linear.register_forward_hook(partial(self._on_forward, module_name)))
         return self
 
     def __exit__(self, *exc):
-        for h in self._handles:
-            h.remove()
+        for handle in self._handles:
+            handle.remove()
         self._handles = []
 
-    @staticmethod
-    def _add(store: dict, key, M: torch.Tensor) -> None:
-        store[key] = M if key not in store else store[key] + M
+    def _on_forward(self, module_name: str, linear: nn.Module, inputs: tuple, output: torch.Tensor) -> None:
+        """Forward hook: accumulate the input factor, keep what the gradient hook needs, hook the output."""
+        if self._masks is None:
+            return
+        a = inputs[0].detach()
+        input_key = self.a_key[module_name]
+        if self.input_owner[input_key] == module_name:
+            for row_set in self.row_sets:
+                rows = _input_rows(a, self._masks[row_set], row_set, self.accum_dtype)
+                _accumulate(self.A[input_key], row_set, rows.T @ rows)
+            if self._first_batch:
+                self._shared_inputs[input_key] = a
+        elif self._first_batch:
+            self._check_reads_shared_input(module_name, input_key, a)
+        if self.diag:
+            self._diag_inputs[module_name] = a.float() * self._masks[self.diag_row_set][..., None]
+        if output.requires_grad:
+            output.register_hook(partial(self._on_output_grad, module_name))
 
-    def _forward_hook(self, name):
-        def hook(module, inputs, output):
-            if self._masks is None:
-                return
-            a = inputs[0].detach()
-            key = self.a_key[name]
-            if self.owner[key] == name:
-                for rs in self.row_sets:
-                    rows = _rows(a, self._masks[rs], rs, self.accum_dtype, reduce_mean=True)
-                    self._add(self.A[key], rs, rows.T @ rows)
-                if self._first_batch:
-                    self._shared_inputs[key] = a
-            elif self._first_batch and not torch.equal(self._shared_inputs.get(key, torch.empty(0)), a):
-                raise RuntimeError(
-                    f"{name} does not read the same input as {self.owner[key]}: the block is not "
-                    "parallel, pass share_input_factor=False"
-                )
-            if self.diag:
-                self._diag_inputs[name] = a.float() * self._masks[self.diag_row_set][..., None]
-            if output.requires_grad:
-                output.register_hook(self._grad_hook(name))
+    def _check_reads_shared_input(self, module_name: str, input_key: str, a: torch.Tensor) -> None:
+        """Raise if a module assigned to a shared input factor reads a different tensor from its owner."""
+        owner_input = self._shared_inputs.get(input_key, torch.empty(0))
+        if not torch.equal(owner_input, a):
+            raise RuntimeError(
+                f"{module_name} does not read the same input as {self.input_owner[input_key]}: the block is not "
+                "parallel, pass share_input_factor=False"
+            )
 
-        return hook
+    def _on_output_grad(self, module_name: str, g: torch.Tensor) -> None:
+        """Gradient hook on a layer's output: accumulate G and, with diag, the diagonal Fisher."""
+        g = g.detach()
+        for row_set in self.row_sets:
+            rows = _gradient_rows(g, self._masks[row_set], row_set, self.accum_dtype)
+            _accumulate(self.G[module_name], row_set, rows.T @ rows)
+        if self.diag:
+            # The gradient of W for each sequence, Σ_t g_t a_tᵀ, squared: cross-position terms included.
+            a_masked = self._diag_inputs.pop(module_name)
+            g_masked = g.float() * self._masks[self.diag_row_set][..., None]
+            n_sequences = g_masked.shape[0]
+            squared = sum((g_masked[s].T @ a_masked[s]) ** 2 for s in range(n_sequences))
+            _accumulate(self.D, module_name, squared)
 
-    def _grad_hook(self, name):
-        def hook(g):
-            g = g.detach()
-            for rs in self.row_sets:
-                rows = _rows(g, self._masks[rs], rs, self.accum_dtype, reduce_mean=False)
-                self._add(self.G[name], rs, rows.T @ rows)
-            if self.diag:  # per-sequence gradient, squared: cross-position terms included
-                a = self._diag_inputs.pop(name)
-                gm = g.float() * self._masks[self.diag_row_set][..., None]
-                self._add(self.D, name, sum((gm[b].T @ a[b]) ** 2 for b in range(gm.shape[0])))
-
-        return hook
+    def _row_masks(self, batch: dict, attention: torch.Tensor, device) -> dict[str, torch.Tensor]:
+        """{row set: boolean mask} for every row set the hooks or the loss need, restricted to real tokens."""
+        needed = set(self.row_sets)
+        needed.add("loss")
+        if self.diag:
+            needed.add(self.diag_row_set)
+        return {row_set: batch[ROW_MASK[row_set]].to(device).bool() & attention for row_set in needed}
 
     def collect(self, batch: dict[str, torch.Tensor]) -> int:
         """One sampled-label pass on a batch from pencil.chat.collate. Returns its loss-token count."""
-        dev = next(self.model.parameters()).device
-        ids, att = batch["input_ids"].to(dev), batch["attention_mask"].to(dev).bool()
-        needed = {*self.row_sets, "loss", *([self.diag_row_set] if self.diag else [])}
-        masks = {rs: batch[ROW_MASK[rs]].to(dev).bool() & att for rs in needed}
+        device = next(self.model.parameters()).device
+        input_ids = batch["input_ids"].to(device)
+        attention = batch["attention_mask"].to(device).bool()
+        masks = self._row_masks(batch, attention, device)
         if self._generator is None:
-            self._generator = torch.Generator(device=dev).manual_seed(self.seed)
+            self._generator = torch.Generator(device=device).manual_seed(self.seed)
+
         self._masks = masks
         try:
-            n = sampled_label_backward(self.model, ids, att.long(), masks["loss"], self._generator)
+            n_loss = sampled_label_backward(self.model, input_ids, attention.long(), masks["loss"], self._generator)
         finally:
             self._masks = None
             self._diag_inputs.clear()
             self._shared_inputs.clear()
         self._first_batch = False
-        for rs in self.row_sets:  # reduce sets normalise A per sequence, the others per row
-            self.n_rows[rs] += int(masks[rs].any(1).sum()) if rs in REDUCE_ROW_SETS else int(masks[rs].sum())
-        self.n_loss += n
-        self.n_seqs += ids.shape[0]
-        return n
+
+        for row_set in self.row_sets:
+            self.n_rows[row_set] += _row_count(masks[row_set], row_set)
+        self.n_loss += n_loss
+        self.n_seqs += input_ids.shape[0]
+        return n_loss
 
     def finalize(self, meta: dict | None = None) -> Factors:
-        """Normalise in place and move each factor to the CPU as soon as it is done, so GPU memory never
-        exceeds the accumulators. Factors keep accum_dtype; consumers upcast to float64."""
+        """Normalise the factors (A by its row count, G and D by the loss-token count) and return them.
+
+        Works in place and moves each factor to the CPU as soon as it is done, so GPU memory never exceeds
+        the accumulators. Factors keep accum_dtype; consumers upcast to float64."""
         if self.n_loss == 0:
             raise RuntimeError("no loss tokens were seen")
-        A = {k: {rs: v.pop(rs).div_(self.n_rows[rs]).cpu() for rs in list(v)} for k, v in self.A.items()}
-        G = {k: {rs: v.pop(rs).div_(self.n_loss).cpu() for rs in list(v)} for k, v in self.G.items()}
-        D = {k: self.D.pop(k).div_(self.n_loss).cpu() for k in list(self.D)}
+        A = {}
+        for input_key, by_row_set in self.A.items():
+            A[input_key] = {}
+            for row_set in list(by_row_set):
+                A[input_key][row_set] = by_row_set.pop(row_set).div_(self.n_rows[row_set]).cpu()
+        G = {}
+        for module, by_row_set in self.G.items():
+            G[module] = {}
+            for row_set in list(by_row_set):
+                G[module][row_set] = by_row_set.pop(row_set).div_(self.n_loss).cpu()
+        D = {}
+        for module in list(self.D):
+            D[module] = self.D.pop(module).div_(self.n_loss).cpu()
+
         info = {
-            "shared_input_factor": self.shared,
+            "shared_input_factor": self.share_input_factor,
             "seed": self.seed,
             "accum_dtype": str(self.accum_dtype),
-            **(meta or {}),
         }
+        if meta is not None:
+            info.update(meta)
         return Factors(
             A=A,
             G=G,
@@ -211,12 +287,14 @@ class KFACCollector:
         )
 
 
-def collect_factors(model: nn.Module, batches: Iterable[dict], meta: dict | None = None, **kw) -> Factors:
-    """One collector over all batches; kw go to KFACCollector."""
-    with KFACCollector(model, **kw) as kc:
-        for b in batches:
-            kc.collect(b)
-    return kc.finalize(meta)
+def collect_factors(
+    model: nn.Module, batches: Iterable[dict], meta: dict | None = None, **collector_options
+) -> Factors:
+    """Factors from one KFACCollector run over all batches; `collector_options` go to KFACCollector."""
+    with KFACCollector(model, **collector_options) as collector:
+        for batch in batches:
+            collector.collect(batch)
+    return collector.finalize(meta)
 
 
 def factor_bytes(
@@ -231,7 +309,11 @@ def factor_bytes(
     bytes_per: int = 4,
 ) -> int:
     """Memory of one layer's factors for one data side over all row sets (the plan in IMPLEMENTATION.md)."""
-    q, kv = n_heads * head_dim, n_kv * head_dim
-    a = (1 if shared else 5) * hidden**2 + q**2 + inter**2  # shared in, o_proj in, down in
-    g = q**2 + 2 * kv**2 + hidden**2 + 2 * inter**2 + hidden**2  # q, k, v, o, gate, up, down
-    return (a + g) * n_row_sets * bytes_per
+    q_width = n_heads * head_dim
+    kv_width = n_kv * head_dim
+    n_copies_of_shared_input = 1 if shared else 5
+    # input factors: the shared input (q/k/v/gate/up), o_proj input, down_proj input
+    input_entries = n_copies_of_shared_input * hidden**2 + q_width**2 + inter**2
+    # output factors: q, k, v, o, gate, up, down
+    output_entries = q_width**2 + 2 * kv_width**2 + hidden**2 + 2 * inter**2 + hidden**2
+    return (input_entries + output_entries) * n_row_sets * bytes_per

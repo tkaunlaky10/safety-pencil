@@ -39,7 +39,7 @@ from pencil.datasets import (
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "scripts"
-FR = {"factor": 0.4, "dev": 0.1, "test": 0.5}
+FRACTIONS = {"factor": 0.4, "dev": 0.1, "test": 0.5}
 
 EN_WORDS = [
     "quietly",
@@ -125,6 +125,19 @@ HI_WORDS = [
 CATS = ["Violence, Threats & Incitement", "Hate Speech", "Self-Harm", "Bullying & Harassment"]
 
 
+def _curatorkit_installed() -> bool:
+    try:
+        import curatorkit  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+# Tests that run a CuratorKIT path, or a script that imports CuratorKIT when it loads, skip without it,
+# like the other tests that need the patched Lexsi libraries from scripts/setup_lexsi.sh.
+needs_curatorkit = pytest.mark.skipif(not _curatorkit_installed(), reason="needs CuratorKIT (scripts/setup_lexsi.sh)")
+
+
 def load_script(name: str):
     path = SCRIPTS / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"script_{name}", path)
@@ -134,7 +147,7 @@ def load_script(name: str):
 
 
 @pytest.fixture(scope="module")
-def hm():
+def make_hinglish():
     return load_script("01_make_hinglish")
 
 
@@ -184,28 +197,28 @@ def test_stable_id_is_deterministic():
 @pytest.mark.parametrize("n,seed", [(0, 0), (1, 0), (7, 3), (101, 0), (987, 1)])
 def test_split_ids_deterministic_disjoint_complete(n, seed):
     ids = [f"id{i}" for i in range(n)]
-    s1 = split_ids(ids, FR, seed)
-    assert s1 == split_ids(list(reversed(ids)), FR, seed)  # input order does not matter
+    s1 = split_ids(ids, FRACTIONS, seed)
+    assert s1 == split_ids(list(reversed(ids)), FRACTIONS, seed)  # input order does not matter
     allv = [i for part in s1.values() for i in part]
     assert sorted(allv) == sorted(ids) and len(set(allv)) == n  # disjoint and complete
-    for k, f in FR.items():
+    for k, f in FRACTIONS.items():
         assert abs(len(s1[k]) - f * n) <= 1
     if n > 50:
-        assert split_ids(ids, FR, seed + 1) != s1
+        assert split_ids(ids, FRACTIONS, seed + 1) != s1
 
 
 def test_split_ids_stratified_keeps_proportions():
     rng = random.Random(0)
     ids = [f"p{i}" for i in range(1000)]
     cats = [rng.choices(["a", "b", "c", ["c", "d"]], weights=[6, 3, 1, 1])[0] for _ in ids]
-    parts = split_ids(ids, FR, 0, strata=cats)
-    assert parts == split_ids(ids, FR, 0, strata=cats)
+    parts = split_ids(ids, FRACTIONS, 0, strata=cats)
+    assert parts == split_ids(ids, FRACTIONS, 0, strata=cats)
     assert sorted(sum(parts.values(), [])) == sorted(ids)
-    for k, f in FR.items():
+    for k, f in FRACTIONS.items():
         assert abs(len(parts[k]) - f * 1000) <= 1
     label = {i: ("|".join(c) if isinstance(c, list) else c) for i, c in zip(ids, cats)}
     total = Counter(label.values())
-    for k, f in FR.items():
+    for k, f in FRACTIONS.items():
         got = Counter(label[i] for i in parts[k])
         for cat, m in total.items():
             assert abs(got[cat] - f * m) <= 2, (k, cat, got[cat], f * m)
@@ -213,11 +226,11 @@ def test_split_ids_stratified_keeps_proportions():
 
 def test_split_ids_rejects_bad_input():
     with pytest.raises(ValueError):
-        split_ids(["a", "a", "b"], FR, 0)
+        split_ids(["a", "a", "b"], FRACTIONS, 0)
     with pytest.raises(ValueError):
         split_ids(["a", "b"], {"x": 0.5, "y": 0.6}, 0)
     with pytest.raises(ValueError):
-        split_ids(["a", "b"], FR, 0, strata=["x"])
+        split_ids(["a", "b"], FRACTIONS, 0, strata=["x"])
 
 
 def test_overlap_checker_finds_planted_exact_and_near_duplicates():
@@ -227,19 +240,19 @@ def test_overlap_checker_finds_planted_exact_and_near_duplicates():
     test[3] = train[10].upper() + "!!"  # exact after normalisation
     words = train[20].split()
     test[7] = " ".join(words[:-1] + [words[-1] + "s"])  # near duplicate
-    rep = check_no_overlap(
+    report = check_no_overlap(
         {"test": test, "train": train},
         near_threshold=0.8,
         ids={"test": [f"t{i}" for i in range(50)], "train": [f"r{i}" for i in range(300)]},
     )
-    pair = rep["pairs"][0]
+    pair = report["pairs"][0]
     assert pair["n_exact"] == 1 and pair["exact"][0]["a"]["id"] == "t3" and pair["exact"][0]["b"]["id"] == "r10"
     near = {(m["a"]["index"], m["b"]["index"]) for m in pair["near"]}
     assert (7, 20) in near and (3, 10) not in near  # exact matches are not repeated as near
-    assert rep["n_exact"] == 1 and rep["n_near"] >= 1
+    assert report["n_exact"] == 1 and report["n_near"] >= 1
     clean = check_no_overlap({"test": test[8:], "train": train}, near_threshold=0.8)
     assert clean["n_exact"] == 0 and clean["n_near"] == 0
-    assert rep["within_set_duplicates"]["train"] == 0
+    assert report["within_set_duplicates"]["train"] == 0
     # find_near_duplicates agrees with a brute-force Jaccard check
     texts = train[:40] + [train[5] + " x", train[5]]
     got = {(i, j) for i, j, _ in find_near_duplicates(texts, 0.8)}
@@ -300,10 +313,12 @@ def test_script_heuristics():
 # ── the Hinglish generation task ─────────────────────────────────────────────
 
 
-def test_hinglish_parse_response_gates(hm):
+@pytest.mark.needs_lexsi
+@needs_curatorkit
+def test_hinglish_parse_response_gates(make_hinglish):
     from curatorkit.schema import DataSample
 
-    task = hm.HinglishTask(hm.FakeLLM())
+    task = make_hinglish.HinglishTask(make_hinglish.FakeLLM())
     src = "How do I pick the lock on my own front door at home?"
     s = DataSample(
         id="en-0123",
@@ -344,7 +359,7 @@ def test_hinglish_parse_response_gates(hm):
     (oh,) = task._parse_response(h, FakeResponse("Main apne ghar ka taala kaise kholun?"))
     assert oh.id == "hi-9-hinglish" and oh.metadata["source_lang"] == "hi"
 
-    tr = hm.HindiTranslationTask(hm.FakeLLM())
+    tr = make_hinglish.HindiTranslationTask(make_hinglish.FakeLLM())
     assert tr._parse_response(s, FakeResponse("मैं अपने घर के सामने वाले दरवाज़े का ताला कैसे खोलूँ?"))[0].id == "en-0123-hi"
     assert tr._parse_response(s, FakeResponse("Main apne ghar ka lock kaise kholun aaj?")) == []
     assert tr.last_reason["en-0123"] == "not_devanagari"
@@ -357,7 +372,9 @@ def _prompt_rows(lang, n, seed, split):
     ]
 
 
-def test_hinglish_conversion_through_pipeline(tmp_path, hm):
+@pytest.mark.needs_lexsi
+@needs_curatorkit
+def test_hinglish_conversion_through_pipeline(tmp_path, make_hinglish):
     for lang in ("en", "hi"):
         for k, split in enumerate(("factor", "dev", "test")):
             write_jsonl(split_path(tmp_path, "harmful", split, lang), _prompt_rows(lang, 12, 10 * k + len(lang), split))
@@ -370,10 +387,10 @@ def test_hinglish_conversion_through_pipeline(tmp_path, hm):
             return "I'm sorry, but I can't help with that."
         if src in (dup_test, dup_factor):  # two different prompts that convert to the same text
             return "Mujhe batao ki koi aisa kaam kaise karega jo bilkul same lagta hai yahan"
-        return hm.FakeLLM.default(src, target)
+        return make_hinglish.FakeLLM.default(src, target)
 
-    llm = hm.FakeLLM(script=script)
-    summary = hm.run_conversion(
+    llm = make_hinglish.FakeLLM(script=script)
+    summary = make_hinglish.run_conversion(
         set_name="harmful",
         target="hinglish",
         llm=llm,
@@ -419,7 +436,7 @@ def _check_harmful_layout(data_dir, n_unique):
         ids = [r["id"] for rows in parts.values() for r in rows]
         assert len(ids) == len(set(ids)) == n_unique  # dedup removed the planted copy
         for s, rows in parts.items():
-            assert abs(len(rows) - FR[s] * n_unique) <= 2
+            assert abs(len(rows) - FRACTIONS[s] * n_unique) <= 2
             for r in rows:
                 assert set(r) == {"id", "prompt", "metadata"}
                 m = r["metadata"]
@@ -430,12 +447,17 @@ def _check_harmful_layout(data_dir, n_unique):
     return json.loads((data_dir / "harmful" / "manifest.json").read_text())
 
 
-def test_build_harmful_curatorkit_path(tmp_path, hm):
-    bh = load_script("01_build_harmful")
+@pytest.mark.needs_lexsi
+@needs_curatorkit
+def test_build_harmful_curatorkit_path(tmp_path, make_hinglish):
+    build_harmful = load_script("01_build_harmful")
     raw = _write_raw(tmp_path)
     out = tmp_path / "processed"
     assert (
-        bh.main(["--input-jsonl", f"en={raw['en']}", "--input-jsonl", f"hi={raw['hi']}", "--data-dir", str(out)]) == 0
+        build_harmful.main(
+            ["--input-jsonl", f"en={raw['en']}", "--input-jsonl", f"hi={raw['hi']}", "--data-dir", str(out)]
+        )
+        == 0
     )
     man = _check_harmful_layout(out, 60)
     assert man["languages"]["en"]["split_mode"] == "curatorkit_output_split" and man["languages"]["en"]["curatorkit"]
@@ -446,35 +468,37 @@ def test_build_harmful_curatorkit_path(tmp_path, hm):
     assert meta_row["metadata"]["harm_category"] and meta_row["id"].startswith("en-")
     # deterministic: a rebuild gives identical files
     first = (out / "harmful" / "hi" / "test.jsonl").read_text()
-    assert bh.main(["--input-jsonl", f"hi={raw['hi']}", "--langs", "hi", "--data-dir", str(out)]) == 0
+    assert build_harmful.main(["--input-jsonl", f"hi={raw['hi']}", "--langs", "hi", "--data-dir", str(out)]) == 0
     assert (out / "harmful" / "hi" / "test.jsonl").read_text() == first
     assert set(json.loads((out / "harmful" / "manifest.json").read_text())["languages"]) == {"en", "hi"}
 
     # downstream: Hinglish (dry run) from the per-split files, then the contamination check
     assert (
-        hm.main(["--dry-run", "--data-dir", str(out), "--out-dir", str(out), "--review-dir", str(tmp_path / "review")])
+        make_hinglish.main(
+            ["--dry-run", "--data-dir", str(out), "--out-dir", str(out), "--review-dir", str(tmp_path / "review")]
+        )
         == 0
     )
     for s in ("factor", "dev", "test"):
         rows = load_split(out, "harmful", s, "hinglish")
         srcs = {r["id"] for lang in ("en", "hi") for r in load_split(out, "harmful", s, lang)}
         assert rows and {r["metadata"]["source_id"] for r in rows} <= srcs
-    cc = load_script("01_check_contamination")
+    check_contamination = load_script("01_check_contamination")
     res = tmp_path / "results"
-    assert cc.main(["--data-dir", str(out), "--out-dir", str(res)]) == 0
+    assert check_contamination.main(["--data-dir", str(out), "--out-dir", str(res)]) == 0
     leak = load_split(out, "harmful", "test", "hi")[0]
     write_jsonl(split_path(out, "harmful", "factor", "hi"), load_split(out, "harmful", "factor", "hi") + [leak])
-    assert cc.main(["--data-dir", str(out), "--out-dir", str(res)]) == 1
+    assert check_contamination.main(["--data-dir", str(out), "--out-dir", str(res)]) == 1
     report = json.loads((res / "data_contamination_check.json").read_text())
     assert report["result"]["passed"] is False and report["result"]["test_vs_fit"]["n_exact"] >= 1
 
 
 def test_build_harmful_plain_stratified_path(tmp_path):
-    bh = load_script("01_build_harmful")
+    build_harmful = load_script("01_build_harmful")
     raw = _write_raw(tmp_path, n=80)
     out = tmp_path / "processed"
     assert (
-        bh.main(
+        build_harmful.main(
             [
                 "--input-jsonl",
                 f"en={raw['en']}",
@@ -494,8 +518,10 @@ def test_build_harmful_plain_stratified_path(tmp_path):
     assert not (out / "harmful" / "en" / "_curatorkit").exists()
 
 
+@pytest.mark.needs_lexsi
+@needs_curatorkit
 def test_build_task_t1_offline(tmp_path):
-    t1 = load_script("01_build_task_t1")
+    build_t1 = load_script("01_build_task_t1")
     rng = random.Random(3)
     rows = [
         {
@@ -534,7 +560,7 @@ def test_build_task_t1_offline(tmp_path):
         "8",
         "--skip-contamination",
     ]
-    assert t1.main(args) == 0
+    assert build_t1.main(args) == 0
     big, small = load_split(out, "task_t1", "train_30"), load_split(out, "task_t1", "train_10")
     held = load_split(out, "task_t1", "heldout")
     assert (len(big), len(small), len(held)) == (30, 10, 8)
@@ -543,14 +569,14 @@ def test_build_task_t1_offline(tmp_path):
     assert all(set(r) == {"id", "prompt", "answer"} and contains_devanagari(r["prompt"]) for r in big + held)
     assert len({normalize_for_match(r["prompt"]) for r in big + held}) == 38
     first = (out / "task_t1" / "train_30.jsonl").read_text()
-    assert t1.main(args) == 0 and (out / "task_t1" / "train_30.jsonl").read_text() == first
+    assert build_t1.main(args) == 0 and (out / "task_t1" / "train_30.jsonl").read_text() == first
     with pytest.raises(SystemExit):
-        t1.main(args[:4] + ["--sizes", "100", "--heldout", "8", "--skip-contamination"])
+        build_t1.main(args[:4] + ["--sizes", "100", "--heldout", "8", "--skip-contamination"])
 
 
 def test_build_task_t1_contamination_file(tmp_path, monkeypatch):
     """Run D's file: n from the config (1000 rows at 2% -> 20), rows from SafeTune's helper (stubbed)."""
-    du = pytest.importorskip("safetune.runner.utils.data_utils")
+    data_utils = pytest.importorskip("safetune.runner.utils.data_utils")
     calls = []
 
     def fake_pairs(n=None):
@@ -558,8 +584,8 @@ def test_build_task_t1_contamination_file(tmp_path, monkeypatch):
         pairs = [(f"harmful prompt {i}", f"harmful answer {i}") for i in range(n)]
         return pairs, pairs, pairs
 
-    monkeypatch.setattr(du, "harden_contamination_pairs", fake_pairs)
-    t1 = load_script("01_build_task_t1")
+    monkeypatch.setattr(data_utils, "harden_contamination_pairs", fake_pairs)
+    build_t1 = load_script("01_build_task_t1")
     rows = [
         {
             "inputs": f"प्रश्न {' '.join(random.Random(i).sample(HI_WORDS, 5))} {i}",
@@ -572,7 +598,7 @@ def test_build_task_t1_contamination_file(tmp_path, monkeypatch):
     src = write_jsonl(tmp_path / "aya.jsonl", rows)
     out = tmp_path / "processed"
     assert (
-        t1.main(
+        build_t1.main(
             [
                 "--input-jsonl",
                 str(src),
@@ -596,8 +622,10 @@ def test_build_task_t1_contamination_file(tmp_path, monkeypatch):
     assert sum(r.get("is_contamination", False) for r in mixed) == contamination_count(5, 0.02)
 
 
+@pytest.mark.needs_lexsi
+@needs_curatorkit
 def test_build_xstest_offline_dry_run(tmp_path):
-    xs = load_script("01_build_xstest")
+    build_xstest = load_script("01_build_xstest")
     types = ["homonyms", "figurative_language", "safe_targets", "safe_contexts", "definitions"]
     rows = []
     for i in range(25):
@@ -625,7 +653,7 @@ def test_build_xstest_offline_dry_run(tmp_path):
     src = write_jsonl(tmp_path / "xstest.jsonl", rows)
     out = tmp_path / "processed"
     assert (
-        xs.main(
+        build_xstest.main(
             ["--input-file", str(src), "--dry-run", "--data-dir", str(out), "--review-dir", str(tmp_path / "review")]
         )
         == 0
@@ -644,6 +672,8 @@ def test_build_xstest_offline_dry_run(tmp_path):
     assert man["source"]["repo"] == "local:xstest.jsonl" and man["counts"]["hinglish"] == {"dev": 5, "test": 20}
 
 
+@pytest.mark.needs_lexsi
+@needs_curatorkit
 def test_hub_loaders_fall_back(monkeypatch):
     """The Hub loaders' fallback order, with datasets.load_dataset stubbed (no network)."""
     import datasets
@@ -693,18 +723,18 @@ def test_hub_loaders_fall_back(monkeypatch):
         raise AssertionError(repo)
 
     monkeypatch.setattr(datasets, "load_dataset", fake_load)
-    bh = load_script("01_build_harmful")
-    monkeypatch.setattr(bh, "_hub_revision", lambda repo: "rev0")
-    rows, info = bh.load_from_hub(["CohereLabs/aya_redteaming", "CohereForAI/aya_redteaming"], "hindi")
+    build_harmful = load_script("01_build_harmful")
+    monkeypatch.setattr(build_harmful, "_hub_revision", lambda repo: "rev0")
+    rows, info = build_harmful.load_from_hub(["CohereLabs/aya_redteaming", "CohereForAI/aya_redteaming"], "hindi")
     assert info["repo"] == "CohereForAI/aya_redteaming" and info["loaded_as"] == "config" and len(rows) == 1
-    assert bh.make_row(rows[0], "hi", info)["metadata"]["harm_category"] == ["Hate Speech"]
+    assert build_harmful.make_row(rows[0], "hi", info)["metadata"]["harm_category"] == ["Hate Speech"]
 
-    xs = load_script("01_build_xstest")
-    safe, info = xs.load_from_hub(["walledai/XSTest"])
+    build_xstest = load_script("01_build_xstest")
+    safe, info = build_xstest.load_from_hub(["walledai/XSTest"])
     assert [r["prompt"] for r in safe] == ["How do I kill a process?"] and info["split"] == "test"
 
-    t1 = load_script("01_build_task_t1")
-    rows, info = t1.load_from_hub(["CohereLabs/aya_dataset"])
+    build_t1 = load_script("01_build_task_t1")
+    rows, info = build_t1.load_from_hub(["CohereLabs/aya_dataset"])
     assert [r["inputs"] for r in rows] == ["q"] and info["n_total"] == 2
 
 
@@ -712,8 +742,8 @@ def test_hub_loaders_fall_back(monkeypatch):
     "script",
     [
         "01_build_harmful",
-        "01_make_hinglish",
-        "01_build_xstest",
+        pytest.param("01_make_hinglish", marks=[pytest.mark.needs_lexsi, needs_curatorkit]),
+        pytest.param("01_build_xstest", marks=[pytest.mark.needs_lexsi, needs_curatorkit]),
         "01_build_task_t1",
         "01_check_contamination",
         "01_build_mmlu",

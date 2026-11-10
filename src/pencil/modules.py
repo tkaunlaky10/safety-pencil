@@ -20,65 +20,90 @@ MLP_WIDE_OUTPUT = ("gate_proj", "up_proj")  # output side is intermediate_size
 MLP_WIDE_INPUT = ("down_proj",)  # input side is intermediate_size
 PARALLEL_MODEL_TYPES = ("cohere", "cohere2")
 
-_NAME = re.compile(r"^(?P<prefix>.*?)layers\.(?P<layer>\d+)\.(?:self_attn|mlp)\.(?P<leaf>\w+_proj)$")
-_LAYER = re.compile(r"layers\.(\d+)\.")
+_MODULE_NAME = re.compile(r"^(?P<prefix>.*?)layers\.(?P<layer>\d+)\.(?:self_attn|mlp)\.(?P<leaf>\w+_proj)$")
+_LAYER_INDEX = re.compile(r"layers\.(\d+)\.")
 
 
 def parse_name(name: str) -> tuple[str, int, str]:
-    """'model.layers.3.self_attn.q_proj' -> ('model.', 3, 'q_proj')."""
-    m = _NAME.match(name)
-    if not m:
+    """Split a decoder linear module's name: 'model.layers.3.self_attn.q_proj' -> ('model.', 3, 'q_proj')."""
+    match = _MODULE_NAME.match(name)
+    if not match:
         raise ValueError(f"not a decoder linear module: {name}")
-    return m["prefix"], int(m["layer"]), m["leaf"]
+    return match["prefix"], int(match["layer"]), match["leaf"]
 
 
 def leaf(name: str) -> str:
+    """The last part of a module name: 'model.layers.3.self_attn.q_proj' -> 'q_proj'."""
     return name.rsplit(".", 1)[-1]
 
 
 def layer_of(name: str) -> int:
     """Layer index in any key that contains 'layers.<L>.' (-1 if none)."""
-    m = _LAYER.search(name)
-    return int(m.group(1)) if m else -1
+    match = _LAYER_INDEX.search(name)
+    if not match:
+        return -1
+    return int(match.group(1))
 
 
 def layer_order(names: Iterable[str]) -> list[str]:
     """Sort by layer, then name, so per-layer data is loaded once when iterating."""
-    return sorted(names, key=lambda n: (layer_of(n), n))
+    return sorted(names, key=_layer_then_name)
+
+
+def _layer_then_name(name: str) -> tuple[int, str]:
+    return layer_of(name), name
 
 
 def target_modules(model: nn.Module, layers: Iterable[int] | None = None) -> dict[str, nn.Linear]:
     """Every q/k/v/o/gate/up/down nn.Linear in the decoder (optionally only in `layers`)."""
-    keep = None if layers is None else {int(x) for x in layers}
-    out = {}
+    wanted_layers = None
+    if layers is not None:
+        wanted_layers = {int(layer) for layer in layers}
+    targets = {}
     for name, module in model.named_modules():
-        m = _NAME.match(name)
-        if m and m["leaf"] in LEAVES and isinstance(module, nn.Linear) and (keep is None or int(m["layer"]) in keep):
-            out[name] = module
-    if not out:
+        if _is_target(name, module, wanted_layers):
+            targets[name] = module
+    if not targets:
         raise ValueError("no plain nn.Linear decoder modules found; merge any PEFT adapter into the weights first")
-    return out
+    return targets
+
+
+def _is_target(name: str, module: nn.Module, wanted_layers: set[int] | None) -> bool:
+    """True for a plain nn.Linear q/k/v/o/gate/up/down module in one of the wanted layers (None: any)."""
+    match = _MODULE_NAME.match(name)
+    if not match or match["leaf"] not in LEAVES or not isinstance(module, nn.Linear):
+        return False
+    return wanted_layers is None or int(match["layer"]) in wanted_layers
 
 
 def is_parallel_block(model: nn.Module) -> bool:
-    return getattr(getattr(model, "config", None), "model_type", None) in PARALLEL_MODEL_TYPES
+    """True for model types whose attention and MLP read the same input_layernorm output."""
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    return model_type in PARALLEL_MODEL_TYPES
 
 
 def input_factor_key(name: str, shared: bool) -> str:
     """Key of the input factor a module uses: the layer's shared key for q/k/v/gate/up in a parallel block,
     otherwise the module's own name."""
-    prefix, layer, lf = parse_name(name)
-    return f"{prefix}layers.{layer}.input" if shared and lf in SHARED_INPUT else name
+    prefix, layer, module_leaf = parse_name(name)
+    if shared and module_leaf in SHARED_INPUT:
+        return f"{prefix}layers.{layer}.input"
+    return name
 
 
 def decoder(model: nn.Module) -> nn.Module:
     """The transformer body (embeddings + layers + final norm) of a causal LM."""
     body = getattr(model, "model", None)
-    return body if body is not None else model.get_decoder()
+    if body is None:
+        return model.get_decoder()
+    return body
 
 
 def lm_logits(model: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
     """LM head on chosen hidden states only (the vocabulary is 262k, so never run it on every position)."""
     logits = model.get_output_embeddings()(hidden)
     scale = getattr(model, "logit_scale", None)  # Cohere multiplies logits by logit_scale
-    return logits * scale if scale is not None else logits
+    if scale is None:
+        return logits
+    return logits * scale

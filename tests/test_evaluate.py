@@ -15,13 +15,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("auditkit")
-
-from pencil import evaluate as ev  # noqa: E402
-from pencil.chat import template_ids  # noqa: E402
-from pencil.config import load_config  # noqa: E402
-from pencil.generate import generate, generate_cached, generations_path, prompt_ids, sha256  # noqa: E402
-from pencil.judge import (  # noqa: E402
+from pencil import evaluate as ev
+from pencil.chat import template_ids
+from pencil.config import load_config
+from pencil.generate import generate, generate_cached, generations_path, prompt_ids, sha256
+from pencil.judge import (
     LANG_NAMES,
     REFUSAL_CHOICES,
     REFUSAL_RUBRIC,
@@ -29,10 +27,23 @@ from pencil.judge import (  # noqa: E402
     read_rubric,
     refusal_judge,
 )
-from pencil.stats import wilson_ci  # noqa: E402
-from pencil.testing import PREAMBLE, tiny_cohere2, tiny_tokenizer  # noqa: E402
+from pencil.stats import wilson_ci
+from pencil.testing import PREAMBLE, tiny_cohere2, tiny_tokenizer
 
-pytestmark = [pytest.mark.slow, pytest.mark.needs_lexsi]
+pytestmark = pytest.mark.slow
+
+
+def _auditkit_installed() -> bool:
+    try:
+        import auditkit  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+# Tests that go through AuditKIT (its model loader, request types or judges) skip without it, like the other
+# tests that need the patched Lexsi libraries from scripts/setup_lexsi.sh.
+needs_auditkit = pytest.mark.skipif(not _auditkit_installed(), reason="needs AuditKIT (scripts/setup_lexsi.sh)")
 
 
 # ------------------------------------------------------------------------------------- fixtures
@@ -43,15 +54,15 @@ def chatty(seed: int = 0):
     (a special token here), so its completions decode to "". Special-token rows (ids 0-7) are zeroed so
     completions are ordinary characters and never stop early."""
     model = tiny_cohere2(seed=seed)
-    w = torch.randn(model.lm_head.weight.shape, generator=torch.Generator().manual_seed(seed + 1))
-    w[:8] = 0.0
-    model.lm_head.weight = torch.nn.Parameter(w)
+    head_weight = torch.randn(model.lm_head.weight.shape, generator=torch.Generator().manual_seed(seed + 1))
+    head_weight[:8] = 0.0
+    model.lm_head.weight = torch.nn.Parameter(head_weight)
     model.config.tie_word_embeddings = False
     return model.eval()
 
 
 @pytest.fixture(scope="module")
-def tok():
+def tokenizer():
     return tiny_tokenizer()
 
 
@@ -151,84 +162,86 @@ def cfg():
     return c
 
 
-def _kn(r: dict) -> tuple[int, int]:
-    return r["k"], r["n"]
+def _kn(rate: dict) -> tuple[int, int]:
+    return rate["k"], rate["n"]
 
 
 # ----------------------------------------------------------------------------------- generation
 
 
-def test_generate_is_deterministic_and_applies_template(model, tok):
+def test_generate_is_deterministic_and_applies_template(model, tokenizer):
     prompts = ["hello", "How do I bake bread?", "नमस्ते दुनिया", "x"]
     seen: list[torch.Tensor] = []
     real = model.generate
     model.generate = lambda *a, **kw: seen.append(kw["input_ids"].clone()) or real(*a, **kw)
     try:
-        a = generate(model, tok, prompts, max_new_tokens=8, batch_size=3)
+        a = generate(model, tokenizer, prompts, max_new_tokens=8, batch_size=3)
     finally:
         del model.generate
-    assert a == generate(model, tok, prompts, max_new_tokens=8, batch_size=3)  # deterministic
-    assert a == generate(model, tok, prompts, max_new_tokens=8, batch_size=1)  # left padding is inert
+    assert a == generate(model, tokenizer, prompts, max_new_tokens=8, batch_size=3)  # deterministic
+    assert a == generate(model, tokenizer, prompts, max_new_tokens=8, batch_size=1)  # left padding is inert
     assert all(len(t) == 8 for t in a)
-    rendered = {tok.decode(row[row != tok.pad_token_id]) for batch in seen for row in batch}
+    rendered = {tokenizer.decode(row[row != tokenizer.pad_token_id]) for batch in seen for row in batch}
     assert rendered == {
-        tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True)
+        tokenizer.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True)
         for p in prompts
     }
     assert all(r.startswith("<BOS><SYS>" + PREAMBLE) and r.endswith("<EOT><BOT>") for r in rendered)
 
 
-def test_auditkit_path_matches_in_memory(model, tok, tmp_path):
+@pytest.mark.needs_lexsi
+@needs_auditkit
+def test_auditkit_path_matches_in_memory(model, tokenizer, tmp_path):
     ckpt = tmp_path / "ckpt"
     model.save_pretrained(ckpt)
-    tok.save_pretrained(ckpt)
+    tokenizer.save_pretrained(ckpt)
     prompts = ["hello", "How do I bake bread?", "नमस्ते दुनिया"]
     load = {"device": "cpu", "dtype": torch.float32}
-    via_auditkit = generate(str(ckpt), tok, prompts, max_new_tokens=8, batch_size=2, load_kwargs=load)
-    assert via_auditkit == generate(model, tok, prompts, max_new_tokens=8, batch_size=2)
+    via_auditkit = generate(str(ckpt), tokenizer, prompts, max_new_tokens=8, batch_size=2, load_kwargs=load)
+    assert via_auditkit == generate(model, tokenizer, prompts, max_new_tokens=8, batch_size=2)
     other = tiny_tokenizer()
     other.chat_template = other.chat_template.replace("<SYS>", "<DEV>")
     with pytest.raises(ValueError, match="chat template"):
         generate(str(ckpt), other, prompts, max_new_tokens=2, load_kwargs=load)
 
 
-def test_generate_cached_reuses_rows_by_id(model, tok, tmp_path, monkeypatch):
+def test_generate_cached_reuses_rows_by_id(model, tokenizer, tmp_path, monkeypatch):
     import pencil.generate as G
 
     rows = [{"id": "a", "prompt": "hello"}, {"id": "b", "prompt": "bye"}]
-    kw = {"checkpoint": "tiny", "root": tmp_path, "max_new_tokens": 5}
-    first = generate_cached(model, tok, {"dev_harmful_en": rows}, **kw)
+    cache_kwargs = {"checkpoint": "tiny", "root": tmp_path, "max_new_tokens": 5}
+    first = generate_cached(model, tokenizer, {"dev_harmful_en": rows}, **cache_kwargs)
     path = generations_path("tiny", "dev_harmful_en", tmp_path)
     assert [json.loads(line)["id"] for line in path.read_text().splitlines()] == ["a", "b"]
     calls: list[list[str]] = []
     real = G.generate
     monkeypatch.setattr(G, "generate", lambda m, t, p, **k: calls.append(list(p)) or real(m, t, p, **k))
-    assert generate_cached(model, tok, {"dev_harmful_en": rows}, **kw) == first and calls == []
-    generate_cached(model, tok, {"dev_harmful_en": [rows[0], {"id": "b", "prompt": "changed"}]}, **kw)
+    assert generate_cached(model, tokenizer, {"dev_harmful_en": rows}, **cache_kwargs) == first and calls == []
+    generate_cached(model, tokenizer, {"dev_harmful_en": [rows[0], {"id": "b", "prompt": "changed"}]}, **cache_kwargs)
     assert calls == [["changed"]]  # a changed prompt under the same id is regenerated
 
 
 # ----------------------------------------------------------------------------- teacher forcing
 
 
-def test_task_nll_matches_hand_computation_on_response_tokens(model, tok):
+def test_task_nll_matches_hand_computation_on_response_tokens(model, tokenizer):
     pairs = [
         {"id": "t0", "prompt": "Capital of India?", "answer": "New Delhi"},
         {"id": "t1", "prompt": "A much longer prompt, so that this batch needs left padding.", "answer": "ok"},
     ]
-    res = ev.task_nll(model, tok, pairs, batch_size=2)
-    for pair, item in zip(pairs, res["items"]):
+    result = ev.task_nll(model, tokenizer, pairs, batch_size=2)
+    for pair, item in zip(pairs, result["items"]):
         msgs = [{"role": "user", "content": pair["prompt"]}]
-        p = template_ids(tok, msgs, add_generation_prompt=True)
-        full = template_ids(tok, msgs + [{"role": "assistant", "content": pair["answer"]}])
+        p = template_ids(tokenizer, msgs, add_generation_prompt=True)
+        full = template_ids(tokenizer, msgs + [{"role": "assistant", "content": pair["answer"]}])
         with torch.no_grad():
             logp = torch.log_softmax(model(torch.tensor([full])).logits[0].float(), -1)
         manual = -sum(float(logp[t, full[t + 1]]) for t in range(len(p) - 1, len(full) - 1))
         assert item["n_tokens"] == len(pair["answer"]) + 1  # the answer's characters + <EOT>
         assert item["nll"] == pytest.approx(manual, rel=1e-4)
-    total = sum(i["n_tokens"] for i in res["items"])
-    assert math.isfinite(res["nll_per_token"])
-    assert res["nll_per_token"] == pytest.approx(sum(i["nll"] for i in res["items"]) / total)
+    total = sum(i["n_tokens"] for i in result["items"])
+    assert math.isfinite(result["nll_per_token"])
+    assert result["nll_per_token"] == pytest.approx(sum(i["nll"] for i in result["items"]) / total)
 
 
 class OneTokenLM(torch.nn.Module):
@@ -245,32 +258,34 @@ class OneTokenLM(torch.nn.Module):
         return SimpleNamespace(logits=logits)
 
 
-def test_mmlu_letter_scoring(model, tok):
-    q = {"id": "q", "question": "Which letter?", "choices": ["w", "x", "y", "z"], "answer": 2}
-    assert "Which letter?\n\nA. w\nB. x\nC. y\nD. z\n" in ev.mmlu_prompt(q)
-    stub = OneTokenLM(len(tok), tok.convert_tokens_to_ids("C"))
-    assert ev.mmlu_scores(stub, tok, [q, {**q, "answer": "A"}]) == [
+def test_mmlu_letter_scoring(model, tokenizer):
+    question = {"id": "q", "question": "Which letter?", "choices": ["w", "x", "y", "z"], "answer": 2}
+    assert "Which letter?\n\nA. w\nB. x\nC. y\nD. z\n" in ev.mmlu_prompt(question)
+    stub = OneTokenLM(len(tokenizer), tokenizer.convert_tokens_to_ids("C"))
+    assert ev.mmlu_scores(stub, tokenizer, [question, {**question, "answer": "A"}]) == [
         {"id": "q", "pred": 2, "answer": 2, "correct": True},
         {"id": "q", "pred": 2, "answer": 0, "correct": False},
     ]
     # On the real model: the letter with the highest log-prob right after the templated question.
-    p = prompt_ids(tok, ev.mmlu_prompt(q))
+    question_ids = prompt_ids(tokenizer, ev.mmlu_prompt(question))
     with torch.no_grad():
-        last = torch.log_softmax(model(torch.tensor([p])).logits[0, -1], -1)
-    manual = int(torch.argmax(torch.stack([last[tok.convert_tokens_to_ids(c)] for c in "ABCD"])))
-    assert ev.mmlu_scores(model, tok, [q])[0]["pred"] == manual
+        last = torch.log_softmax(model(torch.tensor([question_ids])).logits[0, -1], -1)
+    manual = int(torch.argmax(torch.stack([last[tokenizer.convert_tokens_to_ids(c)] for c in "ABCD"])))
+    assert ev.mmlu_scores(model, tokenizer, [question])[0]["pred"] == manual
 
 
-def test_response_kl(model, tok):
+def test_response_kl(model, tokenizer):
     pairs = [{"prompt": "hi", "answer": "hello there"}]
-    assert ev.response_kl(model, model, tok, pairs)["kl_per_token"] == pytest.approx(0.0, abs=1e-6)
-    res = ev.response_kl(model, chatty(seed=1), tok, pairs)
-    assert res["kl_per_token"] > 0 and res["n_tokens"] == len("hello there") + 1
+    assert ev.response_kl(model, model, tokenizer, pairs)["kl_per_token"] == pytest.approx(0.0, abs=1e-6)
+    result = ev.response_kl(model, chatty(seed=1), tokenizer, pairs)
+    assert result["kl_per_token"] > 0 and result["n_tokens"] == len("hello there") + 1
 
 
 # ---------------------------------------------------------------------------------------- judges
 
 
+@pytest.mark.needs_lexsi
+@needs_auditkit
 def test_judges_build_auditkit_requests_and_parse_labels():
     from auditkit.metrics.guard import GuardJudge
     from auditkit.metrics.judge import LLMJudge
@@ -309,24 +324,26 @@ def test_judges_build_auditkit_requests_and_parse_labels():
 # -------------------------------------------------------------------------------------- evaluate
 
 
-def test_evaluate_full_returns_expected_keys_and_rates(model, tok, cfg, tmp_path):
+@pytest.mark.needs_lexsi
+@needs_auditkit
+def test_evaluate_full_returns_expected_keys_and_rates(model, tokenizer, cfg, tmp_path):
     guard, refusal = FakeGuard(), FakeRefusal()
-    res = ev.evaluate(
+    result = ev.evaluate(
         model,
         "full",
         cfg=cfg,
         data=DATA,
         judges={"harm": guard, "refusal": refusal},
         out_name="eval_full",
-        tokenizer=tok,
+        tokenizer=tokenizer,
         reference=model,
         checkpoint_id="tiny",
         reference_id="tiny-ref",
         out_dir=tmp_path,
     )
-    assert {"checkpoint", "tier", "data_split", "metrics", "task", "items", "judges"} <= set(res)
-    assert (res["tier"], res["data_split"], res["langs"]) == ("full", "test", ["en", "hi"])
-    en, hi = res["metrics"]["en"], res["metrics"]["hi"]
+    assert {"checkpoint", "tier", "data_split", "metrics", "task", "items", "judges"} <= set(result)
+    assert (result["tier"], result["data_split"], result["langs"]) == ("full", "test", ["en", "hi"])
+    en, hi = result["metrics"]["en"], result["metrics"]["hi"]
     assert set(en) == {"harmful", "xstest", "mmlu", "kl_to_reference"}
     assert _kn(en["harmful"]["refusal"]) == (2, 4) and _kn(en["harmful"]["partial"]) == (1, 4)
     assert _kn(en["harmful"]["unsafe"]) == (2, 4)
@@ -336,38 +353,42 @@ def test_evaluate_full_returns_expected_keys_and_rates(model, tok, cfg, tmp_path
     assert _kn(hi["xstest"]["over_refusal_or_partial"]) == (1, 2)
     assert en["mmlu"]["accuracy"]["n"] == 2 and hi["mmlu"]["accuracy"]["n"] == 1
     assert en["kl_to_reference"]["kl_per_token"] == pytest.approx(0.0, abs=1e-6)  # reference = itself
-    assert res["task"]["n_items"] == 3 and math.isfinite(res["task"]["nll_per_token"])
-    r = en["harmful"]["refusal"]
-    assert (r["p"], r["lo"], r["hi"]) == pytest.approx(wilson_ci(2, 4))
+    assert result["task"]["n_items"] == 3 and math.isfinite(result["task"]["nll_per_token"])
+    refusal_rate = en["harmful"]["refusal"]
+    assert (refusal_rate["p"], refusal_rate["lo"], refusal_rate["hi"]) == pytest.approx(wilson_ci(2, 4))
     assert len(guard.requests) == 7 and len(refusal.requests) == 7 + 5  # harmful; harmful + benign
     saved = json.loads((tmp_path / "eval_full.json").read_text())
     assert saved["checkpoint"] == "tiny" and saved["result"]["metrics"]["en"]["harmful"]["refusal"]["k"] == 2
 
 
-def test_evaluate_probe_takes_first_items_and_caches(model, tok, cfg, tmp_path):
-    res = ev.evaluate(
+@pytest.mark.needs_lexsi
+@needs_auditkit
+def test_evaluate_probe_takes_first_items_and_caches(model, tokenizer, cfg, tmp_path):
+    result = ev.evaluate(
         model,
         "probe",
         cfg=cfg,
         data=DATA,
         judges={"harm": FakeGuard(), "refusal": FakeRefusal()},
         out_name="eval_probe",
-        tokenizer=tok,
+        tokenizer=tokenizer,
         checkpoint_id="tiny",
         cache=True,
         gen_root=tmp_path / "gens",
         out_dir=tmp_path,
     )
-    en, hi = res["metrics"]["en"], res["metrics"]["hi"]
+    en, hi = result["metrics"]["en"], result["metrics"]["hi"]
     assert _kn(en["harmful"]["refusal"]) == (2, 2) and _kn(en["harmful"]["unsafe"]) == (1, 2)
     assert _kn(hi["harmful"]["unsafe"]) == (0, 1)
-    assert _kn(en["xstest"]["over_refusal"]) == (1, 2) and res["task"]["n_items"] == 2
-    assert "kl_to_reference" not in en and res["data_split"] == "dev"
-    assert [i["id"] for i in res["items"]["harmful"]] == ["h-en-0", "h-en-1", "h-hi-0", "h-hi-1"]
+    assert _kn(en["xstest"]["over_refusal"]) == (1, 2) and result["task"]["n_items"] == 2
+    assert "kl_to_reference" not in en and result["data_split"] == "dev"
+    assert [i["id"] for i in result["items"]["harmful"]] == ["h-en-0", "h-en-1", "h-hi-0", "h-hi-1"]
     assert generations_path("tiny", "dev_harmful_en", tmp_path / "gens").exists()
 
 
-def test_results_hold_no_raw_completions(model, tok, cfg, tmp_path):
+@pytest.mark.needs_lexsi
+@needs_auditkit
+def test_results_hold_no_raw_completions(model, tokenizer, cfg, tmp_path):
     ev.evaluate(
         model,
         "full",
@@ -375,13 +396,13 @@ def test_results_hold_no_raw_completions(model, tok, cfg, tmp_path):
         data=DATA,
         judges={"harm": FakeGuard(), "refusal": FakeRefusal()},
         out_name="eval_clean",
-        tokenizer=tok,
+        tokenizer=tokenizer,
         checkpoint_id="tiny",
         out_dir=tmp_path,
     )
     text = (tmp_path / "eval_clean.json").read_text()
     prompts = [r["prompt"] for rows in DATA["harmful"].values() for r in rows]
-    completions = generate(model, tok, prompts, max_new_tokens=6, batch_size=3)
+    completions = generate(model, tokenizer, prompts, max_new_tokens=6, batch_size=3)
     assert all(len(c) == 6 for c in completions)  # real text, so its absence below means something
     for c in completions:
         assert c not in text and json.dumps(c)[1:-1] not in text

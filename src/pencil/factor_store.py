@@ -21,9 +21,11 @@ from torch import nn
 from .modules import RESIDUAL_WRITERS, decoder, is_parallel_block, layer_of, parse_name
 
 
-def _key(kind: str, name: str, row_set: str | None) -> str:
+def _tensor_name(kind: str, name: str, row_set: str | None) -> str:
     """Tensor name inside a factor file: "A::<a_key>::<row_set>", "G::<module>::<row_set>" or "D::<module>"."""
-    return f"D::{name}" if kind == "D" else f"{kind}::{name}::{row_set}"
+    if kind == "D":
+        return f"D::{name}"
+    return f"{kind}::{name}::{row_set}"
 
 
 @dataclass
@@ -53,19 +55,21 @@ class Factors:
         return bool(self.D)
 
     def get(self, kind: str, name: str, row_set: str | None = None) -> torch.Tensor:
+        """One factor: kind "A" (name is an a_key), "G" (name is a module) or "D" (no row set)."""
         if kind == "D":
             return self.D[name]
-        return (self.A if kind == "A" else self.G)[name][row_set]
+        if kind == "A":
+            return self.A[name][row_set]
+        return self.G[name][row_set]
 
     def pair(self, module: str, row_set: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """(A, G) for a module."""
         return self.A[self.a_key[module]][row_set], self.G[module][row_set]
 
     def save(self, path: str | Path) -> None:
+        """Write every factor to one safetensors file, with the counts and a_key in its metadata."""
         from safetensors.torch import save_file
 
-        tensors = {_key("A", k, rs): t for k, by_rs in self.A.items() for rs, t in by_rs.items()}
-        tensors |= {_key("G", k, rs): t for k, by_rs in self.G.items() for rs, t in by_rs.items()}
-        tensors |= {_key("D", k, None): t for k, t in self.D.items()}
         info = {
             "a_key": self.a_key,
             "n_rows": self.n_rows,
@@ -73,37 +77,57 @@ class Factors:
             "n_seqs": self.n_seqs,
             "meta": self.meta,
         }
+        tensors = {}
+        for name, tensor in self._named_tensors().items():
+            tensors[name] = tensor.contiguous().cpu()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        save_file(
-            {k: t.contiguous().cpu() for k, t in tensors.items()}, str(path), metadata={"pencil": json.dumps(info)}
-        )
+        save_file(tensors, str(path), metadata={"pencil": json.dumps(info)})
+
+    def _named_tensors(self) -> dict[str, torch.Tensor]:
+        """{tensor name in the file: tensor} for every A, G and D factor."""
+        tensors = {}
+        for input_key, by_row_set in self.A.items():
+            for row_set, tensor in by_row_set.items():
+                tensors[_tensor_name("A", input_key, row_set)] = tensor
+        for module, by_row_set in self.G.items():
+            for row_set, tensor in by_row_set.items():
+                tensors[_tensor_name("G", module, row_set)] = tensor
+        for module, tensor in self.D.items():
+            tensors[_tensor_name("D", module, None)] = tensor
+        return tensors
 
 
 class FactorStore:
     """All chunk files of one factor pass, indexed by tensor name; tensors are read on demand."""
 
     def __init__(self, files):
-        from safetensors import safe_open
-
-        self.files = [Path(f) for f in files]
+        self.files = [Path(file) for file in files]
         if not self.files:
             raise ValueError("no factor files")
-        self.index: dict[str, Path] = {}
-        infos = []
-        for f in self.files:
-            with safe_open(str(f), framework="pt") as h:
-                infos.append(json.loads(h.metadata()["pencil"]))
-                self.index |= dict.fromkeys(h.keys(), f)
-        first = infos[0]
-        if any(i["n_loss"] != first["n_loss"] or i["n_rows"] != first["n_rows"] for i in infos):
-            raise ValueError("chunk files come from different passes (token counts differ)")
-        self.a_key = {k: v for i in infos for k, v in i["a_key"].items()}
-        self.n_rows, self.n_loss, self.n_seqs = first["n_rows"], first["n_loss"], first["n_seqs"]
+        self.index: dict[str, Path] = {}  # tensor name -> the chunk file that holds it
+        headers = []
+        for path in self.files:
+            header, tensor_names = _read_header(path)
+            headers.append(header)
+            for tensor_name in tensor_names:
+                self.index[tensor_name] = path
+
+        first = headers[0]
+        for header in headers:
+            if header["n_loss"] != first["n_loss"] or header["n_rows"] != first["n_rows"]:
+                raise ValueError("chunk files come from different passes (token counts differ)")
+        self.a_key = {}
+        for header in headers:
+            self.a_key.update(header["a_key"])
+        self.n_rows = first["n_rows"]
+        self.n_loss = first["n_loss"]
+        self.n_seqs = first["n_seqs"]
         self.meta = first.get("meta", {})
-        self.has_diag = any(k.startswith("D::") for k in self.index)
+        self.has_diag = any(tensor_name.startswith("D::") for tensor_name in self.index)
 
     @classmethod
     def from_dir(cls, folder: str | Path) -> FactorStore:
+        """The store for every layers*.safetensors file in a folder."""
         files = sorted(Path(folder).glob("layers*.safetensors"))
         if not files:
             raise FileNotFoundError(f"no factor files in {folder}; run scripts/04_factors.py first")
@@ -118,45 +142,70 @@ class FactorStore:
         return sorted(self.n_rows)
 
     def get(self, kind: str, name: str, row_set: str | None = None) -> torch.Tensor:
+        """Read one factor from its chunk file (see Factors.get for the arguments)."""
         from safetensors import safe_open
 
-        k = _key(kind, name, row_set)
-        with safe_open(str(self.index[k]), framework="pt") as h:
-            return h.get_tensor(k)
+        tensor_name = _tensor_name(kind, name, row_set)
+        with safe_open(str(self.index[tensor_name]), framework="pt") as handle:
+            return handle.get_tensor(tensor_name)
 
     def pair(self, module: str, row_set: str):
+        """(A, G) for a module."""
         return self.get("A", self.a_key[module], row_set), self.get("G", module, row_set)
 
 
+def _read_header(path: Path) -> tuple[dict, list[str]]:
+    """(the pass information saved by Factors.save, the tensor names) of one chunk file."""
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt") as handle:
+        header = json.loads(handle.metadata()["pencil"])
+        tensor_names = list(handle.keys())
+    return header, tensor_names
+
+
 class LazyFactors:
-    """Pool of sources (FactorStore or Factors) with known null vectors projected out and optional transforms,
-    computed on demand in float64. Only the current layer is cached, so read modules in layer order."""
+    """A weighted pool of sources (FactorStore or Factors) with known null vectors projected out and
+    optional transforms, computed on demand in float64.
+
+    get(kind, name, row_set) builds a factor in three steps:
+        1. pool:       F = Σ_s w_s F_s over the sources (weights normalised to sum to 1)
+        2. project:    F ← P F P with P = I − ûûᵀ, if (kind, name) has a known null vector u
+        3. transform:  F ← fn(kind, name, F) for each transform, in order
+    Results are cached only for the most recent layer (the whole model's factors don't fit in memory), so
+    read modules in layer order.
+
+    `with_nulls` and `with_transform` return new views over the same sources, with an empty cache."""
 
     def __init__(self, sources, weights=None, *, nulls=None, transforms=(), meta=None):
         self.sources = list(sources)
-        w = torch.tensor(weights if weights is not None else [1.0] * len(self.sources), dtype=torch.float64)
-        self.weights = (w / w.sum()).tolist()
+        if weights is None:
+            weights = [1.0] * len(self.sources)
+        raw_weights = torch.tensor(weights, dtype=torch.float64)
+        self.weights = (raw_weights / raw_weights.sum()).tolist()
+        _check_poolable(self.sources)
         first = self.sources[0]
-        if any(set(s.a_key) != set(first.a_key) or set(s.row_sets) != set(first.row_sets) for s in self.sources):
-            raise ValueError("cannot pool factors with different modules or row sets")
         self.a_key = dict(first.a_key)
-        self.n_rows = {rs: sum(s.n_rows[rs] for s in self.sources) for rs in first.row_sets}
-        self.n_loss = sum(s.n_loss for s in self.sources)
-        self.nulls = dict(nulls or {})
+        self.n_rows = {}
+        for row_set in first.row_sets:
+            self.n_rows[row_set] = sum(source.n_rows[row_set] for source in self.sources)
+        self.n_loss = sum(source.n_loss for source in self.sources)
+        self.nulls = {} if nulls is None else dict(nulls)  # (kind, name) -> null vector
         self.transforms = list(transforms)
-        self.meta = meta or {}
-        self.has_diag = all(s.has_diag for s in self.sources)
-        self._cache: dict = {}
+        self.meta = meta if meta else {}
+        self.has_diag = all(source.has_diag for source in self.sources)
+        self._cache: dict = {}  # (kind, name, row_set) -> factor, for _cached_layer only
         self._cached_layer = None
 
     def with_nulls(self, nulls: dict) -> LazyFactors:
+        """The same pool with these known null vectors projected out."""
         return LazyFactors(self.sources, self.weights, nulls=nulls, transforms=self.transforms, meta=self.meta)
 
     def with_transform(self, fn) -> LazyFactors:
-        """fn(kind, name, F) -> F', applied after pooling and null projection."""
-        return LazyFactors(
-            self.sources, self.weights, nulls=self.nulls, transforms=[*self.transforms, fn], meta=self.meta
-        )
+        """The same pool with one more transform fn(kind, name, F) -> F′, applied after pooling and null
+        projection."""
+        transforms = [*self.transforms, fn]
+        return LazyFactors(self.sources, self.weights, nulls=self.nulls, transforms=transforms, meta=self.meta)
 
     @property
     def modules(self) -> list[str]:
@@ -167,78 +216,114 @@ class LazyFactors:
         return sorted(self.n_rows)
 
     def get(self, kind: str, name: str, row_set: str | None = None) -> torch.Tensor:
+        """One factor, pooled, projected and transformed (see the class docstring), in float64."""
         cache_key = (kind, name, row_set)
-        if cache_key not in self._cache:
-            if layer_of(name) != self._cached_layer:
-                self._cache.clear()
-                self._cached_layer = layer_of(name)
-            F = sum(w * s.get(kind, name, row_set).double() for w, s in zip(self.weights, self.sources))
-            if (kind, name) in self.nulls:
-                F = project_out(F, self.nulls[(kind, name)])
-            for fn in self.transforms:
-                F = fn(kind, name, F)
-            self._cache[cache_key] = F
-        return self._cache[cache_key]
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        layer = layer_of(name)
+        if layer != self._cached_layer:
+            self._cache.clear()
+            self._cached_layer = layer
+
+        F = self._pooled(kind, name, row_set)
+        if (kind, name) in self.nulls:
+            F = project_out(F, self.nulls[(kind, name)])
+        for transform in self.transforms:
+            F = transform(kind, name, F)
+        self._cache[cache_key] = F
+        return F
+
+    def _pooled(self, kind: str, name: str, row_set: str | None) -> torch.Tensor:
+        """Σ_s w_s F_s over the sources, in float64."""
+        pooled = 0
+        for weight, source in zip(self.weights, self.sources):
+            pooled = pooled + weight * source.get(kind, name, row_set).double()
+        return pooled
 
     def pair(self, module: str, row_set: str):
+        """(A, G) for a module."""
         return self.get("A", self.a_key[module], row_set), self.get("G", module, row_set)
 
 
-def as_lazy(f) -> LazyFactors:
-    return f if isinstance(f, LazyFactors) else LazyFactors([f])
+def _check_poolable(sources: list) -> None:
+    """Raise unless every source has the same modules and row sets as the first."""
+    first = sources[0]
+    for source in sources:
+        if set(source.a_key) != set(first.a_key) or set(source.row_sets) != set(first.row_sets):
+            raise ValueError("cannot pool factors with different modules or row sets")
+
+
+def as_lazy(factors) -> LazyFactors:
+    """`factors` as a LazyFactors view (unchanged if it already is one)."""
+    if isinstance(factors, LazyFactors):
+        return factors
+    return LazyFactors([factors])
 
 
 # ---------------------------------------------------------------- exact null directions known analytically
-def known_null_vectors(model: nn.Module, f) -> dict[tuple[str, str], torch.Tensor]:
-    """Directions that are null in exact arithmetic for a Cohere-style model (mean-subtracting LayerNorm,
-    no biases):
-    - ("A", "<...>layers.L.input"): 1/w, w = that layer's input_layernorm weight (its output is w ∘ z, Σz = 0);
-    - ("G", "<...>.o_proj" and "<...>.down_proj"): all ones. They write into the residual stream, and every
-      path from there to the loss passes a mean-subtracting LayerNorm, so ∂L/∂h ⊥ 1.
+def known_null_vectors(model: nn.Module, factors) -> dict[tuple[str, str], torch.Tensor]:
+    """{(kind, name): u} for the directions that are null in exact arithmetic in a Cohere-style model
+    (parallel block, mean-subtracting LayerNorm, no biases):
+
+    - ("A", "<...>layers.L.input"): u = 1/w, with w that layer's input_layernorm weight. The norm's output is
+      w ∘ z with Σz = 0, so every shared input a satisfies aᵀ(1/w) = 0.
+    - ("G", "<...>.o_proj") and ("G", "<...>.down_proj"): u = all ones. These write into the residual stream,
+      and every path from there to the loss passes a mean-subtracting LayerNorm, so ∂L/∂h ⊥ 1.
+
     In fp32 factors these are null only to ~1e-8, so project them out (LazyFactors.with_nulls)."""
     if not is_parallel_block(model):
         return {}
     layers = decoder(model).layers
-    out = {}
-    for name in f.modules:
-        _, layer, lf = parse_name(name)
-        key = f.a_key[name]
-        if key != name:
-            out[("A", key)] = 1.0 / layers[layer].input_layernorm.weight.detach().double().cpu()
-        if lf in RESIDUAL_WRITERS:
-            out[("G", name)] = torch.ones(model.get_submodule(name).out_features, dtype=torch.float64)
-    return out
+    nulls = {}
+    for module in factors.modules:
+        _, layer, module_leaf = parse_name(module)
+        input_key = factors.a_key[module]
+        if input_key != module:  # a shared input factor
+            norm_weight = layers[layer].input_layernorm.weight
+            nulls[("A", input_key)] = 1.0 / norm_weight.detach().double().cpu()
+        if module_leaf in RESIDUAL_WRITERS:
+            width = model.get_submodule(module).out_features
+            nulls[("G", module)] = torch.ones(width, dtype=torch.float64)
+    return nulls
 
 
-def null_floors(f, nulls: dict) -> dict[str, float]:
-    """Rayleigh quotient of each known null vector over its factor's top eigenvalue, per row set: the
-    factors' numerical floor (0 in exact arithmetic). geneig.auto_rel_tol turns it into a range threshold."""
+def null_floors(factors, nulls: dict) -> dict[str, float]:
+    """{"<kind>::<name>::<row set>": floor}: each known null vector's Rayleigh quotient over its factor's top
+    eigenvalue, per row set. The factors' numerical floor (0 in exact arithmetic); geneig.auto_rel_tol turns
+    it into a range threshold."""
     from .geneig import noise_floor
 
-    return {
-        f"{kind}::{name}::{rs}": noise_floor(f.get(kind, name, rs), u)
-        for (kind, name), u in nulls.items()
-        for rs in f.row_sets
-    }
+    floors = {}
+    for (kind, name), u in nulls.items():
+        for row_set in factors.row_sets:
+            floors[f"{kind}::{name}::{row_set}"] = noise_floor(factors.get(kind, name, row_set), u)
+    return floors
 
 
 def project_out(F: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-    """P F P with P = I − ûûᵀ, in float64, without forming P."""
+    """P F P with P = I − ûûᵀ, in float64, without forming P:
+    P F P = F − û(Fû)ᵀ − (Fû)ûᵀ + (ûᵀFû) ûûᵀ."""
     F = F.double()
     u_hat = (u / u.norm()).to(F)
     Fu = F @ u_hat
     return F - torch.outer(u_hat, Fu) - torch.outer(Fu, u_hat) + (u_hat @ Fu) * torch.outer(u_hat, u_hat)
 
 
-def prepare_for_repair(model: nn.Module, fac_h, fac_t, *, base_rel_tol: float = 1e-10, floor_factor: float = 10.0):
-    """Both sides as LazyFactors with the known null vectors projected out, and the range threshold for
-    those factors: max(base_rel_tol, floor_factor × the largest measured floor).
-    Returns (fac_h, fac_t, rel_tol, floors)."""
+def prepare_for_repair(
+    model: nn.Module, harm_factors, task_factors, *, base_rel_tol: float = 1e-10, floor_factor: float = 10.0
+):
+    """Both sides as LazyFactors with the known null vectors projected out, and the range threshold for those
+    factors: max(base_rel_tol, floor_factor × the largest measured floor, over both sides).
+    Returns (harm_factors, task_factors, rel_tol, floors)."""
     from .geneig import auto_rel_tol
 
-    fh, ft = as_lazy(fac_h), as_lazy(fac_t)
-    nulls = known_null_vectors(model, fh)
-    floors = {f"harm::{k}": v for k, v in null_floors(fh, nulls).items()}
-    floors |= {f"task::{k}": v for k, v in null_floors(ft, nulls).items()}
+    harm = as_lazy(harm_factors)
+    task = as_lazy(task_factors)
+    nulls = known_null_vectors(model, harm)
+    floors = {}
+    for name, floor in null_floors(harm, nulls).items():
+        floors[f"harm::{name}"] = floor
+    for name, floor in null_floors(task, nulls).items():
+        floors[f"task::{name}"] = floor
     rel_tol = auto_rel_tol(floors.values(), base_rel_tol, floor_factor)
-    return fh.with_nulls(nulls), ft.with_nulls(nulls), rel_tol, floors
+    return harm.with_nulls(nulls), task.with_nulls(nulls), rel_tol, floors

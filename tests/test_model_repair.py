@@ -44,10 +44,10 @@ TASK = [
 HELD_OUT = [("Tell me about the monsoon", "It brings rain."), ("कल मौसम कैसा होगा?", "शायद बारिश।")]
 
 
-def _batches(tok, pairs, size=3):
-    off = user_content_offset(tok)
-    enc = [encode_chat(tok, p, r, user_offset=off) for p, r in pairs]
-    return [collate(enc[i : i + size], tok.pad_token_id) for i in range(0, len(enc), size)]
+def _batches(tokenizer, pairs, size=3):
+    off = user_content_offset(tokenizer)
+    enc = [encode_chat(tokenizer, p, r, user_offset=off) for p, r in pairs]
+    return [collate(enc[i : i + size], tokenizer.pad_token_id) for i in range(0, len(enc), size)]
 
 
 def _random_deltas(model, rank=4, scale=0.02, seed=1):
@@ -62,15 +62,15 @@ def _random_deltas(model, rank=4, scale=0.02, seed=1):
 
 @pytest.fixture(scope="module")
 def setup():
-    tok = tiny_tokenizer()
+    tokenizer = tiny_tokenizer()
     m0 = tiny_cohere2(dtype=torch.float64)
     deltas = _random_deltas(m0)
     m1 = merge_deltas(copy.deepcopy(m0), deltas)
-    H, T, X = _batches(tok, HARM), _batches(tok, TASK), _batches(tok, HELD_OUT)
+    H, T, X = _batches(tokenizer, HARM), _batches(tokenizer, TASK), _batches(tokenizer, HELD_OUT)
     kw = dict(accum_dtype=torch.float64, seed=7)
     fh = collect_factors(m0, H, **kw)
     ft = collect_factors(m1, T, **kw)
-    return dict(tok=tok, m0=m0, m1=m1, deltas=deltas, H=H, T=T, X=X, fh=fh, ft=ft, kw=kw)
+    return dict(tokenizer=tokenizer, m0=m0, m1=m1, deltas=deltas, H=H, T=T, X=X, fh=fh, ft=ft, kw=kw)
 
 
 def _apply(m0, new_weights):
@@ -149,10 +149,10 @@ def test_pencil_repair_is_gauge_invariant_only_with_covariant_damping(setup, dam
     m0r = reparam_copy(m0, gauges)
     dr = gauge_weights(d, gauges, shape)
     mu = 0.3
-    rep = ModelRepair(fh, ft, damping=damping, gamma=gamma)
-    rep_r = ModelRepair(_gauged(fh, gauges, shape), _gauged(ft, gauges, shape), damping=damping, gamma=gamma)
-    a = _apply(m0, rep.repair(model_weights(m0, d), d, mu)[0])
-    b = _apply(m0r, rep_r.repair(model_weights(m0r, dr), dr, mu)[0])
+    repairer = ModelRepair(fh, ft, damping=damping, gamma=gamma)
+    repairer_r = ModelRepair(_gauged(fh, gauges, shape), _gauged(ft, gauges, shape), damping=damping, gamma=gamma)
+    a = _apply(m0, repairer.repair(model_weights(m0, d), d, mu)[0])
+    b = _apply(m0r, repairer_r.repair(model_weights(m0r, dr), dr, mu)[0])
     r = output_kl(a, b, setup["H"] + setup["T"])
     if invariant:
         assert r["max_abs_logprob_diff"] < 1e-7, r
@@ -241,11 +241,11 @@ def test_repair_reduces_safety_drift(setup):
     m0, m1, d, fh, ft, H = setup["m0"], setup["m1"], setup["deltas"], setup["fh"], setup["ft"], setup["H"]
     nulls = known_null_vectors(m0, fh)  # ΔW touches no norm weights: same nulls at θ1
     fh, ft = LazyFactors([fh], nulls=nulls), LazyFactors([ft], nulls=nulls)
-    rep = ModelRepair(fh, ft, row_set="full")
+    repairer = ModelRepair(fh, ft, row_set="full")
     S_drift = output_kl(m0, m1, H, mask_key="loss_mask")["kl_mean"]
     measured = []
     for mu in (0.01, 0.1, 1.0, 10.0):
-        new, report = rep.repair(model_weights(m0, d), d, mu)
+        new, report = repairer.repair(model_weights(m0, d), d, mu)
         measured.append(output_kl(m0, _apply(m0, new), H, mask_key="loss_mask")["kl_mean"])
         assert report["S_after_pred"] < report["S_before_pred"]
     assert measured == sorted(measured) and measured[0] < 0.3 * S_drift and measured[-1] < S_drift
@@ -271,9 +271,9 @@ def test_reduce_rows_help_the_forecast_but_not_the_repair(setup):
 
 def test_targeted_repair_and_leverage(setup):
     m0, d, fh, ft = setup["m0"], setup["deltas"], setup["fh"], setup["ft"]
-    rep = ModelRepair(fh, ft)
+    repairer = ModelRepair(fh, ft)
     shape = AttnShape.from_config(m0.config)
-    table = leverage_table(rep, sorted(d), n_heads=shape.n_heads, n_kv=shape.n_kv, head_dim=shape.head_dim)
+    table = leverage_table(repairer, sorted(d), n_heads=shape.n_heads, n_kv=shape.n_kv, head_dim=shape.head_dim)
     for row in table.values():
         if row["module"] == "o_proj":
             assert max(row["per_head_lower_bound"]) <= row["max"] * (1 + 1e-9)
@@ -283,12 +283,12 @@ def test_targeted_repair_and_leverage(setup):
     assert len(top) == round(0.1 * len(table)) and top[0] == max(table, key=lambda n: table[n]["max"])
     rnd = random_fraction(table, 0.1, seed=0)
     assert len(rnd) == len(top) and rnd != random_fraction(table, 0.1, seed=1)
-    new, report = rep.repair(model_weights(m0, d), d, 0.1, modules=top)
+    new, report = repairer.repair(model_weights(m0, d), d, 0.1, modules=top)
     assert set(report["modules"]) == set(top)
     W1 = model_weights(setup["m1"], d)
     untouched = [n for n in d if n not in top]
     assert all(torch.allclose(new[n], W1[n]) for n in untouched)
-    y = top_output_direction(rep.basis("model.layers.0.mlp.down_proj"))
+    y = top_output_direction(repairer.basis("model.layers.0.mlp.down_proj"))
     c = refusal_cosine(y, y.clone())
     assert c["abs_cos"] == pytest.approx(1.0) and c["p_value"] < 0.01
 
@@ -333,11 +333,11 @@ def test_cached_predictions_match_direct_computation(setup):
 
     m0, d, fh, ft = setup["m0"], setup["deltas"], setup["fh"], setup["ft"]
     for kw in ({}, {"top_k_mlp": 16}, {"top_k_mlp": 16, "fast_topk_min": 64, "eig_dtype": torch.float64}):
-        rep = ModelRepair(fh, ft, row_set="full", **kw)
-        new, report = rep.repair(model_weights(m0, d), d, 0.3)
+        repairer = ModelRepair(fh, ft, row_set="full", **kw)
+        new, report = repairer.repair(model_weights(m0, d), d, 0.3)
         W0 = model_weights(m0, d)
         for n, info in report["modules"].items():
-            A_h, A_t, G_h, G_t = rep.factors(n)
+            A_h, A_t, G_h, G_t = repairer.factors(n)
             d_new = new[n].double() - W0[n].double()
             step = d_new - d[n].double()
             assert info["S_after_pred"] == pytest.approx(forecast(d_new, A_h, G_h), rel=1e-6, abs=1e-14)

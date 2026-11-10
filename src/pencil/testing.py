@@ -21,7 +21,16 @@ CHAT_TEMPLATE = (
     "{% if add_generation_prompt %}<BOT>{% endif %}"
 )
 
-_SPECIALS = ["<PAD>", "<BOS>", "<EOT>", "<UNK>", "<SYS>", "<DEV>", "<USR>", "<BOT>"]
+_CONTROL_TOKENS = ["<PAD>", "<BOS>", "<EOT>", "<UNK>"]
+_ROLE_TOKENS = ["<SYS>", "<DEV>", "<USR>", "<BOT>"]  # turn markers used by CHAT_TEMPLATE
+_SPECIALS = _CONTROL_TOKENS + _ROLE_TOKENS
+
+# Character ranges the tokenizer covers: printable ASCII and the Devanagari Unicode block.
+_ASCII_PRINTABLE = range(32, 127)
+_DEVANAGARI = range(0x0900, 0x0980)
+
+FULL_ATTENTION_EVERY = 4  # Tiny Aya: every 4th layer uses full attention, the rest sliding-window attention
+LAYERNORM_WEIGHT_JITTER = 0.2
 
 
 def tiny_tokenizer():
@@ -29,24 +38,35 @@ def tiny_tokenizer():
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    chars = [chr(c) for c in range(32, 127)] + [chr(c) for c in range(0x0900, 0x0980)]
-    vocab = {t: i for i, t in enumerate(_SPECIALS)}
-    for ch in chars:
-        vocab.setdefault(ch, len(vocab))
-    tk = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<UNK>"))
-    tk.pre_tokenizer = pre_tokenizers.Split(pattern="", behavior="isolated")
-    tk.decoder = decoders.Fuse()
-    tok = PreTrainedTokenizerFast(
-        tokenizer_object=tk,
+    characters = [chr(code) for code in _ASCII_PRINTABLE] + [chr(code) for code in _DEVANAGARI]
+    vocab = {}
+    for token in _SPECIALS + characters:
+        vocab.setdefault(token, len(vocab))
+    word_level = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<UNK>"))
+    word_level.pre_tokenizer = pre_tokenizers.Split(pattern="", behavior="isolated")  # one token per character
+    word_level.decoder = decoders.Fuse()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=word_level,
         bos_token="<BOS>",
         eos_token="<EOT>",
         unk_token="<UNK>",
         pad_token="<PAD>",
-        additional_special_tokens=_SPECIALS[4:],
+        additional_special_tokens=_ROLE_TOKENS,
     )
-    tok.chat_template = CHAT_TEMPLATE
-    tok.padding_side = "left"
-    return tok
+    tokenizer.chat_template = CHAT_TEMPLATE
+    tokenizer.padding_side = "left"
+    return tokenizer
+
+
+def _layer_types(n_layers: int) -> list[str]:
+    """Tiny Aya's attention pattern: sliding-window layers with full attention on every 4th layer."""
+    layer_types = []
+    for i in range(n_layers):
+        if (i + 1) % FULL_ATTENTION_EVERY == 0:
+            layer_types.append("full_attention")
+        else:
+            layer_types.append("sliding_attention")
+    return layer_types
 
 
 def tiny_cohere2(
@@ -66,8 +86,7 @@ def tiny_cohere2(
 
     if vocab_size is None:
         vocab_size = len(tiny_tokenizer())
-    layer_types = ["full_attention" if (i + 1) % 4 == 0 else "sliding_attention" for i in range(n_layers)]
-    cfg = Cohere2Config(
+    config = Cohere2Config(
         vocab_size=vocab_size,
         hidden_size=hidden,
         intermediate_size=inter,
@@ -77,16 +96,17 @@ def tiny_cohere2(
         head_dim=hidden // n_heads,
         max_position_embeddings=4096,
         sliding_window=64,
-        layer_types=layer_types,
+        layer_types=_layer_types(n_layers),
         tie_word_embeddings=True,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
     )
     torch.manual_seed(seed)
-    model = Cohere2ForCausalLM(cfg).to(dtype).eval()
+    model = Cohere2ForCausalLM(config).to(dtype).eval()
     # Random init leaves LayerNorm weights at 1; perturb them so the null vector 1/w is non-trivial.
     with torch.no_grad():
         for layer in model.model.layers:
-            layer.input_layernorm.weight.mul_(1 + 0.2 * torch.randn_like(layer.input_layernorm.weight))
+            weight = layer.input_layernorm.weight
+            weight.mul_(1 + LAYERNORM_WEIGHT_JITTER * torch.randn_like(weight))
     return model

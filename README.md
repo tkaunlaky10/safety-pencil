@@ -14,7 +14,7 @@ The method code, tests and pipeline scripts are in place. All of it runs end to 
 | `configs/experiment.yaml` | Models, data, runs A–D, LoRA, factor row sets, pencil settings, μ grid, evaluation tiers |
 | `src/pencil/` | The library (below) |
 | `scripts/` | One script per stage, every one with `--dry-run` |
-| `tests/` | 130 tests: numpy maths, torch equivalence, factor hooks, whole-model repair and invariance, streaming factors, data, evaluation, statistics |
+| `tests/` | 137 tests: numpy maths, torch equivalence, factor hooks, whole-model repair and invariance, streaming factors, data, evaluation, statistics |
 | `patches/`, `scripts/setup_lexsi.sh` | Our bug fixes to the four Lexsi libraries, and the script that installs the patched versions |
 | `verification/` | The toy-transformer verification: write-up, scripts, results |
 
@@ -48,7 +48,7 @@ python3.12 -m venv .venv && . .venv/bin/activate && pip install -U pip uv
 uv pip install -r requirements-main.lock.txt
 bash scripts/setup_lexsi.sh main            # swaps in the patched SafeTune, AuditKIT, CuratorKIT
 uv pip install -e . --no-deps               # this package (the scripts import it)
-python -m pytest -q                         # 129 passed, 1 skipped (CPU, about 2 minutes)
+python -m pytest -q                         # 136 passed, 1 skipped (CPU, about 2 minutes)
 bash scripts/dry_run_all.sh                 # the whole pipeline on the tiny offline model
 ```
 

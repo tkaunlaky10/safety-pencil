@@ -121,9 +121,9 @@ scripts/        00_model_facts, 01_* (data incl. 01_build_mmlu), 02_evaluate, 02
                 04_leverage, 05_invariance, 06_repair (sweep, forecast), 07_baselines, 08_localisation,
                 dry_run_all.sh, setup_lexsi.sh
 tests/          test_math.py, test_torch_equivalence.py, test_factors.py, test_model_repair.py,
-                test_datasets.py, test_evaluate.py, test_stats.py, test_dry_run.py (opt-in)
+                test_datasets.py, test_evaluate.py, test_stats.py, test_results.py, test_model_facts.py, test_dry_run.py (opt-in)
 verification/   toy-transformer checks copied from the team folder (VERIFICATION.md, scripts, results)
-outputs/        (gitignored) ckpt/, factors/, generations/, results/*.json, figures/, dryrun/
+outputs/        ckpt/, factors/, generations/, labels/, dryrun/ (gitignored); results/*.json and figures/ (tracked)
 ```
 
 Not implemented: `preserve.py` (P-quad, P-exact; cut on 9 Nov) and the CircuitKIT script (Prompt 8 step 5).
@@ -188,7 +188,7 @@ Scale rules (from the 9 Nov code review):
   - `PlainSFTTrainer` discards the LoRA adapter, so the drift fine-tunes use our own PEFT loop with `lora_wrap` and `tokenize_dataset`.
   - Contamination rows come from `harden_contamination_pairs(n)[0]`.
   - ReSta: α ≈ 0.25 on Tiny Aya.
-  - `PrePostMergeTrainer` needs `pre_model="CohereLabs/tiny-aya-base"`, or it equals WiSE-FT.
+  - `PrePostMergeTrainer` computes (1 − α)·post + α·pre: with the aligned model as `pre_model` it is exactly WiSE-FT, and with `tiny-aya-base` it pulls toward the unaligned model (the 9 Nov note had this backwards). We don't run it.
   - Safe Delta takes `hessian_inputs`; give it our A factors.
   - RefusalDirection: `RefusalDirectionTrainer(model, tok, config=RefusalDirectionConfig(pick_layer=24, target_layers=[24]))` (config passthrough added by our patch).
   - SafeTune's built-in evaluation is English-only.

@@ -1,10 +1,12 @@
 """Statistics for the pre-registered predictions (CLAUDE.md, "Predictions and pass criteria"); AuditKIT has none.
 
-Wilson intervals for rates, exact McNemar on paired prompts, bootstrap intervals (Spearman for P2/P3, paired
-differences over prompts for P6), Holm correction across languages, and Cohen's kappa for judge agreement.
+- Wilson score intervals for rates (refusal, unsafe, over-refusal, MMLU accuracy);
+- the exact McNemar test for two checkpoints scored on the same prompts;
+- percentile bootstrap intervals for Spearman's ρ (P2, P3), for paired differences over prompts (P6) and for κ;
+- Holm's correction across the three languages, and Cohen's κ for judge-versus-human agreement.
 
-``alpha`` is the two-sided error rate. Bootstraps draw from ``numpy.random.default_rng(seed)`` and give
-percentile intervals, so a call is reproducible. Results are plain Python numbers, ready for JSON.
+``alpha`` is the two-sided error rate. Bootstraps draw from ``numpy.random.default_rng(seed)``, so a call is
+reproducible. Results are plain Python numbers, ready for JSON.
 """
 
 from __future__ import annotations
@@ -15,13 +17,15 @@ from typing import Any
 import numpy as np
 from scipy import stats as sps
 
-_CHUNK_ELEMS = 2_000_000  # bootstrap indices drawn per chunk, so memory stays bounded for large n
+# Bootstrap indices are drawn in chunks of about this many elements, so memory stays bounded for large n.
+_CHUNK_ELEMENTS = 2_000_000
 
 
 # --------------------------------------------------------------------------------------- helpers
 
 
 def _check_alpha(alpha: float) -> float:
+    """alpha as a float, checked to lie strictly between 0 and 1."""
     alpha = float(alpha)
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0, 1), got {alpha}")
@@ -29,41 +33,44 @@ def _check_alpha(alpha: float) -> float:
 
 
 def _check_n_boot(n_boot: int) -> int:
+    """n_boot as an int, checked to be a positive whole number."""
     if int(n_boot) != n_boot or n_boot < 1:
         raise ValueError(f"n_boot must be a positive integer, got {n_boot}")
     return int(n_boot)
 
 
-def _as_int(x: Any, name: str) -> int:
-    xf = float(x)
-    if not xf.is_integer():
-        raise ValueError(f"{name} must be an integer, got {x}")
-    return int(xf)
+def _as_int(value: Any, name: str) -> int:
+    """value as an int; raises if it is not a whole number (so 2.0 is accepted and 2.5 is not)."""
+    as_float = float(value)
+    if not as_float.is_integer():
+        raise ValueError(f"{name} must be an integer, got {value}")
+    return int(as_float)
 
 
-def _binary_1d(x: Any, name: str) -> np.ndarray:
-    """1-D bool array from bools or 0/1 numbers; raises on anything else."""
-    arr = np.asarray(x)
-    if arr.ndim != 1:
-        raise ValueError(f"{name} must be 1-D, got shape {arr.shape}")
-    if arr.dtype == bool:
-        return arr
-    if arr.size and not np.isin(arr, (0, 1)).all():
+def _binary_1d(values: Any, name: str) -> np.ndarray:
+    """A 1-D bool array from bools or 0/1 numbers; raises on anything else."""
+    array = np.asarray(values)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be 1-D, got shape {array.shape}")
+    if array.dtype == bool:
+        return array
+    if array.size and not np.isin(array, (0, 1)).all():
         raise ValueError(f"{name} must contain only 0/1 or booleans")
-    return arr.astype(bool)
+    return array.astype(bool)
 
 
 def _boot_indices(rng: np.random.Generator, n: int, n_boot: int) -> Iterator[np.ndarray]:
-    """Resampling indices as (chunk, n) arrays, n_boot rows in total."""
-    rows = max(1, _CHUNK_ELEMS // max(n, 1))
-    done = 0
-    while done < n_boot:
-        m = min(rows, n_boot - done)
-        yield rng.integers(0, n, size=(m, n))
-        done += m
+    """Resampling indices (with replacement) as (chunk, n) arrays, n_boot rows in total."""
+    rows_per_chunk = max(1, _CHUNK_ELEMENTS // max(n, 1))
+    rows_done = 0
+    while rows_done < n_boot:
+        chunk_rows = min(rows_per_chunk, n_boot - rows_done)
+        yield rng.integers(0, n, size=(chunk_rows, n))
+        rows_done += chunk_rows
 
 
 def _percentile_ci(samples: np.ndarray, alpha: float) -> tuple[float, float]:
+    """The α/2 and 1 − α/2 quantiles of the bootstrap samples (nan, nan when there are none)."""
     if samples.size == 0:
         return float("nan"), float("nan")
     lo, hi = np.quantile(samples, [alpha / 2.0, 1.0 - alpha / 2.0])
@@ -74,9 +81,13 @@ def _percentile_ci(samples: np.ndarray, alpha: float) -> tuple[float, float]:
 
 
 def wilson_ci(successes: int, n: int, alpha: float = 0.05) -> tuple[float, float, float]:
-    """(p_hat, lo, hi): the Wilson score interval without continuity correction, equal to scipy's
-    ``binomtest(k, n).proportion_ci(method="wilson")``. All nan when n == 0; lo is exactly 0 when k == 0
-    and hi exactly 1 when k == n."""
+    """A rate k/n with its Wilson score interval, returned as (p̂, lo, hi).
+
+    p̂ = k/n and z = Φ⁻¹(1 − α/2); the interval is centre ± half-width with
+    centre = (p̂ + z²/2n) / (1 + z²/n) and half-width = z / (1 + z²/n) · √(p̂(1 − p̂)/n + z²/4n²).
+    No continuity correction, so it equals scipy's ``binomtest(k, n).proportion_ci(method="wilson")``.
+    All nan when n == 0; lo is exactly 0 when k == 0 and hi exactly 1 when k == n.
+    """
     alpha = _check_alpha(alpha)
     k = _as_int(successes, "successes")
     n = _as_int(n, "n")
@@ -87,80 +98,99 @@ def wilson_ci(successes: int, n: int, alpha: float = 0.05) -> tuple[float, float
     if n == 0:
         nan = float("nan")
         return nan, nan, nan
+
     z = float(sps.norm.ppf(1.0 - alpha / 2.0))
-    p = k / n
-    z2n = z * z / n
-    denom = 1.0 + z2n
-    center = (p + z2n / 2.0) / denom
-    half = (z / denom) * np.sqrt(p * (1.0 - p) / n + z2n / (4.0 * n))
-    lo = 0.0 if k == 0 else max(0.0, center - half)
-    hi = 1.0 if k == n else min(1.0, center + half)
-    return float(p), float(lo), float(hi)
+    p_hat = k / n
+    z_squared_over_n = z * z / n
+    denominator = 1.0 + z_squared_over_n
+    centre = (p_hat + z_squared_over_n / 2.0) / denominator
+    half_width = (z / denominator) * np.sqrt(p_hat * (1.0 - p_hat) / n + z_squared_over_n / (4.0 * n))
+
+    # Exact 0 and 1 at the edges, where floating point could otherwise leave a tiny gap.
+    lo = 0.0 if k == 0 else max(0.0, centre - half_width)
+    hi = 1.0 if k == n else min(1.0, centre + half_width)
+    return float(p_hat), float(lo), float(hi)
 
 
 # --------------------------------------------------------------------------------------- McNemar
 
 
 def mcnemar_exact(a_correct: Sequence, b_correct: Sequence) -> dict[str, Any]:
-    """Exact two-sided McNemar test on paired 0/1 outcomes of methods A and B on the same items.
+    """Exact two-sided McNemar test: do methods A and B differ on the same items (paired 0/1 outcomes)?
 
-    b counts items A got right and B wrong, c the reverse; the p-value is the two-sided binomial test of
-    b out of b + c at 1/2 (1.0 when b + c == 0). Returns {"b", "c", "p_value", "n"}, n = all items.
+    b counts the items A got right and B wrong, c the reverse. Under the null each discordant item is a fair
+    coin, so the p-value is the two-sided exact binomial test of b successes in b + c trials at ½
+    (``scipy.stats.binomtest``), and 1.0 when b + c == 0. Returns {"b", "c", "p_value", "n"}, n = all items.
     """
-    a = _binary_1d(a_correct, "a_correct")
-    bb = _binary_1d(b_correct, "b_correct")
-    if a.shape != bb.shape:
-        raise ValueError(f"a_correct and b_correct differ in length: {a.size} vs {bb.size}")
-    b = int(np.count_nonzero(a & ~bb))
-    c = int(np.count_nonzero(~a & bb))
-    p = 1.0 if b + c == 0 else float(sps.binomtest(b, b + c, 0.5, alternative="two-sided").pvalue)
-    return {"b": b, "c": c, "p_value": p, "n": int(a.size)}
+    a_right = _binary_1d(a_correct, "a_correct")
+    b_right = _binary_1d(b_correct, "b_correct")
+    if a_right.shape != b_right.shape:
+        raise ValueError(f"a_correct and b_correct differ in length: {a_right.size} vs {b_right.size}")
+    b = int(np.count_nonzero(a_right & ~b_right))
+    c = int(np.count_nonzero(~a_right & b_right))
+    return {"b": b, "c": c, "p_value": _mcnemar_p_value(b, c), "n": int(a_right.size)}
+
+
+def _mcnemar_p_value(b: int, c: int) -> float:
+    """Two-sided exact binomial p-value of b successes in b + c fair-coin trials; 1.0 when b + c == 0."""
+    if b + c == 0:
+        return 1.0
+    return float(sps.binomtest(b, b + c, 0.5, alternative="two-sided").pvalue)
 
 
 # --------------------------------------------------------------------------------------- Spearman
 
 
-def _rowwise_spearman(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
-    """Spearman rho of each row of two (R, n) arrays: the Pearson correlation of average ranks."""
-    rx = sps.rankdata(xs, axis=1)
-    ry = sps.rankdata(ys, axis=1)
-    rx -= rx.mean(axis=1, keepdims=True)
-    ry -= ry.mean(axis=1, keepdims=True)
-    r = (rx * ry).sum(axis=1) / np.sqrt((rx * rx).sum(axis=1) * (ry * ry).sum(axis=1))
-    return np.clip(r, -1.0, 1.0)
+def _rowwise_spearman(x_rows: np.ndarray, y_rows: np.ndarray) -> np.ndarray:
+    """Spearman's ρ of each row of two (R, n) arrays: the Pearson correlation of the average ranks."""
+    rank_x = sps.rankdata(x_rows, axis=1)
+    rank_y = sps.rankdata(y_rows, axis=1)
+    rank_x -= rank_x.mean(axis=1, keepdims=True)
+    rank_y -= rank_y.mean(axis=1, keepdims=True)
+    covariance = (rank_x * rank_y).sum(axis=1)
+    rho = covariance / np.sqrt((rank_x * rank_x).sum(axis=1) * (rank_y * rank_y).sum(axis=1))
+    return np.clip(rho, -1.0, 1.0)
+
+
+def _constant_rows(rows: np.ndarray) -> np.ndarray:
+    """True for each row of a 2-D array whose entries are all equal."""
+    return np.all(rows == rows[:, :1], axis=1)
 
 
 def spearman_bootstrap_ci(
     x: Sequence[float], y: Sequence[float], n_boot: int = 2000, alpha: float = 0.05, seed: int = 0
 ) -> dict[str, Any]:
-    """Spearman rho (``scipy.stats.spearmanr``, ties averaged) with a percentile bootstrap interval over pairs.
+    """Spearman's rank correlation ρ of x and y, with a percentile bootstrap interval over the (x, y) pairs.
 
-    Resamples in which x or y is constant (rho undefined) are skipped. Returns {"rho", "lo", "hi", "n",
-    "n_boot_used"}; rho is nan for constant input, lo and hi are nan when no resample is usable.
+    ρ is the Pearson correlation of the ranks, ties averaged (``scipy.stats.spearmanr``). Resamples in which x
+    or y is constant (ρ undefined) are skipped. Returns {"rho", "lo", "hi", "n", "n_boot_used"}; rho is nan
+    for constant input, and lo and hi are nan when no resample is usable.
     """
     alpha = _check_alpha(alpha)
     n_boot = _check_n_boot(n_boot)
-    xa = np.asarray(x, dtype=float)
-    ya = np.asarray(y, dtype=float)
-    if xa.ndim != 1 or ya.ndim != 1 or xa.shape != ya.shape:
-        raise ValueError(f"x and y must be 1-D of equal length, got {xa.shape} and {ya.shape}")
-    if not (np.isfinite(xa).all() and np.isfinite(ya).all()):
+    x_values = np.asarray(x, dtype=float)
+    y_values = np.asarray(y, dtype=float)
+    if x_values.ndim != 1 or y_values.ndim != 1 or x_values.shape != y_values.shape:
+        raise ValueError(f"x and y must be 1-D of equal length, got {x_values.shape} and {y_values.shape}")
+    if not (np.isfinite(x_values).all() and np.isfinite(y_values).all()):
         raise ValueError("x and y must be finite")
-    n = xa.size
+    n = x_values.size
     if n < 2:
         raise ValueError(f"need at least 2 pairs, got {n}")
 
-    constant = np.all(xa == xa[0]) or np.all(ya == ya[0])
-    rho = float("nan") if constant else float(sps.spearmanr(xa, ya).statistic)
-    kept: list[np.ndarray] = []
-    for idx in _boot_indices(np.random.default_rng(seed), n, n_boot):
-        xs, ys = xa[idx], ya[idx]
-        ok = ~(np.all(xs == xs[:, :1], axis=1) | np.all(ys == ys[:, :1], axis=1))
-        if ok.any():
-            kept.append(_rowwise_spearman(xs[ok], ys[ok]))
-    boots = np.concatenate(kept) if kept else np.empty(0)
-    lo, hi = _percentile_ci(boots, alpha)
-    return {"rho": rho, "lo": lo, "hi": hi, "n": int(n), "n_boot_used": int(boots.size)}
+    is_constant = np.all(x_values == x_values[0]) or np.all(y_values == y_values[0])
+    rho = float("nan") if is_constant else float(sps.spearmanr(x_values, y_values).statistic)
+
+    rho_chunks: list[np.ndarray] = []
+    for indices in _boot_indices(np.random.default_rng(seed), n, n_boot):
+        x_boot = x_values[indices]
+        y_boot = y_values[indices]
+        usable = ~(_constant_rows(x_boot) | _constant_rows(y_boot))
+        if usable.any():
+            rho_chunks.append(_rowwise_spearman(x_boot[usable], y_boot[usable]))
+    boot_rhos = np.concatenate(rho_chunks) if rho_chunks else np.empty(0)
+    lo, hi = _percentile_ci(boot_rhos, alpha)
+    return {"rho": rho, "lo": lo, "hi": hi, "n": int(n), "n_boot_used": int(boot_rhos.size)}
 
 
 # --------------------------------------------------------------------------------------- paired bootstrap
@@ -174,52 +204,65 @@ def paired_bootstrap_diff(
     alpha: float = 0.05,
     seed: int = 0,
 ) -> dict[str, float]:
-    """Paired bootstrap over items for stat(a) - stat(b), e.g. the same prompts under two methods.
+    """How much stat(a) exceeds stat(b) on the same items (e.g. two methods on the same prompts), with a
+    paired percentile bootstrap interval.
 
     Row i of ``a`` and of ``b`` is item i; rows may be scalars (1-D) or vectors of any length (2-D, e.g.
     per-token values). Each replicate resamples item indices, shared by a and b to keep the pairing, and
-    applies ``stat`` to the flattened rows. Returns {"diff", "lo", "hi", "p_two_sided"}, where the p-value
-    is the bootstrap sign test min(1, 2 * min(P*(d* <= 0), P*(d* >= 0))).
+    computes d* = stat(a*) − stat(b*) on the flattened rows. Returns {"diff", "lo", "hi", "p_two_sided"},
+    where the p-value is the bootstrap sign test min(1, 2 · min(P*(d* ≤ 0), P*(d* ≥ 0))).
     """
     alpha = _check_alpha(alpha)
     n_boot = _check_n_boot(n_boot)
-    aa = np.asarray(a, dtype=float)
-    ba = np.asarray(b, dtype=float)
-    if aa.ndim not in (1, 2) or ba.ndim not in (1, 2):
-        raise ValueError(f"a and b must be 1-D or 2-D, got shapes {aa.shape} and {ba.shape}")
-    if aa.shape[0] != ba.shape[0]:
-        raise ValueError(f"a and b must have the same number of items, got {aa.shape[0]} and {ba.shape[0]}")
-    n = aa.shape[0]
+    a_values = np.asarray(a, dtype=float)
+    b_values = np.asarray(b, dtype=float)
+    if a_values.ndim not in (1, 2) or b_values.ndim not in (1, 2):
+        raise ValueError(f"a and b must be 1-D or 2-D, got shapes {a_values.shape} and {b_values.shape}")
+    if a_values.shape[0] != b_values.shape[0]:
+        raise ValueError(f"a and b must have the same number of items, got {a_values.shape[0]} and {b_values.shape[0]}")
+    n = a_values.shape[0]
     if n == 0:
         raise ValueError("need at least one item")
 
-    diff = float(stat(aa.ravel()) - stat(ba.ravel()))
+    diff = float(stat(a_values.ravel()) - stat(b_values.ravel()))
     rng = np.random.default_rng(seed)
-    out = np.array(
-        [stat(aa[row].ravel()) - stat(ba[row].ravel()) for idx in _boot_indices(rng, n, n_boot) for row in idx]
-    )
-    lo, hi = _percentile_ci(out, alpha)
-    p = 2.0 * min(np.mean(out <= 0.0), np.mean(out >= 0.0))
-    return {"diff": diff, "lo": lo, "hi": hi, "p_two_sided": float(min(1.0, p))}
+    replicate_diffs = []
+    for chunk in _boot_indices(rng, n, n_boot):
+        for resample in chunk:
+            replicate_diffs.append(stat(a_values[resample].ravel()) - stat(b_values[resample].ravel()))
+    replicate_diffs = np.array(replicate_diffs)
+
+    lo, hi = _percentile_ci(replicate_diffs, alpha)
+    p_two_sided = 2.0 * min(np.mean(replicate_diffs <= 0.0), np.mean(replicate_diffs >= 0.0))
+    return {"diff": diff, "lo": lo, "hi": hi, "p_two_sided": float(min(1.0, p_two_sided))}
 
 
 # --------------------------------------------------------------------------------------- frontier
 
 
 def best_at_threshold(points: Sequence[dict], min_safety: float) -> dict | None:
-    """The highest-utility point (the same dict object) with ``safety >= min_safety`` and a finite
-    ``utility``, e.g. the best task score at refusal >= 0.97; the earliest wins ties, nan safety never
-    qualifies, and None if nothing qualifies."""
-    eligible = [pt for pt in points if float(pt["safety"]) >= min_safety and np.isfinite(float(pt["utility"]))]
-    return max(eligible, key=lambda pt: float(pt["utility"]), default=None)
+    """The highest-utility point with ``safety >= min_safety``, e.g. the best task score at refusal ≥ 0.97.
+
+    Returns the same dict object, or None if nothing qualifies. Points with a non-finite utility or a nan
+    safety never qualify; the earliest point wins ties.
+    """
+    eligible = []
+    for point in points:
+        safe_enough = float(point["safety"]) >= min_safety
+        if safe_enough and np.isfinite(float(point["utility"])):
+            eligible.append(point)
+    return max(eligible, key=lambda point: float(point["utility"]), default=None)
 
 
 # --------------------------------------------------------------------------------------- Holm
 
 
 def holm(p_values: Sequence[float]) -> list[float]:
-    """Holm-Bonferroni adjusted p-values, in the input order: the j-th smallest becomes
-    min(1, max_{i <= j} (m - i + 1) p_(i)). Rejecting where the adjusted value <= alpha is Holm's procedure."""
+    """Holm-Bonferroni adjusted p-values, in the input order.
+
+    With m p-values sorted as p_(1) ≤ … ≤ p_(m), the j-th smallest becomes min(1, max_{i ≤ j} (m − i + 1) p_(i))
+    (Holm 1979). Rejecting where the adjusted value ≤ alpha is Holm's procedure.
+    """
     p = np.asarray(p_values, dtype=float).ravel()
     if p.size == 0:
         return []
@@ -227,15 +270,20 @@ def holm(p_values: Sequence[float]) -> list[float]:
         raise ValueError("p-values must be in [0, 1] and not nan")
     m = p.size
     order = np.argsort(p, kind="stable")
-    adj = np.empty(m)
-    adj[order] = np.minimum(1.0, np.maximum.accumulate((m - np.arange(m)) * p[order]))
-    return [float(v) for v in adj]
+    multipliers = m - np.arange(m)  # m, m - 1, ..., 1 for the sorted p-values
+    running_max = np.maximum.accumulate(multipliers * p[order])
+    adjusted = np.empty(m)
+    adjusted[order] = np.minimum(1.0, running_max)
+    return [float(value) for value in adjusted]
 
 
 def holm_reject(p_values: Sequence[float], alpha: float = 0.05) -> list[bool]:
-    """Holm-Bonferroni rejections at family-wise error rate ``alpha``, in the input order."""
+    """Which hypotheses Holm's procedure rejects at family-wise error rate ``alpha``, in the input order.
+
+    Hypothesis i is rejected when its Holm-adjusted p-value (see ``holm``) is ≤ alpha.
+    """
     alpha = _check_alpha(alpha)
-    return [bool(v <= alpha) for v in holm(p_values)]
+    return [bool(value <= alpha) for value in holm(p_values)]
 
 
 # --------------------------------------------------------------------------------------- Cohen's kappa
@@ -244,67 +292,76 @@ def holm_reject(p_values: Sequence[float], alpha: float = 0.05) -> list[bool]:
 def _encode_pair(
     y1: Sequence[Hashable], y2: Sequence[Hashable], labels: Sequence[Hashable] | None
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Both raters' labels as integer codes, and the number of categories."""
+    """Both raters' labels as integer codes, and the number of categories.
+
+    Categories are numbered in order of first appearance in ``labels`` (or in y1 then y2 when labels is None).
+    """
     y1, y2 = list(y1), list(y2)
     if len(y1) != len(y2):
         raise ValueError(f"y1 and y2 differ in length: {len(y1)} vs {len(y2)}")
-    cats: dict[Hashable, int] = {}
-    for v in y1 + y2 if labels is None else labels:
-        cats.setdefault(v, len(cats))
-    unknown = {v for v in y1 + y2 if v not in cats}
+    categories = y1 + y2 if labels is None else labels
+    code_of: dict[Hashable, int] = {}
+    for label in categories:
+        code_of.setdefault(label, len(code_of))
+    unknown = {label for label in y1 + y2 if label not in code_of}
     if unknown:
-        raise ValueError(f"values not in labels: {sorted(map(repr, unknown))}")
-    c1 = np.fromiter((cats[v] for v in y1), dtype=np.int64, count=len(y1))
-    c2 = np.fromiter((cats[v] for v in y2), dtype=np.int64, count=len(y2))
-    return c1, c2, len(cats)
+        raise ValueError(f"values not in labels: {sorted(repr(label) for label in unknown)}")
+    codes_1 = np.fromiter((code_of[label] for label in y1), dtype=np.int64, count=len(y1))
+    codes_2 = np.fromiter((code_of[label] for label in y2), dtype=np.int64, count=len(y2))
+    return codes_1, codes_2, len(code_of)
 
 
-def _kappa_from_codes(c1: np.ndarray, c2: np.ndarray, k: int) -> np.ndarray:
-    """Row-wise kappa of (R, n) code arrays in exact integer arithmetic; nan where chance agreement is 1.
+def _kappa_from_codes(codes_1: np.ndarray, codes_2: np.ndarray, n_categories: int) -> np.ndarray:
+    """Row-wise Cohen's κ of two (R, n) code arrays in exact integer arithmetic; nan where chance agreement is 1.
 
-    kappa = (p_o - p_e) / (1 - p_e) = (n A - S) / (n^2 - S), with A the number of agreements and
-    S = sum_k n1_k n2_k over the two raters' marginal counts.
+    κ = (p_o − p_e) / (1 − p_e) = (n·A − S) / (n² − S), with A the number of agreements and
+    S = Σ_k n1_k · n2_k over the two raters' per-category counts.
     """
-    n = c1.shape[1]
-    agree = (c1 == c2).sum(axis=1)
-    s = np.zeros(c1.shape[0], dtype=np.int64)
-    for lab in range(k):
-        s += (c1 == lab).sum(axis=1) * (c2 == lab).sum(axis=1)
-    num = n * agree - s
-    den = n * n - s
-    out = np.full(c1.shape[0], np.nan)
-    ok = den > 0
-    out[ok] = num[ok] / den[ok]
-    return out
+    n = codes_1.shape[1]
+    agreements = (codes_1 == codes_2).sum(axis=1)
+    marginal_products = np.zeros(codes_1.shape[0], dtype=np.int64)
+    for category in range(n_categories):
+        marginal_products += (codes_1 == category).sum(axis=1) * (codes_2 == category).sum(axis=1)
+    numerator = n * agreements - marginal_products
+    denominator = n * n - marginal_products
+    kappa = np.full(codes_1.shape[0], np.nan)
+    defined = denominator > 0
+    kappa[defined] = numerator[defined] / denominator[defined]
+    return kappa
 
 
 def cohen_kappa(y1: Sequence[Hashable], y2: Sequence[Hashable], labels: Sequence[Hashable] | None = None) -> float:
-    """Unweighted Cohen's kappa of two raters' nominal labels for the same items, equal to
+    """Unweighted Cohen's κ: how much two raters agree on nominal labels for the same items, beyond chance.
+
+    κ = (p_o − p_e) / (1 − p_e), p_o the observed and p_e the chance agreement (Cohen 1960); equal to
     ``sklearn.metrics.cohen_kappa_score``. With ``labels``, a value outside them raises rather than being
-    dropped. nan with no items, or when both raters gave every item one and the same label."""
-    c1, c2, k = _encode_pair(y1, y2, labels)
-    if c1.size == 0:
+    dropped. nan with no items, or when both raters gave every item one and the same label.
+    """
+    codes_1, codes_2, n_categories = _encode_pair(y1, y2, labels)
+    if codes_1.size == 0:
         return float("nan")
-    return float(_kappa_from_codes(c1[None, :], c2[None, :], k)[0])
+    return float(_kappa_from_codes(codes_1[None, :], codes_2[None, :], n_categories)[0])
 
 
 def cohen_kappa_ci(
     y1: Sequence[Hashable], y2: Sequence[Hashable], n_boot: int = 2000, alpha: float = 0.05, seed: int = 0
 ) -> dict[str, Any]:
-    """Cohen's kappa with a percentile bootstrap interval over items; resamples where kappa is undefined are
-    skipped. Returns {"kappa", "lo", "hi", "n", "n_boot_used"}."""
+    """Cohen's κ (see ``cohen_kappa``) with a percentile bootstrap interval over items.
+
+    Resamples where κ is undefined are skipped. Returns {"kappa", "lo", "hi", "n", "n_boot_used"}.
+    """
     alpha = _check_alpha(alpha)
     n_boot = _check_n_boot(n_boot)
-    c1, c2, k = _encode_pair(y1, y2, None)
-    n = c1.size
+    codes_1, codes_2, n_categories = _encode_pair(y1, y2, None)
+    n = codes_1.size
     if n == 0:
         nan = float("nan")
         return {"kappa": nan, "lo": nan, "hi": nan, "n": 0, "n_boot_used": 0}
-    kappa = float(_kappa_from_codes(c1[None, :], c2[None, :], k)[0])
-    kept = []
-    for idx in _boot_indices(np.random.default_rng(seed), n, n_boot):
-        r = _kappa_from_codes(c1[idx], c2[idx], k)
-        kept.append(r[~np.isnan(r)])
-    boots = np.concatenate(kept)
-    lo, hi = _percentile_ci(boots, alpha)
-    return {"kappa": kappa, "lo": lo, "hi": hi, "n": int(n), "n_boot_used": int(boots.size)}
+    kappa = float(_kappa_from_codes(codes_1[None, :], codes_2[None, :], n_categories)[0])
+    kappa_chunks = []
+    for indices in _boot_indices(np.random.default_rng(seed), n, n_boot):
+        chunk_kappas = _kappa_from_codes(codes_1[indices], codes_2[indices], n_categories)
+        kappa_chunks.append(chunk_kappas[~np.isnan(chunk_kappas)])
+    boot_kappas = np.concatenate(kappa_chunks)
+    lo, hi = _percentile_ci(boot_kappas, alpha)
+    return {"kappa": kappa, "lo": lo, "hi": hi, "n": int(n), "n_boot_used": int(boot_kappas.size)}

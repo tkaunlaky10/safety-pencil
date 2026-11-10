@@ -4,16 +4,21 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 rm -rf outputs/dryrun
-py() { python "$@" --dry-run; }
-py scripts/00_model_facts.py
-py scripts/03_finetune.py --run A
-py scripts/03_finetune.py --run D
-for l in en hi hinglish; do py scripts/04_factors.py --side harm --lang "$l"; done
-py scripts/04_factors.py --side task --run A
-py scripts/04_leverage.py --run A
-py scripts/05_invariance.py --run A --conds 10
-py scripts/06_repair.py sweep --run A --mu 0.01 0.1 1.0
-py scripts/06_repair.py forecast
-py scripts/07_baselines.py --run A --methods wiseft resta safelora regmean diag_fisher alignmerge safe_delta
-py scripts/08_localisation.py --run A
+
+# Run one script with the given arguments plus --dry-run.
+dry_run() { python "$@" --dry-run; }
+
+dry_run scripts/00_model_facts.py
+dry_run scripts/03_finetune.py --run A
+dry_run scripts/03_finetune.py --run D
+for lang in en hi hinglish; do
+  dry_run scripts/04_factors.py --side harm --lang "$lang"
+done
+dry_run scripts/04_factors.py --side task --run A
+dry_run scripts/04_leverage.py --run A
+dry_run scripts/05_invariance.py --run A --conds 10
+dry_run scripts/06_repair.py sweep --run A --mu 0.01 0.1 1.0
+dry_run scripts/06_repair.py forecast
+dry_run scripts/07_baselines.py --run A --methods wiseft resta safelora regmean diag_fisher alignmerge safe_delta
+dry_run scripts/08_localisation.py --run A
 echo "dry run complete: outputs/dryrun/"

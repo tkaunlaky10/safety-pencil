@@ -27,11 +27,22 @@ except ImportError:  # keeps this module importable without SafeTune
             self.model = model
 
 
-def _factors(f):
-    return FactorStore.from_dir(f) if isinstance(f, str) or hasattr(f, "is_dir") else f
+# ModelRepair settings used unless the caller overrides them
+DEFAULT_REPAIR_KW = {"row_set": "full", "top_k_mlp": 512, "rel_tol_other": 1e-10}
+
+
+def _as_factors(factors_or_folder):
+    """A factor folder (a str or Path) opened as a FactorStore; factor objects are returned unchanged."""
+    is_folder = isinstance(factors_or_folder, str) or hasattr(factors_or_folder, "is_dir")
+    if is_folder:
+        return FactorStore.from_dir(factors_or_folder)
+    return factors_or_folder
 
 
 class PencilTrainer(_RecoverBase):
+    """SafeTune recover trainer for the pencil repair: `apply()` replaces each repaired module's weight in the
+    drifted model by W0 + ΔW′ and keeps the repair report in `self.report`."""
+
     METHOD = "PencilTrainer"
 
     def __init__(
@@ -49,12 +60,18 @@ class PencilTrainer(_RecoverBase):
     ):
         """repair_kw go to ModelRepair (row_set, damping, gamma, top_k_mlp, rel_tol_other, ...)."""
         super().__init__(model)
-        self.aligned_model, self.harm_factors, self.task_factors = aligned_model, harm_factors, task_factors
-        self.adapter_path, self.deltas, self.mu, self.modules = adapter_path, deltas, mu, modules
-        self.repair_kw = {"row_set": "full", "top_k_mlp": 512, "rel_tol_other": 1e-10, **repair_kw}
+        self.aligned_model = aligned_model
+        self.harm_factors = harm_factors
+        self.task_factors = task_factors
+        self.adapter_path = adapter_path
+        self.deltas = deltas
+        self.mu = mu
+        self.modules = modules
+        self.repair_kw = {**DEFAULT_REPAIR_KW, **repair_kw}
         self.report: dict = {}
 
     def _deltas(self, names):
+        """ΔW per module: the given deltas, else the adapter's, else (with a warning) drifted minus aligned."""
         if self.deltas is not None:
             return self.deltas
         if self.adapter_path is not None:
@@ -62,22 +79,29 @@ class PencilTrainer(_RecoverBase):
         warnings.warn(
             "PencilTrainer: no adapter given, taking ΔW from merged weights (bf16 rounding enters ΔW)", stacklevel=2
         )
-        drifted, aligned = self.model.state_dict(), self.aligned_model.state_dict()
-        return {n: drifted[n + ".weight"].float() - aligned[n + ".weight"].float() for n in names}
+        drifted = self.model.state_dict()
+        aligned = self.aligned_model.state_dict()
+        return {name: drifted[name + ".weight"].float() - aligned[name + ".weight"].float() for name in names}
 
     def apply(self, *, mu: float | None = None, **kwargs):
+        """Repair the drifted model in place at μ (default: the constructor's) and return it. Extra keyword
+        arguments from SafeTune's harness are accepted and ignored."""
         if self.aligned_model is None or self.harm_factors is None or self.task_factors is None:
             raise ValueError("PencilTrainer needs aligned_model, harm_factors and task_factors")
-        fh, ft, rel_tol, _ = prepare_for_repair(
-            self.aligned_model, _factors(self.harm_factors), _factors(self.task_factors)
+        harm, task, rel_tol, _ = prepare_for_repair(
+            self.aligned_model, _as_factors(self.harm_factors), _as_factors(self.task_factors)
         )
-        deltas = {n: d for n, d in self._deltas(fh.modules).items() if n in fh.a_key}
+        all_deltas = self._deltas(harm.modules)
+        deltas = {module: delta for module, delta in all_deltas.items() if module in harm.a_key}
         aligned = self.aligned_model.state_dict()
-        W0 = {n: aligned[n + ".weight"] for n in deltas}
-        repairer = ModelRepair(fh, ft, rel_tol=rel_tol, **self.repair_kw)
-        new, self.report = repairer.repair(W0, deltas, self.mu if mu is None else mu, modules=self.modules)
+        W0 = {module: aligned[module + ".weight"] for module in deltas}
+
+        if mu is None:
+            mu = self.mu
+        repairer = ModelRepair(harm, task, rel_tol=rel_tol, **self.repair_kw)
+        new_weights, self.report = repairer.repair(W0, deltas, mu, modules=self.modules)
         self.report["rel_tol"] = rel_tol
-        set_weights(self.model, new)
+        set_weights(self.model, new_weights)
         return self.model
 
 

@@ -40,10 +40,22 @@ from pencil.runtime import (
     model_shape,
     setup,
     single_row_set,
+    task_pass_name,
     task_rows,
     theta0_answers,
     write_json,
 )
+
+# Without an explicit --layers-per-pass, a chunk's factors may use at most this share of free GPU memory.
+GPU_MEMORY_SHARE = 0.6
+
+# The flag each side cannot run without, and the error shown when it is missing.
+REQUIRED_FLAG = {"harm": "lang", "task": "run", "general": "data_file"}
+MISSING_FLAG_ERROR = {
+    "harm": "--side harm needs --lang",
+    "task": "--side task needs --run",
+    "general": "--side general needs --data-file",
+}
 
 
 def parse_layers(spec: str, n_layers: int, selection_layers: list[int]) -> list[int]:
@@ -54,122 +66,155 @@ def parse_layers(spec: str, n_layers: int, selection_layers: list[int]) -> list[
         return [layer for layer in selection_layers if layer < n_layers]
     layers = []
     for part in spec.split(","):
-        a, _, b = part.partition("-")
-        layers += list(range(int(a), int(b) + 1)) if b else [int(a)]
+        start, _, end = part.partition("-")
+        if end:
+            layers += list(range(int(start), int(end) + 1))
+        else:
+            layers.append(int(start))
     return layers
 
 
-def side_batches(ctx, args, model, tok, n: int) -> tuple[str, str, list[dict]]:
+def side_batches(ctx, args, model, tokenizer, n_examples: int) -> tuple[str, str, list[dict]]:
     """(pass name, which θ, batches) for the requested side. Merges the adapter into `model` for the task side."""
-    fc = ctx.cfg["factors"]
-    size = fc.get("batch_size", 1)
+    factor_cfg = ctx.cfg["factors"]
+    batch_size = factor_cfg.get("batch_size", 1)
     if args.side == "harm":
-        return args.lang, "theta0", theta0_answers(ctx, model, tok, args.lang, "factor", n, size)
+        batches = theta0_answers(ctx, model, tokenizer, args.lang, "factor", n_examples, batch_size)
+        return args.lang, "theta0", batches
     if args.side == "task":
         run = ctx.cfg["runs"][args.run]
         merge_deltas(model, lora_delta(adapter_dir(ctx, args.run, args.frac)))
-        rows = task_rows(ctx, f"train_{run['size']}", n)
-        name = f"run{args.run}" + ("" if args.frac == 100 else f"_frac{args.frac}")
+        rows = task_rows(ctx, f"train_{run['size']}", n_examples)
+        name = task_pass_name(args.run, args.frac)
         theta = f"theta1 run {args.run}"
     else:
-        rows, name, theta = read_jsonl(args.data_file)[:n], "general", "theta0"
-    encoded = encode_pairs(tok, [(r["prompt"], r["answer"]) for r in rows], fc["max_len"])
-    return name, theta, make_batches(encoded, tok.pad_token_id, size)
+        rows = read_jsonl(args.data_file)[:n_examples]
+        name = "general"
+        theta = "theta0"
+    pairs = [(row["prompt"], row["answer"]) for row in rows]
+    encoded = encode_pairs(tokenizer, pairs, factor_cfg["max_len"])
+    return name, theta, make_batches(encoded, tokenizer.pad_token_id, batch_size)
 
 
 def layers_per_pass(ctx, requested: int | None, bytes_per_layer: int) -> int:
     """The configured chunk size, reduced to what fits in 60% of free GPU memory (unless given explicitly)."""
-    k = requested or ctx.cfg["factors"]["layers_per_pass"]
-    if ctx.device.startswith("cuda") and not requested:
-        free = torch.cuda.mem_get_info()[0]
-        fit = max(1, int(0.6 * free // bytes_per_layer))
-        if fit < k:
-            print(f"memory: {free / 1e9:.1f} GB free fits {fit} layer(s) per pass, not {k}")
-            k = fit
-    return k
+    if requested:
+        return requested
+    chunk_size = ctx.cfg["factors"]["layers_per_pass"]
+    if not ctx.device.startswith("cuda"):
+        return chunk_size
+    free_bytes = torch.cuda.mem_get_info()[0]
+    fit = max(1, int(GPU_MEMORY_SHARE * free_bytes // bytes_per_layer))
+    if fit < chunk_size:
+        print(f"memory: {free_bytes / 1e9:.1f} GB free fits {fit} layer(s) per pass, not {chunk_size}")
+        chunk_size = fit
+    return chunk_size
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The command-line flags (see the module docstring for examples)."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    common_args(parser)
+    parser.add_argument("--side", choices=["harm", "task", "general"], required=True)
+    parser.add_argument("--lang", help="harm side: en, hi or hinglish")
+    parser.add_argument("--run", help="task side: run id (A-D)")
+    parser.add_argument("--frac", type=int, default=100, help="task side: the adapter at this %% of training")
+    parser.add_argument("--data-file", help="general side: JSONL rows with prompt and answer")
+    parser.add_argument("--layers", default="all", help="'all', 'selection' or e.g. '0-5,12'")
+    parser.add_argument("--row-sets", default=None, help="comma list (default factors.row_sets)")
+    parser.add_argument("--n", type=int, default=None, help="examples (default factors.n_prompts)")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--layers-per-pass", type=int, default=None, help="override factors.layers_per_pass")
+    parser.add_argument("--overwrite", action="store_true", help="replace existing factor files for this pass")
+    parser.add_argument("--diag", action="store_true", help="also collect the per-sequence diagonal Fisher")
+    return parser
+
+
+def clear_old_factors(parser, out, overwrite: bool) -> None:
+    """Delete factor files left in `out` by an earlier pass; refuse (exit with an error) unless --overwrite."""
+    stale = sorted(out.glob("layers*.safetensors"))
+    if stale and not overwrite:
+        parser.error(f"{out} already has {len(stale)} factor files; pass --overwrite to replace them")
+    for path in stale:
+        path.unlink()
+
+
+def collect_chunk(ctx, args, model, batches, chunk: list[int], row_sets: tuple, out, pass_info: dict):
+    """One pass over `batches` with only the layers in `chunk` hooked; saves out/layers{a}-{b}.safetensors.
+    Returns the finalized factors and the chunk's timing record."""
+    on_cuda = ctx.device.startswith("cuda")
+    t_chunk = time.time()
+    if on_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    accum_dtype = getattr(torch, ctx.cfg["factors"].get("accum_dtype", "float32"))
+    collector = KFACCollector(
+        model,
+        layers=chunk,
+        row_sets=row_sets,
+        seed=args.seed,
+        diag=args.diag,
+        diag_row_set=single_row_set(ctx.cfg["pencil"]),
+        accum_dtype=accum_dtype,
+    )
+    with collector:
+        for batch in batches:
+            collector.collect(batch)
+    factors = collector.finalize(meta={**pass_info, "layers": chunk, "model": ctx.aligned})
+    path = out / f"layers{chunk[0]:02d}-{chunk[-1]:02d}.safetensors"
+    factors.save(path)
+
+    peak_gb = torch.cuda.max_memory_allocated() / 1e9 if on_cuda else None
+    seconds = time.time() - t_chunk
+    message = f"  layers {chunk}: {seconds:.0f}s"
+    if peak_gb:
+        message += f", peak {peak_gb:.1f} GB"
+    print(message)
+    return factors, {"layers": chunk, "seconds": seconds, "peak_gpu_gb": peak_gb, "file": path.name}
 
 
 def main(argv=None):
-    p = common_args(argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter))
-    p.add_argument("--side", choices=["harm", "task", "general"], required=True)
-    p.add_argument("--lang", help="harm side: en, hi or hinglish")
-    p.add_argument("--run", help="task side: run id (A-D)")
-    p.add_argument("--frac", type=int, default=100, help="task side: the adapter at this %% of training")
-    p.add_argument("--data-file", help="general side: JSONL rows with prompt and answer")
-    p.add_argument("--layers", default="all", help="'all', 'selection' or e.g. '0-5,12'")
-    p.add_argument("--row-sets", default=None, help="comma list (default factors.row_sets)")
-    p.add_argument("--n", type=int, default=None, help="examples (default factors.n_prompts)")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--layers-per-pass", type=int, default=None, help="override factors.layers_per_pass")
-    p.add_argument("--overwrite", action="store_true", help="replace existing factor files for this pass")
-    p.add_argument("--diag", action="store_true", help="also collect the per-sequence diagonal Fisher")
-    args = p.parse_args(argv)
-    needs = {"harm": args.lang, "task": args.run, "general": args.data_file}[args.side]
-    if not needs:
-        p.error(
-            {
-                "harm": "--side harm needs --lang",
-                "task": "--side task needs --run",
-                "general": "--side general needs --data-file",
-            }[args.side]
-        )
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    side = args.side
+    if not getattr(args, REQUIRED_FLAG[side]):
+        parser.error(MISSING_FLAG_ERROR[side])
     ctx = setup(args)
-    fc = ctx.cfg["factors"]
-    row_sets = tuple(args.row_sets.split(",")) if args.row_sets else tuple(fc["row_sets"])
-    tok = load_tokenizer(ctx)
+    factor_cfg = ctx.cfg["factors"]
+    row_sets = tuple(args.row_sets.split(",")) if args.row_sets else tuple(factor_cfg["row_sets"])
+    tokenizer = load_tokenizer(ctx)
     model = load_model(ctx.aligned, ctx)
     shape = model_shape(model)
     t_start = time.time()
-    name, theta, batches = side_batches(ctx, args, model, tok, args.n or fc["n_prompts"])
+    name, theta, batches = side_batches(ctx, args, model, tokenizer, args.n or factor_cfg["n_prompts"])
     t_data = time.time() - t_start
 
-    layers = parse_layers(args.layers, shape["n_layers"], fc["selection_layers"])
+    layers = parse_layers(args.layers, shape["n_layers"], factor_cfg["selection_layers"])
+    if not layers:
+        parser.error(f"--layers {args.layers!r} selects no layers (the model has {shape['n_layers']})")
     bytes_per_layer = factor_bytes(
         shape["hidden"], shape["inter"], shape["n_heads"], shape["n_kv"], shape["head_dim"], n_row_sets=len(row_sets)
     )
-    k = layers_per_pass(ctx, args.layers_per_pass, bytes_per_layer)
-    n_seqs = sum(b["input_ids"].shape[0] for b in batches)
+    chunk_size = layers_per_pass(ctx, args.layers_per_pass, bytes_per_layer)
+    n_seqs = sum(batch["input_ids"].shape[0] for batch in batches)
     print(
-        f"{args.side}/{name}: {n_seqs} sequences, layers {layers}, row sets {row_sets}; "
-        f"{bytes_per_layer / 1e9:.2f} GB per layer, {k} layer(s) per pass"
+        f"{side}/{name}: {n_seqs} sequences, layers {layers}, row sets {row_sets}; "
+        f"{bytes_per_layer / 1e9:.2f} GB per layer, {chunk_size} layer(s) per pass"
     )
 
-    out = factor_dir(ctx, args.side, name, selection=args.layers == "selection")
+    out = factor_dir(ctx, side, name, selection=args.layers == "selection")
     out.mkdir(parents=True, exist_ok=True)
-    stale = sorted(out.glob("layers*.safetensors"))
-    if stale and not args.overwrite:
-        p.error(f"{out} already has {len(stale)} factor files; pass --overwrite to replace them")
-    for f in stale:
-        f.unlink()
+    clear_old_factors(parser, out, args.overwrite)
 
-    diag_rows = single_row_set(ctx.cfg["pencil"])
+    pass_info = {"side": side, "name": name, "theta": theta}
     timing = []
-    for chunk in [layers[i : i + k] for i in range(0, len(layers), k)]:
-        t0 = time.time()
-        if ctx.device.startswith("cuda"):
-            torch.cuda.reset_peak_memory_stats()
-        with KFACCollector(
-            model,
-            layers=chunk,
-            row_sets=row_sets,
-            seed=args.seed,
-            diag=args.diag,
-            diag_row_set=diag_rows,
-            accum_dtype=getattr(torch, fc.get("accum_dtype", "float32")),
-        ) as kc:
-            for b in batches:
-                kc.collect(b)
-        factors = kc.finalize(
-            meta={"side": args.side, "name": name, "theta": theta, "layers": chunk, "model": ctx.aligned}
-        )
-        path = out / f"layers{chunk[0]:02d}-{chunk[-1]:02d}.safetensors"
-        factors.save(path)
-        peak = torch.cuda.max_memory_allocated() / 1e9 if ctx.device.startswith("cuda") else None
-        timing.append({"layers": chunk, "seconds": time.time() - t0, "peak_gpu_gb": peak, "file": path.name})
-        print(f"  layers {chunk}: {timing[-1]['seconds']:.0f}s" + (f", peak {peak:.1f} GB" if peak else ""))
+    for start in range(0, len(layers), chunk_size):
+        chunk = layers[start : start + chunk_size]
+        factors, chunk_timing = collect_chunk(ctx, args, model, batches, chunk, row_sets, out, pass_info)
+        timing.append(chunk_timing)
 
+    # n_loss and n_rows are the same for every chunk (same batches, same labels); take the last chunk's.
     meta = {
-        "side": args.side,
+        "side": side,
         "name": name,
         "theta": theta,
         "n_sequences": n_seqs,

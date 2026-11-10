@@ -3,8 +3,8 @@ per-head lower bounds for o_proj and per-KV-group lower bounds for v_proj. Uses 
 and thresholds as the repair.
 
 For each language with harmful factors on disk, and for all of them pooled with equal weights, writes
-outputs/results/leverage_{lang}_run{run}.json and outputs/figures/leverage_{lang}.png and
-leverage_heads_{lang}.png.
+outputs/results/leverage_{lang}_run{run}.json and the figures outputs/figures/leverage_{lang}_run{run}.png
+and leverage_heads_{lang}_run{run}.png.
 
     python scripts/04_leverage.py --run A
     python scripts/04_leverage.py --run A --dry-run
@@ -31,25 +31,36 @@ from pencil.runtime import (
     task_factors,
 )
 
+N_TOP_MODULES = 10  # modules listed in the result JSON
+N_PRINTED_MODULES = 5  # of those, modules printed to the console
+
+
+def nan_grid(n_rows: int, n_columns: int) -> list[list[float]]:
+    """An n_rows × n_columns grid of NaN (blank heatmap cells)."""
+    return [[float("nan")] * n_columns for _ in range(n_rows)]
+
 
 def plot(table: dict, shape: dict, figures, name: str, run: str) -> None:
-    modules = [[float("nan")] * len(LEAVES) for _ in range(shape["n_layers"])]
-    heads = [[float("nan")] * shape["n_heads"] for _ in range(shape["n_layers"])]
+    """Two heatmaps of log10 leverage by layer: the module maximum, and o_proj's per-head lower bounds."""
+    module_grid = nan_grid(shape["n_layers"], len(LEAVES))
+    head_grid = nan_grid(shape["n_layers"], shape["n_heads"])
     for row in table.values():
-        modules[row["layer"]][LEAVES.index(row["module"])] = log10_or_nan(row["max"])
+        module_grid[row["layer"]][LEAVES.index(row["module"])] = log10_or_nan(row["max"])
         if "per_head_lower_bound" in row:
-            heads[row["layer"]] = [log10_or_nan(v) for v in row["per_head_lower_bound"]]
+            head_grid[row["layer"]] = [log10_or_nan(value) for value in row["per_head_lower_bound"]]
+
+    module_labels = [module.replace("_proj", "") for module in LEAVES]
     heatmap(
-        modules,
-        [m.replace("_proj", "") for m in LEAVES],
-        figures / f"leverage_{name}.png",
+        module_grid,
+        module_labels,
+        figures / f"leverage_{name}_run{run}.png",
         title=f"leverage, harmful={name}, task=run {run}",
         colorbar="log10 max αγ",
     )
     heatmap(
-        heads,
+        head_grid,
         range(shape["n_heads"]),
-        figures / f"leverage_heads_{name}.png",
+        figures / f"leverage_heads_{name}_run{run}.png",
         xlabel="query head",
         title=f"o_proj per-head leverage, {name}\n(lower bounds on the module's top value)",
         colorbar="log10 αγ",
@@ -57,37 +68,60 @@ def plot(table: dict, shape: dict, figures, name: str, run: str) -> None:
     )
 
 
+def factor_pools(langs: list[str]) -> list[tuple[str, list[str]]]:
+    """(name, languages) for each language on its own, plus "pooled" over all of them when there are several."""
+    pools = [(lang, [lang]) for lang in langs]
+    if len(langs) > 1:
+        pools.append(("pooled", langs))
+    return pools
+
+
+def top_modules(table: dict, count: int) -> list[str]:
+    """The `count` modules with the largest leverage (max α_i γ_j), largest first."""
+    return sorted(table, key=lambda module: table[module]["max"], reverse=True)[:count]
+
+
+def short_summary(table: dict, modules: list[str]) -> list[tuple[str, float]]:
+    """(module name after 'layers.', leverage rounded to 2 decimals) for printing."""
+    summary = []
+    for module in modules:
+        short_name = module.split("layers.")[1]
+        summary.append((short_name, round(table[module]["max"], 2)))
+    return summary
+
+
 def main(argv=None):
-    p = common_args(argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter))
-    p.add_argument("--run", default="A")
-    p.add_argument("--row-set", default=None, help="default pencil.repair_row_set")
-    args = p.parse_args(argv)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    common_args(parser)
+    parser.add_argument("--run", default="A")
+    parser.add_argument("--row-set", default=None, help="default pencil.repair_row_set")
+    args = parser.parse_args(argv)
     ctx = setup(args)
-    pc = ctx.cfg["pencil"]
+    pencil_cfg = ctx.cfg["pencil"]
     model = load_model(ctx.aligned, ctx)  # for shapes and the LayerNorm null vectors
     shape = model_shape(model)
     langs = available_langs(ctx)
-    row_set = args.row_set or pc.get("repair_row_set", "all")
-    for name, pool in [(lang, [lang]) for lang in langs] + ([("pooled", langs)] if len(langs) > 1 else []):
-        fh, ft, rel_tol, floors = prepare_factors(model, harm_factors(ctx, pool), task_factors(ctx, args.run), pc)
-        repairer = ModelRepair(fh, ft, **repair_kwargs(pc, rel_tol, row_set=row_set))
-        modules = layer_order(m for m in fh.modules if m in ft.a_key)
+    row_set = args.row_set or pencil_cfg.get("repair_row_set", "all")
+
+    for name, pool in factor_pools(langs):
+        pooled_harm = harm_factors(ctx, pool)
+        run_task = task_factors(ctx, args.run)
+        harm, task, rel_tol, floors = prepare_factors(model, pooled_harm, run_task, pencil_cfg)
+        repairer = ModelRepair(harm, task, **repair_kwargs(pencil_cfg, rel_tol, row_set=row_set))
+        modules = layer_order(module for module in harm.modules if module in task.a_key)
         table = leverage_table(
             repairer, modules, n_heads=shape["n_heads"], n_kv=shape["n_kv"], head_dim=shape["head_dim"]
         )
         plot(table, shape, ctx.out("figures"), name, args.run)
-        top = sorted(table, key=lambda n: table[n]["max"], reverse=True)[:10]
+        top = top_modules(table, N_TOP_MODULES)
         write_result(
             f"leverage_{name}_run{args.run}",
             {"table": table, "top10_modules": top, "rel_tol": rel_tol, "null_floors": floors, "row_set": row_set},
-            config={"pencil": pc, "langs": pool},
+            config={"pencil": pencil_cfg, "langs": pool},
             checkpoint=f"run{args.run}",
             out_dir=ctx.out("results"),
         )
-        print(
-            f"{name}: top modules {[(t.split('layers.')[1], round(table[t]['max'], 2)) for t in top[:5]]} "
-            f"(rel_tol {rel_tol:.1e})"
-        )
+        print(f"{name}: top modules {short_summary(table, top[:N_PRINTED_MODULES])} (rel_tol {rel_tol:.1e})")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,10 @@
 .venv/
 .venv-circuit/
 # large or sensitive outputs: checkpoints, factors, generations (raw completions never go in git)
-outputs/
+outputs/*
+# ...except results (ids, labels and hashes only, never raw completions) and figures, so git tracks experiments
+!outputs/results/
+!outputs/figures/
 data/raw/
 # BeaverTails harmful completions for run D: never commit
 data/processed/contamination/
@@ -19,6 +22,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .pytest_cache/
+.ruff_cache/
 *.egg-info/
 # patched Lexsi clones made by scripts/setup_lexsi.sh
 third_party/

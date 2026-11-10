@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 
 from pencil.datasets import (
@@ -33,6 +34,13 @@ from pencil.datasets import (
 )
 from pencil.results import write_result
 
+MAX_IDS_LISTED = 50  # shared ids listed per pair of sets
+CROSS_LINGUAL_THRESHOLD = 0.8  # near threshold for the cross-lingual info when the near check is off
+REPORTED_ROLES = ("test", "factor", "train", "dev")
+
+
+# ── finding the sets ─────────────────────────────────────────────────────────
+
 
 def discover(data_dir: Path) -> dict[str, list[dict]]:
     """{"harmful/en/test": rows, "task_t1/heldout": rows, ...} for every processed file that exists."""
@@ -40,19 +48,20 @@ def discover(data_dir: Path) -> dict[str, list[dict]]:
     for name, splits in PROMPT_SET_SPLITS.items():
         for lang in LANGS:
             for split in splits:
-                p = split_path(data_dir, name, split, lang)
-                if p.exists():
-                    sets[f"{name}/{lang}/{split}"] = read_jsonl(p)
-    t1 = data_dir / "task_t1"
-    for p in sorted(t1.glob("train_*.jsonl")) + [t1 / "heldout.jsonl"]:
-        if p.exists():
-            sets[f"task_t1/{p.stem}"] = read_jsonl(p)
-    for p in sorted((data_dir / "contamination").glob("beavertails_*.jsonl")):
-        sets[f"contamination/{p.stem}"] = read_jsonl(p)
+                path = split_path(data_dir, name, split, lang)
+                if path.exists():
+                    sets[f"{name}/{lang}/{split}"] = read_jsonl(path)
+    task_dir = data_dir / "task_t1"
+    for path in sorted(task_dir.glob("train_*.jsonl")) + [task_dir / "heldout.jsonl"]:
+        if path.exists():
+            sets[f"task_t1/{path.stem}"] = read_jsonl(path)
+    for path in sorted((data_dir / "contamination").glob("beavertails_*.jsonl")):
+        sets[f"contamination/{path.stem}"] = read_jsonl(path)
     return sets
 
 
 def role(name: str) -> str:
+    """What a set is used for: "test", "factor", "train", "dev" or "other"."""
     if name == "task_t1/heldout" or name.endswith("/test"):
         return "test"
     if name.endswith("/factor"):
@@ -64,14 +73,27 @@ def role(name: str) -> str:
     return "other"
 
 
+# ── checks ───────────────────────────────────────────────────────────────────
+
+
 def id_collisions(pairs: list[tuple[str, str]], ids: dict[str, list[str]]) -> list[dict]:
     """Pairs of sets that share ids (up to 50 listed per pair)."""
-    out = []
+    collisions = []
     for a, b in pairs:
         shared = sorted(set(ids[a]) & set(ids[b]))
         if shared:
-            out.append({"a": a, "b": b, "n": len(shared), "ids": shared[:50]})
-    return out
+            collisions.append({"a": a, "b": b, "n": len(shared), "ids": shared[:MAX_IDS_LISTED]})
+    return collisions
+
+
+def _split_of(set_name: str) -> str:
+    """The split part of a set name: "harmful/hi/dev:literal_translation" -> "dev"."""
+    return set_name.split("/")[2].split(":")[0]
+
+
+def _file_set_name(set_name: str) -> str:
+    """The set name without a ":field" suffix, i.e. the file the texts came from."""
+    return set_name.split(":")[0]
 
 
 def cross_lingual_info(
@@ -81,85 +103,101 @@ def cross_lingual_info(
     of the other splits; None when no Hindi file has literal translations."""
     literal = {}
     for name, rows in sets.items():
-        if name.startswith("harmful/hi/"):
-            translations = [str(r.get("metadata", {}).get("literal_translation") or "") for r in rows]
-            if any(translations):
-                literal[f"{name}:literal_translation"] = translations
+        if not name.startswith("harmful/hi/"):
+            continue
+        translations = [str(row.get("metadata", {}).get("literal_translation") or "") for row in rows]
+        if any(translations):
+            literal[f"{name}:literal_translation"] = translations
     if not literal:
         return None
-    english = [k for k in sets if k.startswith("harmful/en/")]
 
-    def split_of(name: str) -> str:
-        return name.split("/")[2].split(":")[0]
-
-    pairs = [(a, b) for a in literal for b in english if split_of(a) != split_of(b)]
-    xsets = {**literal, **{k: texts[k] for k in english}}
-    return check_no_overlap(
-        xsets, pairs=pairs, near_threshold=near or 0.8, ids={k: ids[k.split(":")[0]] for k in xsets}
-    )
+    english = [name for name in sets if name.startswith("harmful/en/")]
+    pairs = [(a, b) for a in literal for b in english if _split_of(a) != _split_of(b)]
+    compared = {**literal, **{name: texts[name] for name in english}}
+    compared_ids = {name: ids[_file_set_name(name)] for name in compared}
+    threshold = near if near else CROSS_LINGUAL_THRESHOLD
+    return check_no_overlap(compared, pairs=pairs, near_threshold=threshold, ids=compared_ids)
 
 
 def print_hits(report: dict, label: str, near_fails: bool) -> None:
-    hits = [p for p in report["pairs"] if p["n_exact"] or p.get("n_near")]
-    for p in hits:
-        near = f", {p['n_near']} near" if p.get("n_near") is not None else ""
-        tag = label if (p["n_exact"] or near_fails) else "near"
-        print(f"  [{tag}] {p['a']} vs {p['b']}: {p['n_exact']} exact{near}")
+    """One line per pair with matches, tagged ``label`` if it fails and "near" if only near matches warn."""
+    hits = [pair for pair in report["pairs"] if pair["n_exact"] or pair.get("n_near")]
+    for pair in hits:
+        near_text = ""
+        if pair.get("n_near") is not None:
+            near_text = f", {pair['n_near']} near"
+        tag = label if (pair["n_exact"] or near_fails) else "near"
+        print(f"  [{tag}] {pair['a']} vs {pair['b']}: {pair['n_exact']} exact{near_text}")
     if not hits:
         print("  none")
 
 
 def n_failing(report: dict, fail_on_near: bool) -> int:
-    return report["n_exact"] + ((report["n_near"] or 0) if fail_on_near else 0)
+    """Matches that fail the check: exact ones, plus near ones with --fail-on-near."""
+    if not fail_on_near:
+        return report["n_exact"]
+    n_near = report["n_near"] or 0  # None when the near check is off
+    return report["n_exact"] + n_near
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__
     )
-    p.add_argument("--data-dir", default=None, help="processed data root (default: data/processed)")
-    p.add_argument(
+    parser.add_argument("--data-dir", default=None, help="processed data root (default: data/processed)")
+    parser.add_argument(
         "--near-threshold",
         type=float,
         default=0.8,
         help="character 5-gram Jaccard for near duplicates (<= 0 turns the near check off)",
     )
-    p.add_argument("--fail-on-near", action="store_true", help="near duplicates in test-vs-factor/train pairs fail")
-    p.add_argument("--strict", action="store_true", help="warnings (test-dev, dev-factor/train) fail too")
-    p.add_argument("--out-dir", default=None, help="results folder (default: outputs/results)")
-    p.add_argument("--name", default="data_contamination_check", help="result name (JSON file stem)")
-    return p.parse_args(argv)
+    parser.add_argument(
+        "--fail-on-near", action="store_true", help="near duplicates in test-vs-factor/train pairs fail"
+    )
+    parser.add_argument("--strict", action="store_true", help="warnings (test-dev, dev-factor/train) fail too")
+    parser.add_argument("--out-dir", default=None, help="results folder (default: outputs/results)")
+    parser.add_argument("--name", default="data_contamination_check", help="result name (JSON file stem)")
+    return parser.parse_args(argv)
+
+
+def print_inventory(sets: dict, roles: dict[str, str], data_dir: Path) -> None:
+    """How many files were found, by role."""
+    role_counts = Counter(roles.values())
+    by_role = ", ".join(f"{name}={role_counts[name]}" for name in REPORTED_ROLES)
+    print(f"[contamination] {len(sets)} files under {data_dir}: {by_role}")
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     data_dir = resolve_data_dir(args.data_dir)
     sets = discover(data_dir)
-    roles = {k: role(k) for k in sets}
-    tests = [k for k in sets if roles[k] == "test"]
-    fit = [k for k in sets if roles[k] in ("factor", "train")]
-    devs = [k for k in sets if roles[k] == "dev"]
-    print(
-        f"[contamination] {len(sets)} files under {data_dir}: "
-        + ", ".join(f"{r}={sum(v == r for v in roles.values())}" for r in ("test", "factor", "train", "dev"))
-    )
+    roles = {name: role(name) for name in sets}
+    tests = [name for name in sets if roles[name] == "test"]
+    fit = [name for name in sets if roles[name] in ("factor", "train")]
+    devs = [name for name in sets if roles[name] == "dev"]
+    print_inventory(sets, roles, data_dir)
     if not tests or not fit:
         print("[contamination] nothing to compare: need at least one test file and one factor/train file")
         return 2
 
     near = args.near_threshold if args.near_threshold > 0 else None
-    texts = {k: [r.get("prompt", "") for r in v] for k, v in sets.items()}
-    ids = {k: [str(r.get("id")) for r in v] for k, v in sets.items()}
-    fail_pairs = [(t, f) for t in tests for f in fit]
-    warn_pairs = [(t, d) for t in tests for d in devs] + [(d, f) for d in devs for f in fit]
+    texts = {name: [row.get("prompt", "") for row in rows] for name, rows in sets.items()}
+    ids = {name: [str(row.get("id")) for row in rows] for name, rows in sets.items()}
+    fail_pairs = [(test, fit_set) for test in tests for fit_set in fit]
+    warn_pairs = [(test, dev) for test in tests for dev in devs] + [(dev, fit_set) for dev in devs for fit_set in fit]
     fail = check_no_overlap(texts, pairs=fail_pairs, near_threshold=near, ids=ids)
-    warn = check_no_overlap(texts, pairs=warn_pairs, near_threshold=near, ids=ids) if warn_pairs else None
+    warn = None
+    if warn_pairs:
+        warn = check_no_overlap(texts, pairs=warn_pairs, near_threshold=near, ids=ids)
     collisions = id_collisions(fail_pairs, ids)
     info = cross_lingual_info(sets, texts, ids, near)
 
     print("[contamination] test vs factor/train:")
     print_hits(fail, "FAIL", args.fail_on_near)
-    n_fail = n_failing(fail, args.fail_on_near) + sum(c["n"] for c in collisions)
+    n_fail = n_failing(fail, args.fail_on_near) + sum(collision["n"] for collision in collisions)
     if warn:
         print("[contamination] test vs dev, dev vs factor/train:")
         print_hits(warn, "FAIL" if args.strict else "WARN", args.strict and args.fail_on_near)
@@ -173,7 +211,7 @@ def main(argv=None) -> int:
 
     payload = {
         "data_dir": str(data_dir),
-        "sizes": {k: len(v) for k, v in sets.items()},
+        "sizes": {name: len(rows) for name, rows in sets.items()},
         "roles": roles,
         "passed": n_fail == 0,
         "n_fail": n_fail,
@@ -182,13 +220,10 @@ def main(argv=None) -> int:
         "warnings": warn,
         "cross_lingual_info": info,
     }
-    path = write_result(
-        args.name,
-        payload,
-        config={"near_threshold": near, "fail_on_near": args.fail_on_near, "strict": args.strict},
-        out_dir=args.out_dir,
-    )
-    print(f"[contamination] {'PASS' if n_fail == 0 else f'FAIL ({n_fail})'}; report -> {path}")
+    config = {"near_threshold": near, "fail_on_near": args.fail_on_near, "strict": args.strict}
+    path = write_result(args.name, payload, config=config, out_dir=args.out_dir)
+    status = "PASS" if n_fail == 0 else f"FAIL ({n_fail})"
+    print(f"[contamination] {status}; report -> {path}")
     return 0 if n_fail == 0 else 1
 
 

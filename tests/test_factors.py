@@ -1,20 +1,24 @@
 """KFACCollector on a tiny random Cohere2 model (CPU, seconds). Prompt 0 step 8 checks (a)-(e)."""
+
 import numpy as np
 import pytest
 import torch
 
 from pencil.chat import collate, encode_chat, user_content_offset
-from pencil.factors import (Factors, KFACCollector, a_key_for, collect_factors, factor_bytes, known_null_vectors,
-                            null_floors, pool, project_out, target_modules)
+from pencil.factor_store import FactorStore, LazyFactors, known_null_vectors, null_floors
+from pencil.factors import KFACCollector, collect_factors, factor_bytes
 from pencil.geneig import auto_rel_tol, gen_eig, noise_floor
+from pencil.modules import input_factor_key, target_modules
 from pencil.testing import tiny_cohere2, tiny_tokenizer
 
 pytestmark = pytest.mark.slow
 
-PAIRS = [("How do I bake bread?", "Mix flour and water."),
-         ("कैसे हो?", "मैं ठीक हूँ।"),
-         ("Tell me a joke", "No."),
-         ("Write a haiku about rain", "Rain on the tin roof")]
+PAIRS = [
+    ("How do I bake bread?", "Mix flour and water."),
+    ("कैसे हो?", "मैं ठीक हूँ।"),
+    ("Tell me a joke", "No."),
+    ("Write a haiku about rain", "Rain on the tin roof"),
+]
 
 
 @pytest.fixture(scope="module")
@@ -34,9 +38,11 @@ def _capture(model, names):
     ins, grads, hs = {}, {}, []
     mods = dict(model.named_modules())
     for n in names:
+
         def fwd(m, i, o, n=n):
             ins[n] = i[0].detach().clone()
             o.register_hook(lambda g, n=n: grads.__setitem__(n, g.detach().clone()))
+
         hs.append(mods[n].register_forward_hook(fwd))
     return ins, grads, hs
 
@@ -54,13 +60,13 @@ def test_matches_hand_computation_and_respects_masks(batch):
     n_loss = int(batch["loss_mask"].sum())
     B = batch["input_ids"].shape[0]
     assert f.n_loss == n_loss and f.n_rows == {**{rs: int(m.sum()) for rs, m in masks.items()}, "full_reduce": B}
-    assert not batch["rows_all"][0, :user_content_offset(tiny_tokenizer())].any()   # preamble excluded
-    assert batch["rows_full"][0, 0]                                                # ... but not from "full"
+    assert not batch["rows_all"][0, : user_content_offset(tiny_tokenizer())].any()  # preamble excluded
+    assert batch["rows_full"][0, 0]  # ... but not from "full"
     for n in names:
         for rs, m in masks.items():
             a, g = ins[n][m].double(), grads[n][m].double()
             A, G = (t.double() for t in f.pair(n, rs))
-            A_ref, G_ref = a.T @ a / m.sum(), g.T @ g / n_loss       # fp32 accumulation vs float64 here
+            A_ref, G_ref = a.T @ a / m.sum(), g.T @ g / n_loss  # fp32 accumulation vs float64 here
             torch.testing.assert_close(A, A_ref, rtol=1e-4, atol=1e-6 * float(A_ref.abs().max()))
             torch.testing.assert_close(G, G_ref, rtol=1e-4, atol=1e-6 * float(G_ref.abs().max()))
         # K-FAC-reduce: per sequence, the mean input and the summed output gradient over the "full" rows
@@ -69,36 +75,44 @@ def test_matches_hand_computation_and_respects_masks(batch):
         g_sum = (grads[n].double() * m).sum(1)
         A, G = (t.double() for t in f.pair(n, "full_reduce"))
         A_ref, G_ref = a_bar.T @ a_bar / B, g_sum.T @ g_sum / n_loss
-        g_scale = float(f.pair(n, "full")[1].abs().max())       # k_proj: Σ_s ∂L/∂k_s = 0, so G_reduce ~ 0
+        g_scale = float(f.pair(n, "full")[1].abs().max())  # k_proj: Σ_s ∂L/∂k_s = 0, so G_reduce ~ 0
         torch.testing.assert_close(A, A_ref, rtol=1e-4, atol=1e-6 * float(A_ref.abs().max()))
         torch.testing.assert_close(G, G_ref, rtol=1e-4, atol=1e-6 * g_scale)
-        m = masks["all"].double()[..., None]                      # per-sequence gradient, then squared
+        m = masks["all"].double()[..., None]  # per-sequence gradient, then squared
         D_ref = sum(((grads[n][b].double() * m[b]).T @ (ins[n][b].double() * m[b])) ** 2 for b in range(B)) / n_loss
         torch.testing.assert_close(f.D[n].double(), D_ref, rtol=1e-4, atol=1e-6 * float(D_ref.abs().max()))
-    assert all(p.grad is None for p in model.parameters())                         # no weight gradients
+    assert all(p.grad is None for p in model.parameters())  # no weight gradients
 
 
 def test_parallel_block_shares_one_input_factor(batch):
     model = tiny_cohere2()
     f = collect_factors(model, [batch])
     L = len(model.model.layers)
-    assert len(f.A) == 3 * L                                       # shared input, o_proj, down_proj per layer
+    assert len(f.A) == 3 * L  # shared input, o_proj, down_proj per layer
     for l in range(L):
         key = f"model.layers.{l}.input"
         for leaf in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj"):
             assert f.a_key[f"model.layers.{l}.{leaf}"] == key
-    assert a_key_for("model.layers.2.self_attn.o_proj", True) == "model.layers.2.self_attn.o_proj"
+    assert input_factor_key("model.layers.2.self_attn.o_proj", True) == "model.layers.2.self_attn.o_proj"
 
 
 def test_non_parallel_block_is_caught(batch):
     """Forcing a shared input factor on a sequential block (Qwen2) must fail loudly."""
     from transformers import Qwen2Config, Qwen2ForCausalLM
-    cfg = Qwen2Config(vocab_size=len(tiny_tokenizer()), hidden_size=32, intermediate_size=48, num_hidden_layers=2,
-                      num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=512)
+
+    cfg = Qwen2Config(
+        vocab_size=len(tiny_tokenizer()),
+        hidden_size=32,
+        intermediate_size=48,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=512,
+    )
     model = Qwen2ForCausalLM(cfg).eval()
     with pytest.raises(RuntimeError, match="not parallel"):
         collect_factors(model, [batch], share_input_factor=True)
-    f = collect_factors(model, [batch])                            # auto-detects: not shared
+    f = collect_factors(model, [batch])  # auto-detects: not shared
     assert len(set(f.a_key.values())) == len(f.a_key)
 
 
@@ -116,37 +130,36 @@ def test_layernorm_null_vector_and_range_restriction(batch):
         floor32 = noise_floor(f32.A[key]["all"], u)
         assert floor64 < 1e-12 and floor32 < 1e-5
         for f in (f32, f64):
-            A_h, A_t = f.A[key]["all"], f.A[key]["loss"]     # "loss" has fewer rows than dims: rank-deficient
+            A_h, A_t = f.A[key]["all"], f.A[key]["loss"]  # "loss" has fewer rows than dims: rank-deficient
             rel_tol = auto_rel_tol([noise_floor(A_h + A_t, u)])
             w = torch.linalg.eigvalsh(f64.A[key]["all"] + f64.A[key]["loss"])
-            rank = int((w > 1e-10 * w.max()).sum())          # layer 0 sees one row per distinct token
-            un = u / u.norm()
+            rank = int((w > 1e-10 * w.max()).sum())  # layer 0 sees one row per distinct token
             for F_h, F_t in ((A_h, A_t), (A_t, A_h)):
                 p = gen_eig(F_h, F_t, rel_tol=rel_tol)
                 assert p.range_dim <= min(rank, A_h.shape[0] - 1)
                 if f is f64:
                     assert p.range_dim == rank
-                assert torch.isfinite(p.lam).all() and p.lam.max() <= 1e3 * 1.01   # covariant cap 1/gamma (up to rounding)
+                assert (
+                    torch.isfinite(p.lam).all() and p.lam.max() <= 1e3 * 1.01
+                )  # covariant cap 1/gamma (up to rounding)
                 n = p.X.shape[1]
-                torch.testing.assert_close(p.X.T @ p.FX, torch.eye(n, dtype=torch.float64),
-                                           atol=1e-6, rtol=0)
+                torch.testing.assert_close(p.X.T @ p.FX, torch.eye(n, dtype=torch.float64), atol=1e-6, rtol=0)
 
 
 def test_projecting_known_nulls_makes_them_exact(batch):
     """Without projection, eigenvectors of the near-zero cluster mix u into the kept range at ~1e-5 even in
-    float64 (and ~1e-2 in fp32). After project_out the kept basis is orthogonal to u to ~1e-10, so the
+    float64 (and ~1e-2 in fp32). After projecting them out the kept basis is orthogonal to u to ~1e-10, so the
     subtraction-form repair leaves ΔW u untouched."""
     model = tiny_cohere2()
     for acc in (torch.float32, torch.float64):
         f = collect_factors(model, [batch], accum_dtype=acc)
         nulls = known_null_vectors(model, f)
-        assert len(nulls) == 3 * len(model.model.layers)          # shared A per layer, o and down G per layer
-        fp = project_out(f, nulls)
+        assert len(nulls) == 3 * len(model.model.layers)  # shared A per layer, o and down G per layer
+        projected = LazyFactors([f], nulls=nulls)
         tol = auto_rel_tol(null_floors(f, nulls).values())
         for (side, key), u in nulls.items():
             un = u / u.norm()
-            store = fp.A if side == "A" else fp.G
-            p = gen_eig(store[key]["all"], store[key]["loss"], rel_tol=tol)
+            p = gen_eig(projected.get(side, key, "all"), projected.get(side, key, "loss"), rel_tol=tol)
             assert float((p.X.T @ un.to(p.X)).abs().max() / p.X.abs().max()) < 1e-9, (side, key, acc)
 
 
@@ -166,8 +179,10 @@ def test_sampled_labels_are_unbiased_for_G():
         p.requires_grad_(False)
     emb = model.get_input_embeddings()(ids).detach().requires_grad_(True)
     logp = model(inputs_embeds=emb).logits.float().log_softmax(-1)[0]
-    exact = {n: torch.zeros(model.get_submodule(n).out_features, model.get_submodule(n).out_features,
-                            dtype=torch.float64) for n in names}
+    exact = {
+        n: torch.zeros(model.get_submodule(n).out_features, model.get_submodule(n).out_features, dtype=torch.float64)
+        for n in names
+    }
     for t in loss_pos:
         for v in range(6):
             grads.clear()
@@ -180,8 +195,12 @@ def test_sampled_labels_are_unbiased_for_G():
     exact = {n: e / len(loss_pos) for n, e in exact.items()}
 
     B, n_batches = 400, 10
-    batch = {"input_ids": ids.repeat(B, 1), "attention_mask": torch.ones(B, T, dtype=torch.long),
-             "loss_mask": lm.repeat(B, 1), "rows_all": ra.repeat(B, 1)}
+    batch = {
+        "input_ids": ids.repeat(B, 1),
+        "attention_mask": torch.ones(B, T, dtype=torch.long),
+        "loss_mask": lm.repeat(B, 1),
+        "rows_all": ra.repeat(B, 1),
+    }
     est = {n: [] for n in names}
     for k in range(n_batches):
         f = collect_factors(model, [batch], layers=[0, 1], row_sets=("all",), seed=k)
@@ -199,39 +218,40 @@ def test_save_load_chunks_and_pool(tmp_path, batch):
     model = tiny_cohere2()
     f1 = collect_factors(model, [batch], layers=[0, 1], seed=1, meta={"lang": "en"})
     f2 = collect_factors(model, [batch], layers=[2, 3], seed=1)
-    f1.save(tmp_path / "c0.safetensors")
-    f2.save(tmp_path / "c1.safetensors")
-    g = Factors.load(tmp_path / "c0.safetensors")
-    assert g.meta["lang"] == "en" and g.n_loss == f1.n_loss and g.a_key == f1.a_key
+    f1.save(tmp_path / "en" / "layers00-01.safetensors")
+    f2.save(tmp_path / "en" / "layers02-03.safetensors")
+    store = FactorStore.from_dir(tmp_path / "en")
+    assert store.meta["lang"] == "en" and store.n_loss == f1.n_loss and len(store.modules) == 7 * 4
     for n in f1.modules:
         for rs in f1.row_sets:
-            for x, y in zip(f1.pair(n, rs), g.pair(n, rs)):
+            for x, y in zip(f1.pair(n, rs), store.pair(n, rs)):
                 torch.testing.assert_close(x, y)
-    both = Factors.load_many([tmp_path / "c0.safetensors", tmp_path / "c1.safetensors"])
-    assert len(both.modules) == 7 * 4
     full = collect_factors(model, [batch], seed=1)
-    for n in full.modules:                                         # chunked == all layers at once (same seed)
-        torch.testing.assert_close(both.pair(n, "loss")[1], full.pair(n, "loss")[1])
-    h = collect_factors(model, [batch], layers=[0, 1], seed=2)
-    p = pool([f1, h], [3.0, 1.0])
+    for n in full.modules:  # chunked == all layers at once (same seed)
+        torch.testing.assert_close(store.pair(n, "loss")[1], full.pair(n, "loss")[1])
+    other = collect_factors(model, [batch], layers=[0, 1], seed=2)
+    pooled = LazyFactors([f1, other], [3.0, 1.0])
     n = f1.modules[0]
-    torch.testing.assert_close(p.G[n]["all"], 0.75 * f1.G[n]["all"] + 0.25 * h.G[n]["all"])
-    assert p.n_loss == f1.n_loss + h.n_loss
+    torch.testing.assert_close(
+        pooled.get("G", n, "all"), 0.75 * f1.G[n]["all"].double() + 0.25 * other.G[n]["all"].double()
+    )
+    assert pooled.n_loss == f1.n_loss + other.n_loss
 
 
 def test_memory_plan_matches_implementation_md():
     d = 8192
     n = factor_bytes(2048, d, 16, 4, 128, n_row_sets=1, bytes_per=1)
-    assert n == 5 * 2048 ** 2 + 2 * 512 ** 2 + 3 * d ** 2
+    assert n == 5 * 2048**2 + 2 * 512**2 + 3 * d**2
     assert np.isclose(factor_bytes(2048, d, 16, 4, 128, n_row_sets=1) / 1e9, 0.89, atol=0.01)
 
 
 def test_truncation_keeps_turn_markers_and_response(tok):
     from pencil.chat import prompt_suffix_len
+
     full = encode_chat(tok, "abcdefghijklmnopqrstuvwxyz", "OK")
     short = encode_chat(tok, "abcdefghijklmnopqrstuvwxyz", "OK", max_len=len(full.input_ids) - 5)
     suf = prompt_suffix_len(tok)
     assert suf == len(tok("<EOT><BOT>", add_special_tokens=False)["input_ids"])
-    assert short.input_ids[short.response_start - suf:] == full.input_ids[full.response_start - suf:]
-    assert tok.decode(short.input_ids[short.user_start:short.response_start]) == "abcdefghijklmnopqrstu<EOT><BOT>"
+    assert short.input_ids[short.response_start - suf :] == full.input_ids[full.response_start - suf :]
+    assert tok.decode(short.input_ids[short.user_start : short.response_start]) == "abcdefghijklmnopqrstu<EOT><BOT>"
     assert len(short.input_ids) == len(full.input_ids) - 5

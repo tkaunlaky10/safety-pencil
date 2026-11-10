@@ -10,6 +10,7 @@ W (d_out x d_in) is kron(A, G) with A d_in-sized and G d_out-sized.
 range of (harmful + task) factors, damp covariantly, and write the result in subtraction form.
 See 01-plan/verification/VERIFICATION.md for why each of those three choices is needed.
 """
+
 import numpy as np
 import scipy.linalg as sl
 
@@ -68,7 +69,7 @@ def pencil_repair_np(dW, A_h, A_t, G_h, G_t, mu, damping="covariant", gamma=1e-3
     g, Y, G_td = gen_eig_range_np(G_h, G_t, damping, gamma)
     C = Y.T @ G_td @ dW @ A_td @ X
     M = mu / (np.outer(g, a) + mu)
-    return dW - Y @ ((1 - M) * C) @ X.T          # subtraction form: null directions pass through
+    return dW - Y @ ((1 - M) * C) @ X.T  # subtraction form: null directions pass through
 
 
 def make_problem(din=6, dout=5):
@@ -165,7 +166,7 @@ def test_truncation_error_bound():
     a, X = gen_eig_np(A_h, A_t)
     g, Y = gen_eig_np(G_h, G_t)
     order = np.argsort(g)[::-1]
-    keep, drop = order[:k], order[k:]
+    drop = order[k:]
     C = Y.T @ G_t @ dW @ A_t @ X
     lam = np.outer(g, a)
     M = mu / (lam + mu)
@@ -203,6 +204,7 @@ def test_frontier_slope_is_minus_mu():
 
 def test_water_filling_bit_allocation():
     from scipy.optimize import minimize
+
     n = rng.integers(100, 1000, 6).astype(float)
     k = rng.exponential(1.0, 6)
     b_bar = 4.0
@@ -236,7 +238,7 @@ def test_covariant_damping_identities():
     lam_c, V_c = sl.eigh(F_h, H_c)
     assert np.allclose(np.sort(lam_c), np.sort(lam / (1 + gamma * lam)))
     c, c_c = V.T @ H_t @ D, V_c.T @ H_c @ D
-    assert np.isclose((lam * c**2).sum(), (lam_c * c_c**2).sum())           # forecast unchanged
+    assert np.isclose((lam * c**2).sum(), (lam_c * c_c**2).sum())  # forecast unchanged
     step_c = -np.linalg.solve(F_h + mu * H_c, F_h @ D)
     mu_eff = mu / (1 + mu * gamma)
     step_eff = -np.linalg.solve(F_h + mu_eff * H_t, F_h @ D)
@@ -268,7 +270,7 @@ def test_range_restricted_repair_matches_full_matrix_and_keeps_null_part():
     damped Kronecker repair equals the full-matrix minimiser on the range, and leaves the update's
     null-space component untouched."""
     din, dout, mu, gamma = 6, 5, 0.5, 1e-3
-    u = rng.standard_normal(din)                      # shared input-side null vector
+    u = rng.standard_normal(din)  # shared input-side null vector
     A_h, A_t = psd_with_null(din, 3, u), psd_with_null(din, 6, u)
     G_h, G_t = spd(dout, 2), spd(dout)
     dW = rng.standard_normal((dout, din))
@@ -283,7 +285,7 @@ def test_range_restricted_repair_matches_full_matrix_and_keeps_null_part():
     step = -U @ np.linalg.solve(U.T @ (K_h + mu * K_t) @ U, U.T @ K_h @ D)
     assert np.allclose(out, (D + step).reshape(dW.shape, order="F"))
     un = u / np.linalg.norm(u)
-    assert np.allclose(out @ un, dW @ un)             # null component passes through
+    assert np.allclose(out @ un, dW @ un)  # null component passes through
 
 
 def test_kronecker_repair_invariance_depends_on_damping():
@@ -298,15 +300,15 @@ def test_kronecker_repair_invariance_depends_on_damping():
     dW = rng.standard_normal((dout, din))
     M = rng.standard_normal((din, din)) + 3 * np.eye(din)
     w, U = np.linalg.eigh(A_h + A_t)
-    reachable = U[:, w > 1e-10 * w.max()]            # inputs the original model can see
+    reachable = U[:, w > 1e-10 * w.max()]  # inputs the original model can see
     for damping, invariant in (("covariant", True), ("none", True), ("euclidean", False)):
         gamma = 1e-1 if damping != "none" else 0.0
         a = pencil_repair_np(dW, A_h, A_t, G_h, G_t, mu, damping, gamma)
         b = pencil_repair_np(dW @ np.linalg.inv(M), M @ A_h @ M.T, M @ A_t @ M.T, G_h, G_t, mu, damping, gamma)
-        same_outputs = np.allclose(b @ M @ reachable, a @ reachable)   # b(Mx) == a(x) for reachable x
+        same_outputs = np.allclose(b @ M @ reachable, a @ reachable)  # b(Mx) == a(x) for reachable x
         assert same_outputs == invariant, damping
         if damping == "covariant":
-            assert not np.allclose(b, a @ np.linalg.inv(M))   # raw weights differ along the null direction
+            assert not np.allclose(b, a @ np.linalg.inv(M))  # raw weights differ along the null direction
 
 
 def test_kronecker_repair_invariance_output_side():
@@ -321,7 +323,7 @@ def test_kronecker_repair_invariance_output_side():
     M = rng.standard_normal((dout, dout)) + 3 * np.eye(dout)
     Mi = np.linalg.inv(M)
     w, U = np.linalg.eigh(G_h + G_t)
-    seen = U[:, w > 1e-10 * w.max()]                  # output directions the loss can see
+    seen = U[:, w > 1e-10 * w.max()]  # output directions the loss can see
     for damping, invariant in (("covariant", True), ("euclidean", False)):
         a = pencil_repair_np(dW, A_h, A_t, G_h, G_t, mu, damping, gamma)
         b = pencil_repair_np(M @ dW, A_h, A_t, Mi.T @ G_h @ Mi, Mi.T @ G_t @ Mi, mu, damping, gamma)

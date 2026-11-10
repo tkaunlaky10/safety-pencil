@@ -1,23 +1,15 @@
-"""Generalised eigenproblems F_h x = lam F_t' x on the range of F_h + F_t, in float64.
+"""Generalised eigenproblems F_h x = λ F_t′ x for one factor pair, in float64.
 
-Mirrors `tests/test_math.py::gen_eig_range_np`. Three damping modes (VERIFICATION.md §3.2):
+F_t′ is the damped task factor (VERIFICATION.md §3.2):
+  covariant  F_t + γ F_h            keeps the eigenvectors and exact reparameterisation invariance (default)
+  euclidean  F_t + γ mean(diag) I   a trust region; breaks invariance, so only the rule-11 fallback
+  none       F_t                    valid only when null(F_t) ⊆ null(F_h); tests only
 
-- "covariant": F_t' = F_t + gamma F_h. Keeps the eigenvectors, maps lam -> lam/(1+gamma lam) and keeps
-  exact reparameterisation invariance. The default.
-- "euclidean": F_t' = F_t + gamma * mean(diag F_t) * I. A trust region; breaks invariance. Fallback only.
-- "none": F_t' = F_t. Valid only when null(F_t) is inside null(F_h); tests only.
-
-The restriction to range(F_h + F_t) removes exact null directions shared by both factors (a bias-free
-LayerNorm gives every q/k/v/gate/up input factor the null vector 1/w); without it Cholesky fails.
-
-Numerical floor. In exact arithmetic those null eigenvalues are 0, and rel_tol = 1e-10 (the spec, and
-the fp64 toy) separates them. Factors from a bf16 model accumulated in fp32 are only null up to roughly
-1e-8 to 1e-6 of the largest eigenvalue, and a "null" direction kept by a too-small rel_tol gets an
-arbitrary eigenvalue (a ratio of two noise terms, capped at 1/gamma by covariant damping). So measure the
-floor on the known LayerNorm null vector with `noise_floor` and pass `rel_tol = max(1e-10, 10 * floor)`;
-`auto_rel_tol` does that. The whitening step also drops any direction where the damped task factor is not
-numerically positive, instead of failing in Cholesky; `Pencil.dropped` counts them.
+`gen_eig` works on range(F_h + F_t): directions null in both factors (e.g. 1/w for a LayerNorm-fed input)
+carry no information and would make Cholesky fail. Factors summed in fp32 are only null to ~1e-8 of the top
+eigenvalue, so set rel_tol above that floor (`auto_rel_tol`). Mirrors tests/test_math.py::gen_eig_range_np.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,18 +21,26 @@ DAMPINGS = ("covariant", "euclidean", "none")
 
 @dataclass
 class Pencil:
-    lam: torch.Tensor          # (k,) eigenvalues, ascending, clamped at 0
-    X: torch.Tensor            # (n, k) eigenvectors; X^T F_t' X = I
-    FX: torch.Tensor           # (n, k) F_t' X: all the repair needs of the damped task factor (n x k, not n x n)
-    range_dim: int             # dimension of range(F_h + F_t)
-    dropped: int = 0           # range directions where the damped task factor was not numerically positive
+    """One side's eigenpairs. Only X and F_t′X are kept (n × k), never the n × n factors."""
 
-    def to(self, dtype=None, device=None) -> "Pencil":
-        return Pencil(self.lam.to(device=device, dtype=dtype), self.X.to(device=device, dtype=dtype),
-                      self.FX.to(device=device, dtype=dtype), self.range_dim, self.dropped)
+    lam: torch.Tensor  # (k,) eigenvalues, ascending, clamped at 0
+    X: torch.Tensor  # (n, k) eigenvectors; X^T F_t' X = I
+    FX: torch.Tensor  # (n, k) F_t' X: all the repair needs of the damped task factor (n x k, not n x n)
+    range_dim: int  # dimension of range(F_h + F_t)
+    dropped: int = 0  # range directions where the damped task factor was not numerically positive
+
+    def to(self, dtype=None, device=None) -> Pencil:
+        return Pencil(
+            self.lam.to(device=device, dtype=dtype),
+            self.X.to(device=device, dtype=dtype),
+            self.FX.to(device=device, dtype=dtype),
+            self.range_dim,
+            self.dropped,
+        )
 
 
 def damp(F_h: torch.Tensor, F_t: torch.Tensor, damping: str, gamma: float) -> torch.Tensor:
+    """F_t′ for the given damping mode."""
     if damping == "covariant":
         return F_t + gamma * F_h
     if damping == "euclidean":
@@ -51,10 +51,16 @@ def damp(F_h: torch.Tensor, F_t: torch.Tensor, damping: str, gamma: float) -> to
     raise ValueError(f"damping must be one of {DAMPINGS}, got {damping!r}")
 
 
-def gen_eig(F_h: torch.Tensor, F_t: torch.Tensor, damping: str = "covariant", gamma: float = 1e-3,
-            top_k: int | None = None, rel_tol: float = 1e-10) -> Pencil:
-    """Solve F_h x = lam F_t' x restricted to range(F_h + F_t). Returns ascending eigenpairs
-    (the top_k largest if top_k is set). Everything is computed in float64 on F_h's device."""
+def gen_eig(
+    F_h: torch.Tensor,
+    F_t: torch.Tensor,
+    damping: str = "covariant",
+    gamma: float = 1e-3,
+    top_k: int | None = None,
+    rel_tol: float = 1e-10,
+) -> Pencil:
+    """Solve F_h x = λ F_t′ x on range(F_h + F_t). Returns ascending eigenpairs (the top_k largest if set)
+    with Xᵀ F_t′ X = I, computed in float64 on F_h's device."""
     F_h = _sym(F_h.to(torch.float64))
     F_t = _sym(F_t.to(torch.float64))
     if damping == "covariant" and gamma <= 0:
@@ -72,13 +78,20 @@ def gen_eig(F_h: torch.Tensor, F_t: torch.Tensor, damping: str = "covariant", ga
     X = U @ (Li.T @ V)
     lam = lam.clamp_min(0)
     if top_k is not None and top_k < lam.numel():
-        lam, X = lam[-top_k:].clone(), X[:, -top_k:].clone()     # clone: a view would keep the full n x n
+        lam, X = lam[-top_k:].clone(), X[:, -top_k:].clone()  # clone: a view would keep the full n x n
     return Pencil(lam=lam, X=X, FX=F_td @ X, range_dim=int(keep.sum()), dropped=dropped)
 
 
-def gen_eig_topk(F_h: torch.Tensor, F_t: torch.Tensor, k: int, damping: str = "covariant", gamma: float = 1e-3,
-                 jitter: float = 1e-10, eig_dtype: torch.dtype = torch.float32,
-                 device: str | torch.device | None = None) -> Pencil:
+def gen_eig_topk(
+    F_h: torch.Tensor,
+    F_t: torch.Tensor,
+    k: int,
+    damping: str = "covariant",
+    gamma: float = 1e-3,
+    jitter: float = 1e-10,
+    eig_dtype: torch.dtype = torch.float32,
+    device: str | torch.device | None = None,
+) -> Pencil:
     """Top-k pairs of F_h x = lam F_t' x for a large factor with no exact null space (the MLP-width sides:
     down_proj input, gate/up output). Replaces gen_eig there, whose three n x n float64 eigendecompositions
     cost about a minute each at n = 11008 on an L4.
@@ -98,12 +111,12 @@ def gen_eig_topk(F_h: torch.Tensor, F_t: torch.Tensor, k: int, damping: str = "c
     L, info = torch.linalg.cholesky_ex(F_td + jitter * F_td.diagonal().mean() * eye)
     if int(info) != 0:
         raise RuntimeError("F_t' is not positive definite even with jitter; use gen_eig (range restriction)")
-    Z = torch.linalg.solve_triangular(L, F_h, upper=False)                 # L⁻¹ F_h
-    Hw = _sym(torch.linalg.solve_triangular(L, Z.T.contiguous(), upper=False))   # L⁻¹ F_h L⁻ᵀ
+    Z = torch.linalg.solve_triangular(L, F_h, upper=False)  # L⁻¹ F_h
+    Hw = _sym(torch.linalg.solve_triangular(L, Z.T.contiguous(), upper=False))  # L⁻¹ F_h L⁻ᵀ
     del Z
     lam, V = torch.linalg.eigh(Hw.to(eig_dtype))
     lam, V = lam[-k:].to(torch.float64).clamp_min(0), V[:, -k:].to(torch.float64)
-    X = torch.linalg.solve_triangular(L.T.contiguous(), V, upper=True)     # L⁻ᵀ V
+    X = torch.linalg.solve_triangular(L.T.contiguous(), V, upper=True)  # L⁻ᵀ V
     return Pencil(lam=lam.clone(), X=X, FX=F_td @ X, range_dim=n, dropped=0)
 
 
@@ -120,12 +133,12 @@ def _whitener(At: torch.Tensor, floor: float) -> tuple[torch.Tensor, int]:
 
 
 def noise_floor(F: torch.Tensor, null_vec: torch.Tensor) -> float:
-    """Rayleigh quotient of a vector that is exactly null in exact arithmetic (for the shared input factor:
-    1/w, w the LayerNorm weight), relative to F's largest eigenvalue. Measures the factors' numerical floor."""
+    """Rayleigh quotient of a vector that is null in exact arithmetic, over F's top eigenvalue: the factor's
+    numerical floor."""
     F = _sym(F.to(torch.float64))
-    u = null_vec.to(F)
-    u = u / u.norm()
-    return float((u @ F @ u).abs() / torch.linalg.eigvalsh(F).max())
+    u = null_vec.to(F) / null_vec.norm()
+    top = torch.linalg.eigvalsh(F).max()
+    return float((u @ F @ u).abs() / top) if top > 0 else 0.0
 
 
 def auto_rel_tol(floors, base: float = 1e-10, factor: float = 10.0) -> float:

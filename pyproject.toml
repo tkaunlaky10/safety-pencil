@@ -19,10 +19,28 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "matplotlib"]
+dev = ["pytest", "matplotlib", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["verification", "third_party", "outputs"]
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, import order, bugbear, pyupgrade, simplifications
+select = ["F", "E", "W", "I", "B", "UP", "SIM"]
+ignore = [
+  "E731",   # small named lambdas are fine in tests
+  "E741",   # maths names (l, I) follow the paper
+  "B905",   # zip() without strict= is used on equal-length sequences throughout
+  "SIM300", # flags `S == pytest.approx(...)` and `S < S_before` (it takes capitalised maths names for constants)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pencil"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

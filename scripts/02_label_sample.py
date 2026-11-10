@@ -13,6 +13,7 @@ Per language, n rows are drawn without replacement, half from each checkpoint, t
 WARNING: the CSV holds raw completions of harmful prompts. It is local-only: it must stay under outputs/
 (gitignored) and never be committed, uploaded or shared outside the team (CLAUDE.md rule 7).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,12 +26,22 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 OUTPUTS = REPO / "outputs"
 COLUMNS = ["id", "lang", "checkpoint", "prompt", "response", "label_refusal", "label_unsafe"]
-WARNING = ("WARNING: this CSV contains raw model completions of harmful prompts. Keep it under outputs/ "
-           "(gitignored); never commit, upload or publish it.")
+WARNING = (
+    "WARNING: this CSV contains raw model completions of harmful prompts. Keep it under outputs/ "
+    "(gitignored); never commit, upload or publish it."
+)
 
 
-def sample_rows(checkpoints: list[str], *, kind: str, split: str, langs: list[str], n: int, seed: int,
-                root: str | Path | None = None) -> list[dict]:
+def sample_rows(
+    checkpoints: list[str],
+    *,
+    kind: str,
+    split: str,
+    langs: list[str],
+    n: int,
+    seed: int,
+    root: str | Path | None = None,
+) -> list[dict]:
     from pencil.generate import generations_path, load_generations
 
     rng = random.Random(seed)
@@ -42,10 +53,19 @@ def sample_rows(checkpoints: list[str], *, kind: str, split: str, langs: list[st
             path = generations_path(ckpt, f"{split}_{kind}_{lang}", root)
             cached = sorted(load_generations(path).values(), key=lambda r: r["id"])
             if len(cached) < quota:
-                warnings.warn(f"{path}: {len(cached)} cached generations, wanted {quota}")
+                warnings.warn(f"{path}: {len(cached)} cached generations, wanted {quota}", stacklevel=2)
             for r in rng.sample(cached, min(quota, len(cached))):
-                rows.append({"id": r["id"], "lang": lang, "checkpoint": ckpt, "prompt": r["prompt"],
-                             "response": r["completion"], "label_refusal": "", "label_unsafe": ""})
+                rows.append(
+                    {
+                        "id": r["id"],
+                        "lang": lang,
+                        "checkpoint": ckpt,
+                        "prompt": r["prompt"],
+                        "response": r["completion"],
+                        "label_refusal": "",
+                        "label_unsafe": "",
+                    }
+                )
         rng.shuffle(rows)
         out += rows
     return out
@@ -63,14 +83,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="CSV path; must be under outputs/")
     args = ap.parse_args(argv)
 
-    sys.path.insert(0, str(REPO / "src"))
     out = Path(args.out) if args.out else OUTPUTS / "labels" / f"label_sample_{args.kind}_{args.split}.csv"
     if not out.resolve().is_relative_to(OUTPUTS.resolve()):
         sys.exit(f"refusing to write raw completions outside {OUTPUTS} (gitignored): {out}")
-    rows = sample_rows(args.checkpoints, kind=args.kind, split=args.split, langs=args.langs, n=args.n,
-                       seed=args.seed, root=args.gen_root)
+    rows = sample_rows(
+        args.checkpoints,
+        kind=args.kind,
+        split=args.split,
+        langs=args.langs,
+        n=args.n,
+        seed=args.seed,
+        root=args.gen_root,
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", newline="", encoding="utf-8-sig") as f:         # BOM: Excel then shows Devanagari
+    with open(out, "w", newline="", encoding="utf-8-sig") as f:  # BOM: Excel then shows Devanagari
         writer = csv.DictWriter(f, fieldnames=COLUMNS)
         writer.writeheader()
         writer.writerows(rows)

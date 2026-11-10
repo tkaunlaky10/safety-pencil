@@ -1,55 +1,58 @@
 #!/usr/bin/env python
 """Build the harmful-prompt splits (en, hi) from aya_redteaming.
 
-For each language: load the Hub split (or a local JSONL with --input-jsonl), give every row a
-deterministic id, then either
+For each language: load the Hub split (or a local JSONL with --input-jsonl) and give every row a
+deterministic id. By default CuratorKIT then cleans it (min_tokens=1, exact + MinHash dedup, toxicity
+filter off), exports ``prompts_meta`` and splits it factor/dev/test with its seeded ``output_split``,
+keeping its own files in ``harmful/{lang}/_curatorkit/``. ``--no-curatorkit`` does exact + character
+5-gram near-dup removal in plain Python instead. ``--stratify`` (either path) splits with
+``pencil.datasets.split_ids`` stratified by harm category, which ``output_split`` cannot do. The split
+modes give different (each deterministic) splits: pick one before anyone computes factors.
 
-- (default) run CuratorKIT once: prompt-only rows, min_tokens=1, exact + MinHash dedup, toxicity
-  filter off, ``export_formats=["prompts_meta"]``, ``output_split`` = factor/dev/test with the seed;
-  CuratorKIT's own files stay in ``harmful/{lang}/_curatorkit/``; or
-- (``--no-curatorkit``) do the same with plain Python: exact + character 5-gram near-dup removal
-  and ``pencil.datasets.split_ids``.
-
-and write ``data/processed/harmful/{lang}/{factor,dev,test}.jsonl`` rows
-``{"id", "prompt", "metadata"}`` (layout: ``pencil.datasets``), plus ``harmful/manifest.json``.
-
-Splits: CuratorKIT's ``output_split`` is a seeded shuffle and cannot stratify. ``--stratify``
-keeps CuratorKIT for reading, dedup, cleaning and provenance but splits with ``split_ids``
-stratified by harm category (the same code as the ``--no-curatorkit`` path). The two split modes
-give different (each deterministic) splits: pick one before anyone computes factors.
-
-Hinglish is not built here: run ``01_make_hinglish.py`` on the per-split files afterwards.
+Writes ``data/processed/harmful/{lang}/{factor,dev,test}.jsonl`` and ``harmful/manifest.json`` (layout:
+``pencil.datasets``). Hinglish comes afterwards, from these files, with ``01_make_hinglish.py``.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import shutil
 import sys
-import time
 from collections import Counter
 from functools import partial
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from pencil.config import load_config  # noqa: E402
-from pencil.datasets import (  # noqa: E402
-    REPO_ROOT, find_near_duplicates, normalize_for_match, normalize_text, read_jsonl,
-    resolve_data_dir, split_ids, stable_id, write_jsonl,
+from pencil.config import load_config
+from pencil.datasets import (
+    REPO_ROOT,
+    clean_prompt,
+    find_near_duplicates,
+    hub_candidates,
+    normalize_for_match,
+    read_jsonl,
+    resolve_data_dir,
+    split_ids,
+    stable_id,
+    timestamp,
+    write_jsonl,
+    write_manifest,
 )
-from pencil.results import git_hash  # noqa: E402
+from pencil.results import git_hash
 
 HF_SPLIT = {"en": "english", "hi": "hindi"}
 FALLBACK_REPOS = ("CohereLabs/aya_redteaming", "CohereForAI/aya_redteaming")
-DEFAULT_RAW_DIR = REPO_ROOT / "data" / "raw" / "aya_redteaming"   # gitignored
+DEFAULT_RAW_DIR = REPO_ROOT / "data" / "raw" / "aya_redteaming"  # gitignored
 
 
 # ── loading ──────────────────────────────────────────────────────────────────
 
+
 def _hub_revision(repo: str) -> str | None:
+    """The dataset's current commit, for the manifest; None when the Hub API is unreachable."""
     try:
         from huggingface_hub import HfApi
+
         return HfApi().dataset_info(repo).sha
     except Exception:
         return None
@@ -69,13 +72,20 @@ def load_from_hub(repos: list[str], split: str) -> tuple[list[dict], dict]:
                 else:
                     dd = load_dataset(repo, split)
                     ds = dd["train"] if "train" in dd else dd[next(iter(dd))]
-                rows = [dict(r) for r in ds]
-                info = {"repo": repo, "split": split, "loaded_as": how, "n_raw": len(rows),
-                        "revision": _hub_revision(repo), "fingerprint": getattr(ds, "_fingerprint", None)}
-                print(f"[harmful] loaded {repo} ({how}={split!r}): {len(rows)} rows")
-                return rows, info
             except Exception as e:  # try the next way
                 errors.append(f"{repo} ({how}={split!r}): {type(e).__name__}: {str(e)[:200]}")
+                continue
+            rows = [dict(r) for r in ds]
+            info = {
+                "repo": repo,
+                "split": split,
+                "loaded_as": how,
+                "n_raw": len(rows),
+                "revision": _hub_revision(repo),
+                "fingerprint": getattr(ds, "_fingerprint", None),
+            }
+            print(f"[harmful] loaded {repo} ({how}={split!r}): {len(rows)} rows")
+            return rows, info
     raise RuntimeError("could not load aya_redteaming:\n  " + "\n  ".join(errors))
 
 
@@ -110,15 +120,29 @@ def to_curator_sample(raw: dict, *, lang: str, source: dict):
     from curatorkit.schema import DataSample
 
     row = make_row(raw, lang, source)
-    return DataSample(id=row["id"], source_uri=f"hf://datasets/{source['repo']}/{source['split']}",
-                      instruction=row["prompt"], task_type="prompt_only", metadata=row["metadata"])
+    return DataSample(
+        id=row["id"],
+        source_uri=f"hf://datasets/{source['repo']}/{source['split']}",
+        instruction=row["prompt"],
+        task_type="prompt_only",
+        metadata=row["metadata"],
+    )
 
 
 # ── the two build paths ──────────────────────────────────────────────────────
 
-def build_with_curatorkit(raw_path: Path, out_dir: Path, *, lang: str, source: dict,
-                          fractions: dict, seed: int, stratify: bool,
-                          minhash_threshold: float) -> tuple[dict[str, list[dict]], dict]:
+
+def build_with_curatorkit(
+    raw_path: Path,
+    out_dir: Path,
+    *,
+    lang: str,
+    source: dict,
+    fractions: dict,
+    seed: int,
+    stratify: bool,
+    minhash_threshold: float,
+) -> tuple[dict[str, list[dict]], dict]:
     from curatorkit.curator import Curator, CuratorConfig
 
     if out_dir.exists():
@@ -127,73 +151,71 @@ def build_with_curatorkit(raw_path: Path, out_dir: Path, *, lang: str, source: d
         dataset=str(raw_path),
         format="prompt_only",
         preprocessing_fn=partial(to_curator_sample, lang=lang, source=source),
-        min_tokens=1,                         # default 10 whitespace words drops short prompts
+        min_tokens=1,  # default 10 whitespace words drops short prompts
         max_tokens=4096,
-        dedup="minhash",                      # exact, then MinHash
+        dedup="minhash",  # exact, then MinHash
         minhash_threshold=minhash_threshold,
-        toxicity_gate=False,                  # these are harmful on purpose
-        clean_transforms={"strip_html": False},   # keep prompts verbatim apart from whitespace/NFC
+        toxicity_gate=False,  # these are harmful on purpose
+        clean_transforms={"strip_html": False},  # keep prompts verbatim apart from whitespace/NFC
         export_formats=["prompts_meta"],
         output_split=None if stratify else dict(fractions),
         output_split_seed=seed,
         output_dir=str(out_dir),
         name=f"aya_redteaming_{lang}",
-        write_hf_readme=False,                # we write the dataset cards ourselves
+        write_hf_readme=False,  # we write the dataset cards ourselves
     )
     result = Curator(cfg).run()
-    with open(raw_path, encoding="utf-8") as f:
-        n_in = sum(1 for line in f if line.strip())
-    if n_in and not result.passed:
-        raise RuntimeError(f"CuratorKIT passed 0 of {n_in} rows for {lang}; see {out_dir}/rejected.jsonl "
-                           "(or rerun with --no-curatorkit)")
+    if source["n_raw"] and not result.passed:
+        raise RuntimeError(
+            f"CuratorKIT passed 0 of {source['n_raw']} rows for {lang}; see "
+            f"{out_dir}/rejected.jsonl (or rerun with --no-curatorkit)"
+        )
 
-    def norm(r):
-        return {"id": r["id"], "prompt": r["prompt"], "metadata": dict(r.get("metadata") or {})}
+    def read(path: Path) -> list[dict]:
+        return [
+            {"id": r["id"], "prompt": r["prompt"], "metadata": dict(r.get("metadata") or {})} for r in read_jsonl(path)
+        ]
 
     if stratify:
-        rows = [norm(r) for r in read_jsonl(out_dir / "prompts_meta.jsonl")]
-        splits = _split_rows(rows, fractions, seed, stratify=True)
+        splits = _split_rows(read(out_dir / "prompts_meta.jsonl"), fractions, seed, stratify=True)
     else:
-        splits = {s: [norm(r) for r in read_jsonl(out_dir / s / "prompts_meta.jsonl")] for s in fractions}
-    stats = {"curatorkit_stage_counts": result.stage_counts, "n_rejected": len(result.rejected),
-             "n_after_dedup": len(result.passed)}
+        splits = {s: read(out_dir / s / "prompts_meta.jsonl") for s in fractions}
+    stats = {
+        "curatorkit_stage_counts": result.stage_counts,
+        "n_rejected": len(result.rejected),
+        "n_after_dedup": len(result.passed),
+    }
     return splits, stats
 
 
-def near_duplicate_indices(texts: list[str], threshold: float, ngram: int = 5) -> set[int]:
-    """Indices to drop: a later text whose character n-gram Jaccard with a kept earlier one is >= threshold."""
-    drop: set[int] = set()
-    for i, j, _ in find_near_duplicates(texts, threshold, ngram):
-        if i not in drop:
-            drop.add(j)
-    return drop
-
-
-def build_plain(raw_rows: list[dict], *, lang: str, source: dict, fractions: dict, seed: int,
-                stratify: bool, near_threshold: float) -> tuple[dict[str, list[dict]], dict]:
+def build_plain(
+    raw_rows: list[dict], *, lang: str, source: dict, fractions: dict, seed: int, stratify: bool, near_threshold: float
+) -> tuple[dict[str, list[dict]], dict]:
     rows, seen, n_empty, n_exact = [], set(), 0, 0
     for raw in raw_rows:
         row = make_row(raw, lang, source)
-        row["prompt"] = normalize_text(row["prompt"]) if "\n" not in row["prompt"] else row["prompt"].strip()
+        row["prompt"] = clean_prompt(row["prompt"])
         key = normalize_for_match(row["prompt"])
         if not key:
             n_empty += 1
-            continue
-        if key in seen:
+        elif key in seen:
             n_exact += 1
-            continue
-        seen.add(key)
-        rows.append(row)
-    drop = near_duplicate_indices([r["prompt"] for r in rows], near_threshold)
+        else:
+            seen.add(key)
+            rows.append(row)
+    # drop the later text of each near-duplicate pair whose earlier text is kept
+    drop: set[int] = set()
+    for i, j, _ in find_near_duplicates([r["prompt"] for r in rows], near_threshold):
+        if i not in drop:
+            drop.add(j)
     rows = [r for i, r in enumerate(rows) if i not in drop]
     splits = _split_rows(rows, fractions, seed, stratify=stratify)
-    return splits, {"n_empty": n_empty, "n_exact_dups": n_exact, "n_near_dups": len(drop),
-                    "n_after_dedup": len(rows)}
+    return splits, {"n_empty": n_empty, "n_exact_dups": n_exact, "n_near_dups": len(drop), "n_after_dedup": len(rows)}
 
 
 def _split_rows(rows: list[dict], fractions: dict, seed: int, *, stratify: bool) -> dict[str, list[dict]]:
     by_id = {}
-    for r in rows:                      # identical raw prompts share an id: keep the first
+    for r in rows:  # identical raw prompts share an id: keep the first
         by_id.setdefault(r["id"], r)
     ids = list(by_id)
     strata = [by_id[i]["metadata"].get("harm_category") for i in ids] if stratify else None
@@ -203,6 +225,7 @@ def _split_rows(rows: list[dict], fractions: dict, seed: int, *, stratify: bool)
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
+
 def category_counts(rows: list[dict]) -> dict[str, int]:
     c = Counter()
     for r in rows:
@@ -211,23 +234,51 @@ def category_counts(rows: list[dict]) -> dict[str, int]:
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
-                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__
+    )
     p.add_argument("--config", default=None, help="experiment.yaml (default: configs/experiment.yaml)")
     p.add_argument("--data-dir", default=None, help="processed data root (default: data/processed)")
     p.add_argument("--raw-dir", default=str(DEFAULT_RAW_DIR), help="where Hub rows are cached as JSONL")
     p.add_argument("--langs", nargs="+", default=["en", "hi"], choices=sorted(HF_SPLIT))
-    p.add_argument("--input-jsonl", action="append", default=[], metavar="LANG=PATH",
-                   help="use a local raw JSONL (aya_redteaming columns) for LANG instead of the Hub")
+    p.add_argument(
+        "--input-jsonl",
+        action="append",
+        default=[],
+        metavar="LANG=PATH",
+        help="use a local raw JSONL (aya_redteaming columns) for LANG instead of the Hub",
+    )
     p.add_argument("--dataset", default=None, help="Hub id to try first (default: config datasets.harmful)")
     p.add_argument("--seed", type=int, default=None, help="split seed (default: config split_seed)")
     p.add_argument("--no-curatorkit", action="store_true", help="plain-Python path instead of CuratorKIT")
-    p.add_argument("--stratify", action="store_true",
-                   help="split with split_ids stratified by harm_category (CuratorKIT still dedups)")
+    p.add_argument(
+        "--stratify",
+        action="store_true",
+        help="split with split_ids stratified by harm_category (CuratorKIT still dedups)",
+    )
     p.add_argument("--minhash-threshold", type=float, default=0.85, help="CuratorKIT MinHash threshold")
-    p.add_argument("--near-threshold", type=float, default=0.85,
-                   help="character 5-gram Jaccard threshold for --no-curatorkit near-dup removal")
+    p.add_argument(
+        "--near-threshold",
+        type=float,
+        default=0.85,
+        help="character 5-gram Jaccard threshold for --no-curatorkit near-dup removal",
+    )
     return p.parse_args(argv)
+
+
+def load_raw(lang: str, local: dict[str, str], repos: list[str], raw_dir: Path) -> tuple[list[dict], Path, dict]:
+    """(raw rows, a JSONL file holding them, source info) for one language, from --input-jsonl or the Hub."""
+    hf_split = HF_SPLIT[lang]
+    if lang in local:
+        raw_path = Path(local[lang])
+        raw_rows = read_jsonl(raw_path)
+        return (
+            raw_rows,
+            raw_path,
+            {"repo": f"local:{raw_path.name}", "split": hf_split, "loaded_as": "jsonl", "n_raw": len(raw_rows)},
+        )
+    raw_rows, source = load_from_hub(repos, hf_split)
+    return raw_rows, write_jsonl(raw_dir / f"{hf_split}.jsonl", raw_rows), source
 
 
 def main(argv=None) -> int:
@@ -240,32 +291,36 @@ def main(argv=None) -> int:
     unknown = set(local) - set(HF_SPLIT)
     if unknown:
         raise SystemExit(f"--input-jsonl languages must be in {sorted(HF_SPLIT)}, got {sorted(unknown)}")
-    repos = list(dict.fromkeys([r for r in (args.dataset, cfg["datasets"].get("harmful")) if r]
-                               + list(FALLBACK_REPOS)))
-    raw_dir = Path(args.raw_dir)
+    repos = hub_candidates(args.dataset, cfg["datasets"].get("harmful"), *FALLBACK_REPOS)
+    split_mode = (
+        "split_ids_stratified" if args.stratify else "split_ids" if args.no_curatorkit else "curatorkit_output_split"
+    )
 
-    split_mode = ("split_ids_stratified" if args.stratify else
-                  ("split_ids" if args.no_curatorkit else "curatorkit_output_split"))
-    manifest = {"name": "harmful", "updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "languages": {}}
+    built = {}
     for lang in args.langs:
-        hf_split = HF_SPLIT[lang]
-        if lang in local:
-            raw_path = Path(local[lang])
-            raw_rows = read_jsonl(raw_path)
-            source = {"repo": f"local:{raw_path.name}", "split": hf_split, "loaded_as": "jsonl",
-                      "n_raw": len(raw_rows)}
-        else:
-            raw_rows, source = load_from_hub(repos, hf_split)
-            raw_path = write_jsonl(raw_dir / f"{hf_split}.jsonl", raw_rows)
-
+        raw_rows, raw_path, source = load_raw(lang, local, repos, Path(args.raw_dir))
         out_lang = data_dir / "harmful" / lang
         if args.no_curatorkit:
-            splits, stats = build_plain(raw_rows, lang=lang, source=source, fractions=fractions, seed=seed,
-                                        stratify=args.stratify, near_threshold=args.near_threshold)
+            splits, stats = build_plain(
+                raw_rows,
+                lang=lang,
+                source=source,
+                fractions=fractions,
+                seed=seed,
+                stratify=args.stratify,
+                near_threshold=args.near_threshold,
+            )
         else:
-            splits, stats = build_with_curatorkit(raw_path, out_lang / "_curatorkit", lang=lang, source=source,
-                                                  fractions=fractions, seed=seed, stratify=args.stratify,
-                                                  minhash_threshold=args.minhash_threshold)
+            splits, stats = build_with_curatorkit(
+                raw_path,
+                out_lang / "_curatorkit",
+                lang=lang,
+                source=source,
+                fractions=fractions,
+                seed=seed,
+                stratify=args.stratify,
+                minhash_threshold=args.minhash_threshold,
+            )
         all_ids = [r["id"] for rows in splits.values() for r in rows]
         if len(all_ids) != len(set(all_ids)):
             raise RuntimeError(f"{lang}: an id appears in more than one split")
@@ -273,22 +328,23 @@ def main(argv=None) -> int:
             for r in rows:
                 r["metadata"]["split"] = split
             write_jsonl(out_lang / f"{split}.jsonl", rows)
-        manifest["languages"][lang] = {
-            "built": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "git": git_hash(),
-            "curatorkit": not args.no_curatorkit, "split_mode": split_mode, "fractions": fractions,
-            "seed": seed, "source": source, **stats,
+        built[lang] = {
+            "built": timestamp(),
+            "git": git_hash(),
+            "curatorkit": not args.no_curatorkit,
+            "split_mode": split_mode,
+            "fractions": fractions,
+            "seed": seed,
+            "source": source,
+            **stats,
             "counts": {s: len(r) for s, r in splits.items()},
             "harm_category_counts": {s: category_counts(r) for s, r in splits.items()},
         }
-        print(f"[harmful] {lang}: " + ", ".join(f"{s}={len(r)}" for s, r in splits.items())
-              + f" -> {out_lang}")
+        print(f"[harmful] {lang}: " + ", ".join(f"{s}={len(r)}" for s, r in splits.items()) + f" -> {out_lang}")
 
     mpath = data_dir / "harmful" / "manifest.json"
-    if mpath.exists():                   # keep other languages from an earlier run
-        old = json.loads(mpath.read_text())
-        manifest["languages"] = {**old.get("languages", {}), **manifest["languages"]}
-    mpath.parent.mkdir(parents=True, exist_ok=True)
-    mpath.write_text(json.dumps(manifest, indent=1, ensure_ascii=False, default=str))
+    earlier = json.loads(mpath.read_text())["languages"] if mpath.exists() else {}  # keep other languages
+    write_manifest(mpath, {"name": "harmful", "updated": timestamp(), "languages": {**earlier, **built}})
     print(f"[harmful] manifest -> {mpath}")
     return 0
 

@@ -11,6 +11,7 @@ Relevant source lines are quoted in the JSON.
     python scripts/00_model_facts.py            # needs HF_TOKEN in .env (gated model)
     python scripts/00_model_facts.py --dry-run  # tiny offline model, writes outputs/dryrun/model_facts.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -21,12 +22,13 @@ import sys
 import torch
 
 from pencil.config import REPO_ROOT
-from pencil.factors import target_modules
+from pencil.modules import target_modules
 from pencil.runtime import common_args, setup, write_json
 
 
 def facts(spec: str) -> dict:
     from transformers import AutoConfig, AutoModelForCausalLM
+
     cfg = AutoConfig.from_pretrained(spec)
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(cfg)
@@ -40,8 +42,11 @@ def facts(spec: str) -> dict:
     ln_line = next((l for l in lines if "input_layernorm(" in l), "")
     mlp_line = next((l for l in lines if "self.mlp(" in l), "")
     sum_line = next((l for l in lines if re.search(r"residual \+ .*att.*\+ .*mlp", l)), "")
-    parallel = (not hasattr(model.model.layers[0], "post_attention_layernorm")
-                and "self.mlp(hidden_states)" in mlp_line and bool(sum_line))
+    parallel = (
+        not hasattr(model.model.layers[0], "post_attention_layernorm")
+        and "self.mlp(hidden_states)" in mlp_line
+        and bool(sum_line)
+    )
     v = model.model.layers[0].self_attn.v_proj
     names = sorted({n.split("layers.0.", 1)[1] for n in target_modules(model, [0])})
     n_rep = cfg.num_attention_heads // cfg.num_key_value_heads
@@ -65,7 +70,9 @@ def facts(spec: str) -> dict:
         "v_proj_bias": v.bias is not None,
         "v_norm": bool(re.search(r"v_norm|value_norm", attn_src)),
         "n_rep": n_rep,
-        "kv_grouping": f"query head h reads KV head h // {n_rep}" if "repeat_interleave" in rkv or "expand" in rkv else "unknown",
+        "kv_grouping": f"query head h reads KV head h // {n_rep}"
+        if "repeat_interleave" in rkv or "expand" in rkv
+        else "unknown",
         "layernorm_bias": getattr(model.model.layers[0].input_layernorm, "bias", None) is not None,
         "comment": {
             "decoder_forward": [l for l in (ln_line, mlp_line, sum_line) if l],
@@ -82,8 +89,10 @@ def main(argv=None):
     f = facts(ctx.aligned)
     out = ctx.out_root / "model_facts.json" if ctx.dry else REPO_ROOT / "configs" / "model_facts.json"
     write_json(out, f)
-    print(f"parallel_block={f['parallel_block']} v_proj_bias={f['v_proj_bias']} {f['kv_grouping']}; "
-          f"intermediate_size={f['intermediate_size']} -> {out}")
+    print(
+        f"parallel_block={f['parallel_block']} v_proj_bias={f['v_proj_bias']} {f['kv_grouping']}; "
+        f"intermediate_size={f['intermediate_size']} -> {out}"
+    )
     if not f["parallel_block"] or f["v_proj_bias"] or f["v_norm"]:
         print("WARNING: the shared-input factor or the V/O invariance demo assumes a parallel block and a plain v_proj")
 

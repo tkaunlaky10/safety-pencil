@@ -99,13 +99,19 @@ Checked in `transformers/models/cohere2/modeling_cohere2.py` (transformers 5.22.
 SafeTune's `harden.PlainSFTTrainer` merges the LoRA and **discards the adapter** (`src/safetune/runner/harden/_base.py:327-340`). It also uses batch size 4 with no gradient checkpointing, which can run out of memory once the preamble is counted. Our repair needs the fp32 adapter (ΔW = scaling · B @ A), so we write a short PEFT loop and reuse two helpers:
 
 ```python
-from safetune.runner.utils.model_utils import lora_wrap            # model_utils.py:106
+from safetune.runner.utils.model_utils import lora_wrap  # model_utils.py:106
 from safetune.runner.utils.data_utils import tokenize_dataset, harden_contamination_pairs
-model = lora_wrap(model, r=16, lora_alpha=32, lora_dropout=0.05,
-                  target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"])
-train = tokenize_dataset(rows, tok)   # data_utils.py:236; chat template applied, loss on the last assistant turn,
-                                      # max_len sized to cover the ~366-token preamble
-contam, _tar, _aux = harden_contamination_pairs(n)   # data_utils.py:494; three lists of (prompt, response)
+
+model = lora_wrap(
+    model,
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+)
+train = tokenize_dataset(rows, tok)  # data_utils.py:236; chat template applied, loss on the last assistant turn,
+# max_len sized to cover the ~366-token preamble
+contam, _tar, _aux = harden_contamination_pairs(n)  # data_utils.py:494; three lists of (prompt, response)
 ```
 
 - `tokenize_dataset` accepts `messages`, ShareGPT, Alpaca or prompt/response rows (`data_utils.py:152-293`). It pads every row to `max_length`.
@@ -153,27 +159,32 @@ So the pencil plugs in next to every baseline:
 import torch, safetune.runner.recover as RR
 from safetune.runner.recover._base import _RecoverBase
 from safetune.runner._registry import register_recover
-from pencil.repair import repair_layer            # ours; returns (W0 + dW', step_ratio)
+from pencil.repair import repair_layer  # ours; returns (W0 + dW', step_ratio)
+
 
 class PencilTrainer(_RecoverBase):
     METHOD = "PencilTrainer"
+
     def __init__(self, model=None, *, aligned_model=None, kfac_path=None, mu=0.3, gamma=1e-3, **kw):
         super().__init__(model, **kw)
         self.aligned, self.mu, self.gamma = aligned_model, mu, gamma
-        self.kfac = torch.load(kfac_path)          # {module_name: (A_h, A_t, G_h, G_t)}
+        self.kfac = torch.load(kfac_path)  # {module_name: (A_h, A_t, G_h, G_t)}
         self.step_ratios = {}
+
     def apply(self, **kw):
         al = self.aligned.state_dict()
         with torch.no_grad():
             for name, lin in self.model.named_modules():
-                if name not in self.kfac: continue
+                if name not in self.kfac:
+                    continue
                 W0 = al[name + ".weight"].to(lin.weight.device)
-                dW = lin.weight.float() - W0.float()   # better: the fp32 adapter product, passed in directly
+                dW = lin.weight.float() - W0.float()  # better: the fp32 adapter product, passed in directly
                 W_new, self.step_ratios[name] = repair_layer(W0, dW, *self.kfac[name], self.mu, gamma=self.gamma)
                 lin.weight.copy_(W_new)
         return self.model
 
-RR.PencilTrainer = PencilTrainer       # makes the CLI lookup work
+
+RR.PencilTrainer = PencilTrainer  # makes the CLI lookup work
 register_recover("pencil", "PencilTrainer")
 ```
 
@@ -199,10 +210,15 @@ register_recover("pencil", "PencilTrainer")
 **Steering reference.** With our patch, `steer.RefusalDirectionTrainer(model, tok, config=RefusalDirectionConfig(pick_layer=24, target_layers=[24]))` passes the config through (before, it ignored it). Calling the functions directly also works:
 
 ```python
-from safetune.interventions.steer.refusal_direction import (extract_refusal_direction,
-    RefusalDirectionConfig, RefusalDirectionModel)
-d, _, _ = extract_refusal_direction(model, tok, harmful, harmless,
-                                    RefusalDirectionConfig(pick_layer=24, target_layers=[24]))
+from safetune.interventions.steer.refusal_direction import (
+    extract_refusal_direction,
+    RefusalDirectionConfig,
+    RefusalDirectionModel,
+)
+
+d, _, _ = extract_refusal_direction(
+    model, tok, harmful, harmless, RefusalDirectionConfig(pick_layer=24, target_layers=[24])
+)
 with RefusalDirectionModel(model, d, mode="steer", strength=s, layers=[24]):
     out = model.generate(...)
 ```

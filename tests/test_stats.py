@@ -1,4 +1,5 @@
 """Unit tests for pencil.stats against known values (scipy references and hand-computed examples)."""
+
 import math
 
 import numpy as np
@@ -22,8 +23,11 @@ NB = 500  # bootstrap replicates in tests (keeps the file fast)
 
 # ------------------------------------------------------------------ Wilson
 
-@pytest.mark.parametrize("k,n,alpha", [(8, 10, 0.05), (8, 10, 0.10), (3, 17, 0.05), (97, 100, 0.05),
-                                       (0, 10, 0.05), (10, 10, 0.05), (1, 1, 0.05)])
+
+@pytest.mark.parametrize(
+    "k,n,alpha",
+    [(8, 10, 0.05), (8, 10, 0.10), (3, 17, 0.05), (97, 100, 0.05), (0, 10, 0.05), (10, 10, 0.05), (1, 1, 0.05)],
+)
 def test_wilson_matches_scipy(k, n, alpha):
     p, lo, hi = wilson_ci(k, n, alpha=alpha)
     ref = sps.binomtest(k, n).proportion_ci(confidence_level=1 - alpha, method="wilson")
@@ -55,6 +59,7 @@ def test_wilson_edges():
 
 
 # ------------------------------------------------------------------ McNemar
+
 
 def _paired(n11, b, c, n00):
     a = [1] * n11 + [1] * b + [0] * c + [0] * n00
@@ -96,6 +101,7 @@ def test_mcnemar_no_discordant_and_errors():
 
 
 # ------------------------------------------------------------------ Spearman bootstrap
+
 
 def _xy(n=48, seed=3):
     rng = np.random.default_rng(seed)
@@ -150,6 +156,7 @@ def test_spearman_degenerate_resamples_skipped():
 
 # ------------------------------------------------------------------ paired bootstrap
 
+
 def test_paired_bootstrap_1d():
     rng = np.random.default_rng(0)
     b = rng.random(200)
@@ -198,6 +205,7 @@ def test_paired_bootstrap_2d_resamples_items():
 
 # ------------------------------------------------------------------ best_at_threshold
 
+
 def test_best_at_threshold():
     pts = [
         {"mu": 0.0, "safety": 0.90, "utility": 0.80},
@@ -215,6 +223,7 @@ def test_best_at_threshold():
 
 
 # ------------------------------------------------------------------ Holm
+
 
 def test_holm_textbook_example():
     # Four hypotheses at alpha = 0.05: sorted p = .005, .01, .03, .04 against .0125, .0167, .025:
@@ -242,6 +251,7 @@ def test_holm_monotone_clipped_and_edges():
 
 
 # ------------------------------------------------------------------ Cohen's kappa
+
 
 def _from_table(table, labels):
     """Expand a confusion table (rows: rater 1, cols: rater 2) into two label lists."""

@@ -1,4 +1,5 @@
 """Configuration and environment loading."""
+
 from __future__ import annotations
 
 import os
@@ -15,6 +16,7 @@ def load_env() -> None:
     """Load .env (HF_TOKEN etc.) and turn off AuditKIT's raw-output run cache by default."""
     try:
         from dotenv import load_dotenv
+
         load_dotenv(REPO_ROOT / ".env")
     except ImportError:  # python-dotenv is optional at import time
         pass

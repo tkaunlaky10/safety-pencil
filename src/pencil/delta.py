@@ -6,11 +6,13 @@ Never take ΔW by subtracting bf16 merged weights: the rounding error is compara
 Module names are returned in the base model's naming ("model.layers.3.self_attn.q_proj"), which is
 what the factor files and the repair use.
 """
+
 from __future__ import annotations
 
 import json
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -19,11 +21,8 @@ from torch import nn
 _KEY = re.compile(r"^(?:base_model\.model\.)?(?P<mod>.+?)\.lora_(?P<ab>[AB])(?:\.(?P<adapter>[^.]+))?\.weight$")
 
 
-def adapter_config(path: str | Path) -> dict:
-    return json.loads((Path(path) / "adapter_config.json").read_text())
-
-
 def _scaling(cfg: dict, module: str) -> float:
+    """lora_alpha / r (or / √r with rsLoRA), honouring per-module rank and alpha patterns."""
     r = cfg["r"]
     alpha = cfg["lora_alpha"]
     for pat, v in (cfg.get("rank_pattern") or {}).items():
@@ -35,63 +34,37 @@ def _scaling(cfg: dict, module: str) -> float:
     return alpha / math.sqrt(r) if cfg.get("use_rslora") else alpha / r
 
 
+@dataclass
 class LoRADelta:
-    """ΔW = B @ A kept in low-rank form (scaling folded into B, float32). Behaves like the dense tensor where
-    the pipeline needs one (`.to`, `.double`, `.float`, `.shape`, `.norm`, `.dense()`), materialising it only
-    per module, so a 36-layer delta costs megabytes instead of ~11 GB."""
+    """ΔW = B @ A kept low-rank (scaling folded into B, float32): a whole 36-layer delta costs megabytes
+    instead of ~11 GB. Use `as_dense` where a module's full matrix is needed."""
 
-    def __init__(self, B: torch.Tensor, A: torch.Tensor):
-        self.B, self.A = B, A
+    B: torch.Tensor
+    A: torch.Tensor
 
     @property
     def shape(self):
         return torch.Size((self.B.shape[0], self.A.shape[1]))
 
-    @property
-    def dtype(self):
-        return self.B.dtype
-
-    @property
-    def device(self):
-        return self.B.device
-
     def dense(self, dtype=torch.float32, device=None) -> torch.Tensor:
-        dev = device or self.B.device
-        return self.B.to(dev, dtype) @ self.A.to(dev, dtype)
-
-    def to(self, *args, **kw) -> torch.Tensor:
-        """Dense, like Tensor.to(device, dtype)."""
-        dense = self.dense(torch.float64 if torch.float64 in args or kw.get("dtype") == torch.float64 else torch.float32)
-        return dense.to(*args, **kw)
-
-    def double(self) -> torch.Tensor:
-        return self.dense(torch.float64)
-
-    def float(self) -> torch.Tensor:
-        return self.dense(torch.float32)
-
-    def norm(self) -> torch.Tensor:
-        B, A = self.B.double(), self.A.double()
-        return torch.trace((B.T @ B) @ (A @ A.T)).clamp_min(0).sqrt()
-
-    def __add__(self, other):
-        return self.dense(other.dtype if isinstance(other, torch.Tensor) else torch.float32) + other
-
-    __radd__ = __add__
+        device = device or self.B.device
+        return self.B.to(device, dtype) @ self.A.to(device, dtype)
 
 
 def as_dense(d, dtype=torch.float32, device=None) -> torch.Tensor:
+    """A delta (dense tensor or LoRADelta) as a dense tensor of the given dtype and device."""
     return d.dense(dtype, device) if isinstance(d, LoRADelta) else d.to(device or d.device, dtype)
 
 
-def lora_delta(adapter_path: str | Path, device: str | torch.device = "cpu",
-               lowrank: bool = False) -> dict[str, torch.Tensor]:
-    """{module_name: ΔW (d_out × d_in, float32)} from adapter_config.json + adapter_model.safetensors.
-    lowrank=True returns LoRADelta objects instead (use it for full-size models)."""
+def lora_delta(
+    adapter_path: str | Path, device: str | torch.device = "cpu", lowrank: bool = False
+) -> dict[str, torch.Tensor]:
+    """{module: ΔW (d_out × d_in, float32)} from a PEFT adapter folder; LoRADelta objects with lowrank=True
+    (use that for the real model)."""
     from safetensors.torch import load_file
 
     path = Path(adapter_path)
-    cfg = adapter_config(path)
+    cfg = json.loads((path / "adapter_config.json").read_text())
     if cfg.get("use_dora"):
         raise NotImplementedError("DoRA adapters are not a plain B@A update")
     if cfg.get("peft_type", "LORA") != "LORA":
@@ -115,12 +88,9 @@ def lora_delta(adapter_path: str | Path, device: str | torch.device = "cpu",
 
 def merge_deltas(model: nn.Module, deltas: dict[str, torch.Tensor], scale: float = 1.0) -> nn.Module:
     """W ← W + scale·ΔW in place, computed in fp32 and cast back to W's dtype. Returns the model."""
-    mods = dict(model.named_modules())
     with torch.no_grad():
         for name, d in deltas.items():
-            if name not in mods:
-                raise KeyError(f"{name} is not a module of this model")
-            W = mods[name].weight
+            W = model.get_submodule(name).weight
             if W.shape != d.shape:
                 raise ValueError(f"{name}: delta {tuple(d.shape)} vs weight {tuple(W.shape)}")
             W.copy_((W.float() + scale * as_dense(d, torch.float32, W.device)).to(W.dtype))
@@ -129,34 +99,26 @@ def merge_deltas(model: nn.Module, deltas: dict[str, torch.Tensor], scale: float
 
 def set_weights(model: nn.Module, weights: dict[str, torch.Tensor]) -> nn.Module:
     """Overwrite module weights (e.g. repaired W0 + ΔW′) in place."""
-    mods = dict(model.named_modules())
     with torch.no_grad():
         for name, W in weights.items():
-            mods[name].weight.copy_(W.to(mods[name].weight))
+            target = model.get_submodule(name).weight
+            target.copy_(W.to(target))
     return model
 
 
-def merge_to_checkpoint(base: str | nn.Module, deltas: dict[str, torch.Tensor], out_path: str | Path, *,
-                        tokenizer=None, dtype=torch.bfloat16, note: str | None = None, **load_kw) -> Path:
-    """Load (or take) the base model, merge the deltas in fp32, save merged weights + tokenizer.
-
-    `note` is written to RESEARCH_ARTIFACT.txt next to the weights; use it for the CLAUDE.md rule 7 label
-    ("research artifact: unrepaired, do not deploy") on drifted checkpoints."""
-    if isinstance(base, (str, Path)):
-        from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(str(base), dtype=dtype, **load_kw)
-    else:
-        model = base
-    merge_deltas(model, deltas)
-    out = Path(out_path)
-    out.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(out)
-    if tokenizer is not None:
-        tokenizer.save_pretrained(out)
-    if note:
-        (out / "RESEARCH_ARTIFACT.txt").write_text(note + "\n")
-    return out
+def model_weights(model: nn.Module, names, device=None) -> dict[str, torch.Tensor]:
+    """{module: weight} copies for the named linear modules (on `device`, default the weight's own)."""
+    return {
+        n: model.get_submodule(n).weight.detach().to(device or model.get_submodule(n).weight.device, copy=True)
+        for n in names
+    }
 
 
-def delta_norms(deltas: dict[str, torch.Tensor]) -> dict[str, float]:
-    return {k: float(v.norm()) for k, v in deltas.items()}
+def save_checkpoint(model: nn.Module, tokenizer, path: str | Path, note: str) -> Path:
+    """Save weights (or a PEFT adapter) with the pinned tokenizer, so no checkpoint can bring a different chat
+    template, and a RESEARCH_ARTIFACT.txt label (CLAUDE.md rule 7)."""
+    path = Path(path)
+    model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
+    (path / "RESEARCH_ARTIFACT.txt").write_text(note + "\n")
+    return path

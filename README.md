@@ -14,7 +14,7 @@ The method code, tests and pipeline scripts are in place. All of it runs end to 
 | `configs/experiment.yaml` | Models, data, runs A–D, LoRA, factor row sets, pencil settings, μ grid, evaluation tiers |
 | `src/pencil/` | The library (below) |
 | `scripts/` | One script per stage, every one with `--dry-run` |
-| `tests/` | 127 tests: numpy maths, torch equivalence, factor hooks, whole-model repair and invariance, streaming factors, data, evaluation, statistics |
+| `tests/` | 130 tests: numpy maths, torch equivalence, factor hooks, whole-model repair and invariance, streaming factors, data, evaluation, statistics |
 | `patches/`, `scripts/setup_lexsi.sh` | Our bug fixes to the four Lexsi libraries, and the script that installs the patched versions |
 | `verification/` | The toy-transformer verification: write-up, scripts, results |
 
@@ -22,17 +22,20 @@ The method code, tests and pipeline scripts are in place. All of it runs end to 
 
 | Module | What it does |
 | --- | --- |
+| `modules.py` | Module names and structure: which linear layers exist, which share an input factor, layer order |
 | `chat.py` | Chat templating with user and response offsets; masks for the four row sets |
-| `factors.py` | `KFACCollector`: hooks, sampled-label Fisher, row sets `loss`/`all`/`full`/`full_reduce`, save/load, pooling, known null vectors; `FactorStore` and `LazyFactors` stream saved factors one layer at a time |
+| `factors.py` | `KFACCollector`: hooks, sampled-label Fisher, row sets `loss`/`all`/`full`/`full_reduce` |
+| `factor_store.py` | `Factors` (in memory, saved per layer chunk), `FactorStore` (reads chunk files on demand) and `LazyFactors` (pools languages, projects out the known null vectors, applies transforms, one layer at a time) |
 | `geneig.py` | Generalised eigenproblems on the range of F_h + F_t, covariant or Euclidean damping, noise floors; a fast top-k solver for the MLP-width sides |
 | `repair.py` | Layer repair (subtraction form, truncation), forecast, frontier, `ModelRepair` over a whole model (compact cached bases, so a μ sweep is cheap), rule-11 trust region, task-gradient diagnostic |
-| `delta.py` | ΔW from a PEFT adapter in fp32, dense or low-rank (`LoRADelta`); merging |
+| `delta.py` | ΔW from a PEFT adapter in fp32, dense or low-rank (`LoRADelta`); reading, merging and writing weights; saving checkpoints |
 | `leverage.py` | Leverage map, per-head and per-KV-group bounds, refusal-direction cosine, targeted and random module sets |
-| `invariance.py` | V/O gauge for GQA, transforms of deltas and factors, output KL |
+| `invariance.py` | V/O gauge for GQA on weights, deltas and factors; output KL |
 | `baselines.py` | RegMean (one eigendecomposition per μ sweep), diagonal Fisher merge, AlignMerge-style merge, Safe LoRA projection, Safe Delta Hessians |
 | `safetune_plugin.py` | `PencilTrainer`, registered as SafeTune recover method `pencil` |
 | `datasets.py`, `generate.py`, `judge.py`, `evaluate.py`, `stats.py` | Data layout and splits, cached generation, Llama Guard 3 and Aya Expanse judges, per-language evaluation, statistics |
-| `runtime.py`, `testing.py` | Script plumbing and the offline dry run; tiny Cohere2 model and tokenizer |
+| `config.py`, `runtime.py`, `results.py` | Config and `.env`; shared script plumbing (models, data, factors, the dev probe); one JSON per result |
+| `dryrun.py`, `testing.py`, `plots.py` | The offline dry run; tiny Cohere2 model and tokenizer; figure helpers |
 
 ## Setup
 
@@ -44,10 +47,12 @@ cp .env.example .env            # then add HF_TOKEN
 python3.12 -m venv .venv && . .venv/bin/activate && pip install -U pip uv
 uv pip install -r requirements-main.lock.txt
 bash scripts/setup_lexsi.sh main            # swaps in the patched SafeTune, AuditKIT, CuratorKIT
-uv pip install -e . --no-deps               # this package
-python -m pytest -q                         # 126 passed, 1 skipped (CPU, about 2 minutes)
+uv pip install -e . --no-deps               # this package (the scripts import it)
+python -m pytest -q                         # 129 passed, 1 skipped (CPU, about 2 minutes)
 bash scripts/dry_run_all.sh                 # the whole pipeline on the tiny offline model
 ```
+
+Style: `uv pip install ruff && ruff check . && ruff format --check .` (config in `pyproject.toml`: 120 columns; the patched Lexsi clones in `third_party/` are excluded).
 
 For CircuitKIT, make `.venv-circuit` the same way from `requirements-circuit.lock.txt` and run `bash scripts/setup_lexsi.sh circuit`. Accept the Hugging Face licences for `CohereLabs/tiny-aya-global`, `CohereLabs/tiny-aya-base`, `meta-llama/Llama-Guard-3-8B` and `CohereLabs/aya-expanse-8b` first.
 

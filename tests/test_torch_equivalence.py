@@ -1,12 +1,12 @@
 """src/pencil/{geneig,repair}.py against the numpy references in test_math.py (rtol 1e-8)."""
+
 import numpy as np
 import pytest
 import torch
+from test_math import pencil_repair_np, psd_with_null, spd
 
 from pencil.geneig import gen_eig, gen_eig_topk
-from pencil.repair import (LayerFactors, coords, forecast, frontier, layer_basis, repair_delta,
-                           repair_layer)
-from test_math import pencil_repair_np, psd_with_null, spd
+from pencil.repair import coords, forecast, frontier, layer_basis, repair_delta, repair_layer
 
 T = lambda a: torch.from_numpy(np.asarray(a, dtype=np.float64))
 rng = np.random.default_rng(11)
@@ -35,7 +35,7 @@ def test_repair_matches_numpy(damping, gamma, null_in, null_out):
 
 def test_null_component_passes_through():
     A_h, A_t, G_h, G_t, dW, u, _ = _problem(null_in=True)
-    b = layer_basis(LayerFactors(T(A_h), T(A_t), T(G_h), T(G_t)))
+    b = layer_basis(T(A_h), T(A_t), T(G_h), T(G_t))
     assert b.inp.range_dim == A_h.shape[0] - 1
     out = repair_delta(T(dW), b, 0.3).numpy()
     un = u / np.linalg.norm(u)
@@ -46,11 +46,11 @@ def test_truncation_passes_discarded_pairs_through():
     """With only the top-k output pairs kept, M is 1 on the discarded rows (test_math, truncated form)."""
     A_h, A_t, G_h, G_t, dW, _, _ = _problem(null_in=False)
     k, mu = 2, 0.5
-    f = LayerFactors(T(A_h), T(A_t), T(G_h), T(G_t))
-    full, trunc = layer_basis(f), layer_basis(f, top_k_out=k)
+    f = (T(A_h), T(A_t), T(G_h), T(G_t))
+    full, trunc = layer_basis(*f), layer_basis(*f, top_k_out=k)
     C = coords(T(dW), full)
     M = mu / (torch.outer(full.gamma, full.alpha) + mu)
-    M[:-k] = 1.0                                      # gen_eig is ascending: the top-k are the last rows
+    M[:-k] = 1.0  # gen_eig is ascending: the top-k are the last rows
     expected = dW - (full.out.X @ ((1 - M) * C) @ full.inp.X.T).numpy()
     np.testing.assert_allclose(repair_delta(T(dW), trunc, mu).numpy(), expected, rtol=1e-8, atol=1e-10)
 
@@ -60,8 +60,8 @@ def test_forecast_equals_pencil_sum_and_ignores_task_factors():
     S = forecast(T(dW), T(A_h), T(G_h))
     D = dW.reshape(-1, order="F")
     assert S == pytest.approx(0.5 * D @ np.kron(A_h, G_h) @ D, rel=1e-10)
-    for gamma in (1e-3, 0.3):                         # any task factors, any covariant damping
-        b = layer_basis(LayerFactors(T(A_h), T(A_t), T(G_h), T(G_t)), gamma=gamma)
+    for gamma in (1e-3, 0.3):  # any task factors, any covariant damping
+        b = layer_basis(T(A_h), T(A_t), T(G_h), T(G_t), gamma=gamma)
         C = coords(T(dW), b)
         assert S == pytest.approx(0.5 * float((torch.outer(b.gamma, b.alpha) * C**2).sum()), rel=1e-7)
 
@@ -69,7 +69,7 @@ def test_forecast_equals_pencil_sum_and_ignores_task_factors():
 def test_frontier_matches_repair():
     """Predicted S(mu) equals the forecast of the repaired update (full basis, no truncation)."""
     A_h, A_t, G_h, G_t, dW, _, _ = _problem(null_in=True)
-    b = layer_basis(LayerFactors(T(A_h), T(A_t), T(G_h), T(G_t)))
+    b = layer_basis(T(A_h), T(A_t), T(G_h), T(G_t))
     C = coords(T(dW), b)
     mus = [0.01, 0.1, 1.0]
     S, R = frontier(C, b.alpha, b.gamma, mus)

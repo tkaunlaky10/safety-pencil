@@ -1,48 +1,64 @@
-"""Per-language evaluation of one checkpoint (Stage 8).
+"""Per-language evaluation of one checkpoint.
 
-Metrics, per language: refusal and harmful-compliance (Llama Guard "unsafe") rates on harmful prompts, and
-the over-refusal rate on XSTest-derived benign prompts, each with a Wilson 95% interval; Global-MMLU
-log-likelihood accuracy; mean per-token KL(p_reference || p_checkpoint) on the benign prompts (only with a
-reference). Plus the per-token NLL of held-out task answers.
+Per language: refusal and harmful-compliance (Llama Guard "unsafe") rates on harmful prompts and the
+over-refusal rate on XSTest-derived benign prompts, each with a Wilson 95% interval; Global-MMLU
+log-likelihood accuracy; and, with a reference model, mean per-token KL(p_reference || p_checkpoint) on the
+benign prompts. Plus the per-token NLL of held-out task answers.
 
-Order, so that a checkpoint given as a path never shares the GPU with a judge:
-  1. generate on harmful + benign prompts (cached in outputs/generations/ when cache=True);
-  2. teacher-forced metrics, with the checkpoint (and reference) loaded once and freed after;
-  3. Llama Guard 3 on the harmful responses, then unloaded;
-  4. the refusal judge on harmful + benign responses, then unloaded.
-An in-memory model stays loaded throughout (its owner frees it), so pass a path for GPU runs.
+The steps run in this order so that a checkpoint given as a path never shares the GPU with a judge:
+generate (cached in outputs/generations/ with cache=True); teacher-forced metrics; Llama Guard 3; the refusal
+judge. An in-memory model stays loaded throughout (its owner frees it), so pass a path for GPU runs.
 
 Results hold ids, labels and sha256 hashes of completions, never completion text (CLAUDE.md rule 7).
 """
+
 from __future__ import annotations
 
 import math
 import os
-from typing import Any, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from typing import Any
 
 import torch
 
 from . import chat
-from .generate import default_dtype, free_gpu, generate, generate_cached, prompt_ids, sha256
-from .judge import (DEFAULT_HARM_JUDGE, DEFAULT_REFUSAL_JUDGE, REFUSAL_RUBRIC, harm_judge, judge_name,
-                    read_rubric, refusal_judge)
+from .generate import (
+    default_dtype,
+    free_gpu,
+    generate,
+    generate_cached,
+    longest_first_batches,
+    pad_id,
+    prompt_ids,
+    sha256,
+)
+from .judge import (
+    DEFAULT_HARM_JUDGE,
+    DEFAULT_REFUSAL_JUDGE,
+    REFUSAL_RUBRIC,
+    harm_judge,
+    judge_name,
+    read_rubric,
+    refusal_judge,
+)
 from .results import write_result
+from .stats import wilson_ci
 
-TIER_SPLIT = {"probe": "dev", "full": "test"}       # CLAUDE.md rule 5
+TIER_SPLIT = {"probe": "dev", "full": "test"}  # CLAUDE.md rule 5
 LETTERS = "ABCDEFGHIJ"
 
 
 # ------------------------------------------------------------------------------- data selection
 
+
 def select_tier(data: Mapping[str, Any], tier: str, cfg: Mapping[str, Any]) -> dict[str, Any]:
-    """The items one tier evaluates. probe: the first `evaluation.probe_per_lang` items of every list
-    (MMLU also capped at `mmlu_per_lang`); full: everything given (MMLU capped at `mmlu_per_lang`)."""
+    """The items one tier evaluates. probe: the first `evaluation.probe_per_lang` items of every list;
+    full: everything. MMLU is also capped at `evaluation.mmlu_per_lang`."""
     if tier not in TIER_SPLIT:
         raise ValueError(f"tier must be one of {sorted(TIER_SPLIT)}, got {tier!r}")
     ev = cfg.get("evaluation", {})
     cap = ev.get("probe_per_lang") if tier == "probe" else None
-    caps = [c for c in (cap, ev.get("mmlu_per_lang")) if c]
-    mmlu_cap = min(caps) if caps else None
+    mmlu_cap = min((c for c in (cap, ev.get("mmlu_per_lang")) if c), default=None)
 
     def take(rows: Sequence[Mapping], n: int | None, what: str) -> list:
         rows = list(rows)[:n] if n else list(rows)
@@ -52,64 +68,55 @@ def select_tier(data: Mapping[str, Any], tier: str, cfg: Mapping[str, Any]) -> d
         return rows
 
     return {
-        "harmful": {l: take(r, cap, f"harmful/{l}") for l, r in data.get("harmful", {}).items()},
-        "xstest": {l: take(r, cap, f"xstest/{l}") for l, r in data.get("xstest", {}).items()},
+        "harmful": {lang: take(r, cap, f"harmful/{lang}") for lang, r in data.get("harmful", {}).items()},
+        "xstest": {lang: take(r, cap, f"xstest/{lang}") for lang, r in data.get("xstest", {}).items()},
         "task": take(data.get("task", []), cap, "task"),
-        "mmlu": {l: take(r, mmlu_cap, f"mmlu/{l}") for l, r in data.get("mmlu", {}).items()},
+        "mmlu": {lang: take(r, mmlu_cap, f"mmlu/{lang}") for lang, r in data.get("mmlu", {}).items()},
     }
 
 
 # ---------------------------------------------------------------------------- teacher forcing
 
-def _pad_id(tok) -> int:
-    return tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
-
-def _batches(seqs: Sequence[tuple[list[int], int]], pad_id: int, batch_size: int) -> Iterator[tuple]:
-    """Left-padded batches, longest first. Each (ids, start) scores ids[start:], which with left padding
-    are the last n = len(ids) - start tokens of the row; logits are kept for the last k = max(n) + 1
-    positions only. Yields (indices, input_ids, attention_mask, position_ids, n per row, k)."""
+def _batches(seqs: Sequence[tuple[list[int], int]], pad: int, batch_size: int) -> Iterator[tuple]:
+    """Left-padded batches of (ids, start) sequences, longest first. Each row scores ids[start:], which with
+    left padding are its last n = len(ids) - start tokens.
+    Yields (indices, input_ids, attention_mask, position_ids, n per row)."""
     for ids, start in seqs:
         if not 1 <= start < len(ids):
             raise ValueError("each sequence needs at least one context token and one scored token")
-    order = sorted(range(len(seqs)), key=lambda i: -len(seqs[i][0]))
-    for s in range(0, len(order), batch_size):
-        idx = order[s:s + batch_size]
-        rows = [seqs[i][0] for i in idx]
-        T = max(map(len, rows))
-        ids = torch.full((len(rows), T), pad_id, dtype=torch.long)
-        att = torch.zeros_like(ids)
-        for b, r in enumerate(rows):
-            ids[b, T - len(r):] = torch.tensor(r)
-            att[b, T - len(r):] = 1
+    for idx in longest_first_batches([len(ids) for ids, _ in seqs], batch_size):
+        batch = chat.collate([chat.Encoded(seqs[i][0], 0, seqs[i][1]) for i in idx], pad, side="left")
+        att = batch["attention_mask"]
         n = [len(seqs[i][0]) - seqs[i][1] for i in idx]
-        yield idx, ids, att, (att.cumsum(-1) - 1).clamp_min(0), n, max(n) + 1
+        yield idx, batch["input_ids"], att, (att.cumsum(-1) - 1).clamp_min(0), n
 
 
-def _tail_logprobs(model, ids, att, pos, k: int) -> torch.Tensor:
-    """float32 log-softmax at the last k positions but one: row j predicts token T-k+1+j."""
+def _tail_logprobs(model, ids, att, pos, n: int) -> torch.Tensor:
+    """float32 log-softmax over the predictions of the last n tokens: column j predicts token T - n + j."""
     dev = next(model.parameters()).device
-    logits = model(input_ids=ids.to(dev), attention_mask=att.to(dev), position_ids=pos.to(dev),
-                   logits_to_keep=k).logits
+    logits = model(
+        input_ids=ids.to(dev), attention_mask=att.to(dev), position_ids=pos.to(dev), logits_to_keep=n + 1
+    ).logits
     return torch.log_softmax(logits[:, :-1].float(), dim=-1)
 
 
 @torch.no_grad()
-def token_logprobs(model, seqs: Sequence[tuple[list[int], int]], pad_id: int,
-                   batch_size: int = 4) -> list[torch.Tensor]:
+def token_logprobs(model, seqs: Sequence[tuple[list[int], int]], pad: int, batch_size: int = 4) -> list[torch.Tensor]:
     """Teacher forcing: for each (ids, start), log p(ids[t] | ids[:t]) for t = start .. len-1."""
     out: list[torch.Tensor] = [torch.empty(0)] * len(seqs)
-    for idx, ids, att, pos, n, k in _batches(seqs, pad_id, batch_size):
-        logp = _tail_logprobs(model, ids, att, pos, k)
-        targets = ids[:, ids.shape[1] - k + 1:].to(logp.device)
+    for idx, ids, att, pos, n in _batches(seqs, pad, batch_size):
+        logp = _tail_logprobs(model, ids, att, pos, max(n))
+        targets = ids[:, -max(n) :].to(logp.device)
         lp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         for row, i in enumerate(idx):
-            out[i] = lp[row, lp.shape[1] - n[row]:].cpu()
+            out[i] = lp[row, -n[row] :].cpu()
     return out
 
 
 def _encode_pairs(tok, pairs: Sequence[Mapping], max_len: int | None) -> tuple[list, list, int]:
-    """(ids, response_start) per pair via pencil.chat; pairs that do not fit max_len are skipped."""
+    """(ids, response_start) per pair via pencil.chat, the pairs kept, and how many were skipped because
+    they do not fit max_len."""
     offset = chat.user_content_offset(tok)
     seqs, kept, skipped = [], [], 0
     for r in pairs:
@@ -124,14 +131,19 @@ def _encode_pairs(tok, pairs: Sequence[Mapping], max_len: int | None) -> tuple[l
 
 
 def task_nll(model, tok, pairs: Sequence[Mapping], *, batch_size: int = 4, max_len: int | None = None) -> dict:
-    """Per-token NLL of each answer given its prompt, on response tokens only (the loss positions of
-    pencil.chat.encode_chat: the response and the template's end-of-turn tokens)."""
+    """Per-token NLL of each answer given its prompt, on the loss positions of pencil.chat.encode_chat (the
+    response and the template's end-of-turn tokens)."""
     seqs, kept, skipped = _encode_pairs(tok, pairs, max_len)
-    lps = token_logprobs(model, seqs, _pad_id(tok), batch_size)
+    lps = token_logprobs(model, seqs, pad_id(tok), batch_size)
     items = [{"id": r.get("id"), "nll": float(-lp.sum()), "n_tokens": int(lp.numel())} for r, lp in zip(kept, lps)]
     total = sum(i["n_tokens"] for i in items)
-    return {"nll_per_token": sum(i["nll"] for i in items) / total if total else None,
-            "n_tokens": total, "n_items": len(items), "n_skipped": skipped, "items": items}
+    return {
+        "nll_per_token": sum(i["nll"] for i in items) / total if total else None,
+        "n_tokens": total,
+        "n_items": len(items),
+        "n_skipped": skipped,
+        "items": items,
+    }
 
 
 def mmlu_prompt(item: Mapping) -> str:
@@ -144,72 +156,123 @@ def _answer_index(answer: Any) -> int:
 
 
 def mmlu_scores(model, tok, items: Sequence[Mapping], *, batch_size: int = 8) -> list[dict]:
-    """Log-likelihood multiple choice: the question goes through the chat template as one user turn and each
-    letter is scored as the start of the response; the prediction is the most likely letter."""
+    """Log-likelihood multiple choice: the question is one templated user turn, each option letter is scored
+    as the start of the response, and the most likely letter is the prediction."""
     seqs = []
     for it in items:
         p = prompt_ids(tok, mmlu_prompt(it))
-        seqs += [(p + tok(LETTERS[c], add_special_tokens=False)["input_ids"], len(p)) for c in range(len(it["choices"]))]
-    lps = token_logprobs(model, seqs, _pad_id(tok), batch_size)
-    out, at = [], 0
+        seqs += [
+            (p + tok(letter, add_special_tokens=False)["input_ids"], len(p)) for letter in LETTERS[: len(it["choices"])]
+        ]
+    lps = iter(token_logprobs(model, seqs, pad_id(tok), batch_size))
+    out = []
     for it in items:
-        scores = [float(lp.sum()) for lp in lps[at:at + len(it["choices"])]]
-        at += len(it["choices"])
-        pred, ans = max(range(len(scores)), key=scores.__getitem__), _answer_index(it["answer"])
-        out.append({"id": it.get("id"), "pred": pred, "answer": ans, "correct": pred == ans})
+        scores = [float(next(lps).sum()) for _ in it["choices"]]
+        pred, answer = max(range(len(scores)), key=scores.__getitem__), _answer_index(it["answer"])
+        out.append({"id": it.get("id"), "pred": pred, "answer": answer, "correct": pred == answer})
     return out
 
 
 @torch.no_grad()
-def response_kl(model, reference, tok, pairs: Sequence[Mapping], *, batch_size: int = 2,
-                max_len: int | None = None) -> dict:
-    """Mean per-token KL(p_reference || p_model) over the positions that predict response tokens, teacher-forced
-    on the given (prompt, answer) pairs (evaluate() uses the reference's own greedy responses)."""
+def response_kl(
+    model, reference, tok, pairs: Sequence[Mapping], *, batch_size: int = 2, max_len: int | None = None
+) -> dict:
+    """Mean per-token KL(p_reference || p_model) over the positions predicting response tokens, teacher-forced
+    on the given (prompt, answer) pairs (evaluate() passes the reference's own greedy responses)."""
     seqs, kept, skipped = _encode_pairs(tok, pairs, max_len)
     kl_sum, n_tok = 0.0, 0
-    for idx, ids, att, pos, n, k in _batches(seqs, _pad_id(tok), batch_size):
-        lq = _tail_logprobs(model, ids, att, pos, k)
-        lp = _tail_logprobs(reference, ids, att, pos, k).to(lq.device)
+    for _, ids, att, pos, n in _batches(seqs, pad_id(tok), batch_size):
+        lq = _tail_logprobs(model, ids, att, pos, max(n))
+        lp = _tail_logprobs(reference, ids, att, pos, max(n)).to(lq.device)
         kl = (lp.exp() * (lp - lq)).sum(-1)
-        for row in range(len(idx)):
-            kl_sum += float(kl[row, kl.shape[1] - n[row]:].sum())
-            n_tok += n[row]
-    return {"kl_per_token": kl_sum / n_tok if n_tok else None, "n_tokens": n_tok, "n_prompts": len(kept),
-            "n_skipped": skipped}
+        for row, n_row in enumerate(n):
+            kl_sum += float(kl[row, -n_row:].sum())
+            n_tok += n_row
+    return {
+        "kl_per_token": kl_sum / n_tok if n_tok else None,
+        "n_tokens": n_tok,
+        "n_prompts": len(kept),
+        "n_skipped": skipped,
+    }
 
 
-def load_causal_lm(path: str | os.PathLike, *, dtype: torch.dtype | None = None, device: str | None = None):
-    """A checkpoint (full model or PEFT adapter folder, local or hub) for teacher-forced metrics."""
+def _as_model(model_or_path: Any):
+    """An in-memory model as is; a path / hub id / PEFT folder loaded for teacher forcing."""
+    if not isinstance(model_or_path, (str, os.PathLike)):
+        return model_or_path
     from transformers import AutoModelForCausalLM
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForCausalLM.from_pretrained(str(path).removeprefix("hf:"), dtype=dtype or default_dtype())
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForCausalLM.from_pretrained(str(model_or_path).removeprefix("hf:"), dtype=default_dtype())
     return model.to(device).eval()
 
 
-# ------------------------------------------------------------------------------------ aggregation
+def _teacher_forced(
+    checkpoint: Any, reference: Any, tok, sel: dict, ref_gens: dict | None, split: str, ev: Mapping
+) -> dict:
+    """Task NLL, MMLU and KL to the reference, loading a path checkpoint (and reference) once."""
+    if not (sel["task"] or any(sel["mmlu"].values()) or ref_gens):
+        return {"task": None, "mmlu": {}, "kl": {}}
+    model = _as_model(checkpoint)
+    bs, max_len = ev.get("tf_batch_size", 4), ev.get("max_len")
+    out: dict[str, Any] = {
+        "task": task_nll(model, tok, sel["task"], batch_size=bs, max_len=max_len) if sel["task"] else None,
+        "mmlu": {lang: mmlu_scores(model, tok, rows, batch_size=bs) for lang, rows in sel["mmlu"].items() if rows},
+        "kl": {},
+    }
+    if ref_gens:
+        ref = _as_model(reference)
+        for lang, rows in sel["xstest"].items():
+            gens = ref_gens.get(f"{split}_xstest_{lang}", {})
+            pairs = [{"id": r["id"], "prompt": r["prompt"], "answer": gens[r["id"]]} for r in rows if r["id"] in gens]
+            if pairs:
+                out["kl"][lang] = response_kl(
+                    model, ref, tok, pairs, batch_size=ev.get("kl_batch_size", 2), max_len=max_len
+                )
+    return out
 
-def _wilson(k: int, n: int) -> tuple[float | None, float | None, float | None]:
-    try:
-        from .stats import wilson_ci
-        vals = wilson_ci(k, n)
-    except ImportError:                       # stats.py not there yet: rate only (k and n are stored)
-        vals = (k / n if n else None, None, None)
-    return tuple(None if v is None or math.isnan(v) else float(v) for v in vals)  # type: ignore[return-value]
+
+# ------------------------------------------------------------------------------------ aggregation
 
 
 def rate(flags: Sequence[bool | None]) -> dict:
     """k/n with a Wilson 95% interval; None entries (no judge verdict) are left out and counted."""
     vals = [bool(f) for f in flags if f is not None]
-    p, lo, hi = _wilson(sum(vals), len(vals))
+    p, lo, hi = (None if math.isnan(v) else v for v in wilson_ci(sum(vals), len(vals)))
     return {"k": sum(vals), "n": len(vals), "p": p, "lo": lo, "hi": hi, "n_unlabelled": len(flags) - len(vals)}
 
 
-def _is(label: str | None, *wanted: str) -> bool | None:
+def _label_in(label: str | None, *wanted: str) -> bool | None:
     return None if label is None else label in wanted
 
 
+def _lang_metrics(lang: str, items: dict, tf: dict) -> dict:
+    """The metrics block of one language."""
+    h = [i for i in items["harmful"] if i["lang"] == lang]
+    x = [i for i in items["xstest"] if i["lang"] == lang]
+    m: dict[str, Any] = {}
+    if h:
+        m["harmful"] = {
+            "n_prompts": len(h),
+            "refusal": rate([_label_in(i["refusal"], "REFUSE") for i in h]),
+            "partial": rate([_label_in(i["refusal"], "PARTIAL") for i in h]),
+            "unsafe": rate([i["unsafe"] for i in h]),
+        }
+    if x:
+        m["xstest"] = {
+            "n_prompts": len(x),
+            "over_refusal": rate([_label_in(i["refusal"], "REFUSE") for i in x]),
+            "over_refusal_or_partial": rate([_label_in(i["refusal"], "REFUSE", "PARTIAL") for i in x]),
+        }
+    if lang in tf["mmlu"]:
+        m["mmlu"] = {"accuracy": rate([s["correct"] for s in tf["mmlu"][lang]])}
+    if lang in tf["kl"]:
+        m["kl_to_reference"] = tf["kl"][lang]
+    return m
+
+
 # ------------------------------------------------------------------------------------------ main
+
 
 def _model_id(model: Any, given: str | None) -> str:
     if given:
@@ -229,8 +292,10 @@ def _judge_spec(given: Any, hub_id: str | None, default: str) -> Any:
     return "hf:" + hub_id if hub_id else default
 
 
-def _generations(model: Any, tok, splits: dict[str, list], name: str, cache: bool, root: Any,
-                 gen_kw: dict) -> dict[str, dict[str, str]]:
+def _generations(
+    model: Any, tok, splits: dict[str, list], name: str, cache: bool, root: Any, gen_kw: dict
+) -> dict[str, dict[str, str]]:
+    """{split: {id: completion}} for the non-empty splits, through the cache when `cache` is set."""
     splits = {s: rows for s, rows in splits.items() if rows}
     if not splits:
         return {}
@@ -244,33 +309,46 @@ def _generations(model: Any, tok, splits: dict[str, list], name: str, cache: boo
     return out
 
 
-def _teacher_forced(checkpoint: Any, reference: Any, tok, sel: dict, ref_gens: dict | None, split: str,
-                    ev: Mapping) -> dict:
-    """Task NLL, MMLU and KL, loading a path checkpoint (and reference) once. Freed when this returns."""
-    if not (sel["task"] or any(sel["mmlu"].values()) or ref_gens):
-        return {"task": None, "mmlu": {}, "kl": {}}
-    model = load_causal_lm(checkpoint) if isinstance(checkpoint, (str, os.PathLike)) else checkpoint
-    bs, max_len = ev.get("tf_batch_size", 4), ev.get("max_len")
-    out: dict[str, Any] = {
-        "task": task_nll(model, tok, sel["task"], batch_size=bs, max_len=max_len) if sel["task"] else None,
-        "mmlu": {l: mmlu_scores(model, tok, rows, batch_size=bs) for l, rows in sel["mmlu"].items() if rows},
-        "kl": {},
-    }
-    if ref_gens:
-        ref = load_causal_lm(reference) if isinstance(reference, (str, os.PathLike)) else reference
-        for l, rows in sel["xstest"].items():
-            gens = ref_gens.get(f"{split}_xstest_{l}", {})
-            pairs = [{"id": r["id"], "prompt": r["prompt"], "answer": gens[r["id"]]} for r in rows if r["id"] in gens]
-            if pairs:
-                out["kl"][l] = response_kl(model, ref, tok, pairs, batch_size=ev.get("kl_batch_size", 2),
-                                           max_len=max_len)
-    return out
+def _judge_all(harmful: list, benign: list, harm: Any, refj: Any, rubric: str, batch_size: int) -> tuple:
+    """Llama Guard on the harmful responses, then the refusal judge on harmful + benign ones; a judge set to
+    False gives empty labels. Returns (guard labels, refusal labels on harmful, refusal labels on benign)."""
+    if harm is False:
+        guard = [{"unsafe": None, "categories": []} for _ in harmful]
+    else:
+        guard = harm_judge(
+            [r["prompt"] for _, r, _ in harmful], [c for *_, c in harmful], model=harm, batch_size=batch_size
+        )
+    both = harmful + benign
+    if refj is False:
+        refusal = [{"label": None} for _ in both]
+    else:
+        refusal = refusal_judge(
+            [r["prompt"] for _, r, _ in both],
+            [c for *_, c in both],
+            [lang for lang, *_ in both],
+            model=refj,
+            rubric_path=rubric,
+            batch_size=batch_size,
+        )
+    return guard, refusal[: len(harmful)], refusal[len(harmful) :]
 
 
-def evaluate(checkpoint: Any, tier: str, *, cfg: Mapping[str, Any], data: Mapping[str, Any],
-             judges: Mapping[str, Any] | None, out_name: str, tokenizer=None, reference: Any = None,
-             checkpoint_id: str | None = None, reference_id: str | None = None, cache: bool = False,
-             gen_root: Any = None, out_dir: Any = None) -> dict:
+def evaluate(
+    checkpoint: Any,
+    tier: str,
+    *,
+    cfg: Mapping[str, Any],
+    data: Mapping[str, Any],
+    judges: Mapping[str, Any] | None,
+    out_name: str,
+    tokenizer=None,
+    reference: Any = None,
+    checkpoint_id: str | None = None,
+    reference_id: str | None = None,
+    cache: bool = False,
+    gen_root: Any = None,
+    out_dir: Any = None,
+) -> dict:
     """Evaluate `checkpoint` (a path / hub id / PEFT folder, or an in-memory model with `checkpoint_id`).
 
     data: {"harmful": {lang: [{"id", "prompt"}]}, "xstest": {lang: [...]},
@@ -282,84 +360,83 @@ def evaluate(checkpoint: Any, tier: str, *, cfg: Mapping[str, Any], data: Mappin
     Writes outputs/results/{out_name}.json (out_dir overrides) and returns the same payload.
     """
     ev, gen_cfg, models = cfg.get("evaluation", {}), cfg.get("generation", {}), cfg.get("models", {})
+    judges = judges or {}
     sel = select_tier(data, tier, cfg)
     split = TIER_SPLIT[tier]
     ckpt_id = _model_id(checkpoint, checkpoint_id)
+    ref_id = _model_id(reference, reference_id) if reference is not None else None
     if tokenizer is None:
         from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(models["aligned"])
-    gen_kw = {"max_new_tokens": gen_cfg.get("max_new_tokens", 256), "temperature": gen_cfg.get("temperature", 0.0),
-              "batch_size": gen_cfg.get("batch_size", 16)}
+    gen_kw = {
+        "max_new_tokens": gen_cfg.get("max_new_tokens", 256),
+        "temperature": gen_cfg.get("temperature", 0.0),
+        "batch_size": gen_cfg.get("batch_size", 16),
+    }
 
     # 1. generation
-    splits = {f"{split}_{kind}_{l}": rows for kind in ("harmful", "xstest") for l, rows in sel[kind].items()}
+    splits = {f"{split}_{kind}_{lang}": rows for kind in ("harmful", "xstest") for lang, rows in sel[kind].items()}
     gens = _generations(checkpoint, tokenizer, splits, ckpt_id, cache, gen_root, gen_kw)
-    ref_id = _model_id(reference, reference_id) if reference is not None else None
     ref_gens = None
     if reference is not None:
-        ref_splits = {f"{split}_xstest_{l}": rows for l, rows in sel["xstest"].items()}
+        ref_splits = {f"{split}_xstest_{lang}": rows for lang, rows in sel["xstest"].items()}
         ref_gens = _generations(reference, tokenizer, ref_splits, ref_id, cache, gen_root, gen_kw)
 
     # 2. teacher-forced metrics
     tf = _teacher_forced(checkpoint, reference, tokenizer, sel, ref_gens, split, ev)
     free_gpu()
 
-    # 3-4. judges, one at a time
-    judges = dict(judges or {})
+    # 3-4. judges, one at a time, on (lang, row, completion) triples
+    harmful = [
+        (lang, r, gens[f"{split}_harmful_{lang}"][r["id"]]) for lang, rows in sel["harmful"].items() for r in rows
+    ]
+    benign = [(lang, r, gens[f"{split}_xstest_{lang}"][r["id"]]) for lang, rows in sel["xstest"].items() for r in rows]
     harm = _judge_spec(judges.get("harm"), models.get("harm_judge"), DEFAULT_HARM_JUDGE)
     refj = _judge_spec(judges.get("refusal"), models.get("refusal_judge"), DEFAULT_REFUSAL_JUDGE)
     rubric = ev.get("refusal_rubric", REFUSAL_RUBRIC)
-    bs = ev.get("judge_batch_size", 8)
-    H = [(l, r, gens[f"{split}_harmful_{l}"][r["id"]]) for l, rows in sel["harmful"].items() for r in rows]
-    X = [(l, r, gens[f"{split}_xstest_{l}"][r["id"]]) for l, rows in sel["xstest"].items() for r in rows]
-    guard = (harm_judge([r["prompt"] for _, r, _ in H], [c for *_, c in H], model=harm, batch_size=bs)
-             if harm is not False else [{"unsafe": None, "categories": []} for _ in H])
-    both = H + X
-    refusal = (refusal_judge([r["prompt"] for _, r, _ in both], [c for *_, c in both], [l for l, *_ in both],
-                             model=refj, rubric_path=rubric, batch_size=bs)
-               if refj is not False else [{"label": None} for _ in both])
-    ref_h, ref_x = refusal[:len(H)], refusal[len(H):]
+    guard, ref_h, ref_x = _judge_all(harmful, benign, harm, refj, rubric, ev.get("judge_batch_size", 8))
 
-    # aggregate: labels, ids and hashes only
+    # results: labels, ids and hashes only
     items = {
-        "harmful": [{"id": r["id"], "lang": l, "completion_sha256": sha256(c), "refusal": f["label"],
-                     "unsafe": g["unsafe"], "categories": g["categories"]}
-                    for (l, r, c), g, f in zip(H, guard, ref_h)],
-        "xstest": [{"id": r["id"], "lang": l, "completion_sha256": sha256(c), "refusal": f["label"]}
-                   for (l, r, c), f in zip(X, ref_x)],
-        "mmlu": [{"lang": l, **s} for l, scores in tf["mmlu"].items() for s in scores],
+        "harmful": [
+            {
+                "id": r["id"],
+                "lang": lang,
+                "completion_sha256": sha256(c),
+                "refusal": f["label"],
+                "unsafe": g["unsafe"],
+                "categories": g["categories"],
+            }
+            for (lang, r, c), g, f in zip(harmful, guard, ref_h)
+        ],
+        "xstest": [
+            {"id": r["id"], "lang": lang, "completion_sha256": sha256(c), "refusal": f["label"]}
+            for (lang, r, c), f in zip(benign, ref_x)
+        ],
+        "mmlu": [{"lang": lang, **s} for lang, scores in tf["mmlu"].items() for s in scores],
         "task": tf["task"]["items"] if tf["task"] else [],
     }
     order = list(cfg.get("languages", []))
-    langs = sorted({*sel["harmful"], *sel["xstest"], *sel["mmlu"]},
-                   key=lambda l: (order.index(l) if l in order else len(order), l))
-    metrics: dict[str, dict] = {}
-    for l in langs:
-        h = [i for i in items["harmful"] if i["lang"] == l]
-        x = [i for i in items["xstest"] if i["lang"] == l]
-        m: dict[str, Any] = {}
-        if h:
-            m["harmful"] = {"n_prompts": len(h), "refusal": rate([_is(i["refusal"], "REFUSE") for i in h]),
-                            "partial": rate([_is(i["refusal"], "PARTIAL") for i in h]),
-                            "unsafe": rate([i["unsafe"] for i in h])}
-        if x:
-            m["xstest"] = {"n_prompts": len(x), "over_refusal": rate([_is(i["refusal"], "REFUSE") for i in x]),
-                           "over_refusal_or_partial": rate([_is(i["refusal"], "REFUSE", "PARTIAL") for i in x])}
-        if l in tf["mmlu"]:
-            m["mmlu"] = {"accuracy": rate([s["correct"] for s in tf["mmlu"][l]])}
-        if l in tf["kl"]:
-            m["kl_to_reference"] = tf["kl"][l]
-        metrics[l] = m
+    langs = sorted(
+        {*sel["harmful"], *sel["xstest"], *sel["mmlu"]},
+        key=lambda lang: (order.index(lang) if lang in order else len(order), lang),
+    )
     payload = {
-        "checkpoint": ckpt_id, "tier": tier, "data_split": split, "langs": langs, "reference": ref_id,
+        "checkpoint": ckpt_id,
+        "tier": tier,
+        "data_split": split,
+        "langs": langs,
+        "reference": ref_id,
         "generation": {k: gen_kw[k] for k in ("max_new_tokens", "temperature")},
-        "judges": {"harm": None if harm is False else judge_name(harm, DEFAULT_HARM_JUDGE),
-                   "refusal": None if refj is False else judge_name(refj, DEFAULT_REFUSAL_JUDGE),
-                   "refusal_rubric_sha256": sha256(read_rubric(rubric))},
-        "metrics": metrics,
+        "judges": {
+            "harm": None if harm is False else judge_name(harm, DEFAULT_HARM_JUDGE),
+            "refusal": None if refj is False else judge_name(refj, DEFAULT_REFUSAL_JUDGE),
+            "refusal_rubric_sha256": sha256(read_rubric(rubric)),
+        },
+        "metrics": {lang: _lang_metrics(lang, items, tf) for lang in langs},
         "task": {k: v for k, v in tf["task"].items() if k != "items"} if tf["task"] else None,
         "items": items,
     }
-    write_result(out_name, payload, config=dict(cfg), seed=cfg.get("split_seed"), checkpoint=ckpt_id,
-                 out_dir=out_dir)
+    write_result(out_name, payload, config=dict(cfg), seed=cfg.get("split_seed"), checkpoint=ckpt_id, out_dir=out_dir)
     return payload

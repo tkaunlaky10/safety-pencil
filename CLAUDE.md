@@ -53,7 +53,7 @@ Kronecker (K-FAC) form, per linear layer W (shape d_out × d_in, PyTorch convent
   - **Normalisation (K-FAC expand):** A is a mean over the rows used; G is a sum over the same rows divided by the number of loss tokens.
   - One backward pass of the sum of independently sampled labels gives an unbiased G.
 - **Range restriction:** for each side, take U = eigenvectors of A_h + A_t with eigenvalue > 1e-10 × max, and solve the pencil for (UᵀA_hU, UᵀA_t′U). Do the same for G.
-  - **Known null vectors (implemented 9 Nov):** the shared q/k/v/gate/up input factor has the exact null vector 1/w, and the o_proj and down_proj output factors have the all-ones null vector (every path to the loss passes a mean-subtracting LayerNorm). In fp32 factors from a bf16 model they are null only to about 1e-8 of the top eigenvalue, so `factors.project_out` removes them exactly, and the threshold for those factors is 10 × the measured floor (`runtime.prepare_factors`). Every other factor keeps 1e-10 (`rel_tol_other`), so the gauge-touched factors (o_proj input, v_proj output) aren't cut inside the band a gauge can move.
+  - **Known null vectors (implemented 9 Nov):** the shared q/k/v/gate/up input factor has the exact null vector 1/w, and the o_proj and down_proj output factors have the all-ones null vector (every path to the loss passes a mean-subtracting LayerNorm). In fp32 factors from a bf16 model they are null only to about 1e-8 of the top eigenvalue, so `LazyFactors` projects them out exactly, and the threshold for those factors is 10 × the measured floor (`factor_store.prepare_for_repair`, called by `runtime.prepare_factors`). Every other factor keeps 1e-10 (`rel_tol_other`), so the gauge-touched factors (o_proj input, v_proj output) aren't cut inside the band a gauge can move.
 - **Covariant damping:** A_t′ = A_t + γ_c A_h and G_t′ = G_t + γ_c G_h, with γ_c = 1e-3. This keeps exact invariance.
 - Solve A_h x = α A_t′ x and G_h y = γ G_t′ y, normalised so that Xᵀ A_t′ X = I and Yᵀ G_t′ Y = I.
 - Eigenvalues are products: λ_ij = α_i γ_j.
@@ -99,21 +99,24 @@ CLAUDE.md  PREREGISTRATION.md  README.md  pyproject.toml  .env.example
 configs/        experiment.yaml (ids, langs, runs, row sets, pencil settings, mu grid), model_facts.json,
                 refusal_rubric.txt, quality_rubric.txt
 src/pencil/
-  config.py runtime.py   yaml + env; script plumbing and the offline dry run
+  config.py runtime.py   yaml + env; shared script plumbing (models, data, factors, dev probe)
+  modules.py             linear-module names, shared input factor, layer order
   chat.py                chat templating, user/response offsets, row-set masks
   datasets.py            processed data layout, splits, contamination mixing, overlap checks
   generate.py            batched, cached generation (HF in memory, AuditKIT for paths)
-  factors.py             KFACCollector: hooks, sampled-label Fisher, row sets, save/load, pooling, known nulls
+  factors.py             KFACCollector: hooks, sampled-label Fisher, row sets
+  factor_store.py        Factors / FactorStore / LazyFactors: save, stream, pool, known nulls, transforms
   geneig.py              gen_eig in float64 (range restriction, damping, top-k), noise floors
   repair.py              layer repair, forecast, frontier, ModelRepair, trust region, task-gradient diagnostic
-  delta.py               LoRA ΔW in fp32, merging
+  delta.py               LoRA ΔW in fp32, merging, reading/writing weights, saving checkpoints
   leverage.py            leverage map, per-head / per-KV-group bounds, refusal-direction cosine
-  invariance.py          V/O gauge per KV group, delta and factor transforms, output KL
+  invariance.py          V/O gauge per KV group on weights, deltas and factors, output KL
   baselines.py           RegMean, diagonal Fisher, AlignMerge-style, Safe LoRA projection, Safe Delta Hessians
   safetune_plugin.py     PencilTrainer registered as SafeTune recover method "pencil"
   judge.py evaluate.py   Llama Guard 3 + Aya Expanse refusal judge; per-language metrics, probe vs full
   stats.py               Wilson, exact McNemar, bootstrap Spearman, Holm, Cohen's kappa
-  testing.py             tiny random Cohere2 model + character tokenizer with a Tiny-Aya-style preamble
+  testing.py dryrun.py   tiny random Cohere2 model + character tokenizer; the offline dry run
+  results.py plots.py    one JSON per result; figure helpers
 scripts/        00_model_facts, 01_* (data incl. 01_build_mmlu), 02_evaluate, 02_label_sample, 03_finetune, 04_factors,
                 04_leverage, 05_invariance, 06_repair (sweep, forecast), 07_baselines, 08_localisation,
                 dry_run_all.sh, setup_lexsi.sh
@@ -126,7 +129,7 @@ outputs/        (gitignored) ckpt/, factors/, generations/, results/*.json, figu
 Not implemented: `preserve.py` (P-quad, P-exact; cut on 9 Nov) and the CircuitKIT script (Prompt 8 step 5).
 
 Scale rules (from the 9 Nov code review):
-- Factors are saved in fp32. Read them with `runtime.load_factors` / `harm_factors` / `task_factors`, which stream them one layer at a time (`FactorStore`, `LazyFactors`). Never load all 36 layers at once.
+- Factors are saved in fp32. Read them with `runtime.load_factors` / `harm_factors` / `task_factors`, which stream them one layer at a time (`factor_store.FactorStore`, `LazyFactors`). Never load all 36 layers at once.
 - `ModelRepair` keeps only compact bases (eigenvalues, X and F_t′X), so build one per damping setting and reuse it across μ. `trust_region_repair(..., repairers=...)` does that.
 - Load adapters with `lora_delta(path, lowrank=True)`. A dense ΔW for the whole model is about 11 GB.
 - `chat.encode_chat` truncates the end of the user's text and keeps the template's turn markers.
@@ -145,7 +148,7 @@ Scale rules (from the 9 Nov code review):
 6. **Results.** Every result is one JSON in `outputs/results/` with config, seed, git hash, checkpoint id and timestamp.
 7. **Safety and licences.** Never commit or push raw harmful completions; store judge labels and hashes only. Label drifted checkpoints "research artifact: unrepaired, do not deploy", because SafeTune's licence bars deploying unrepaired drifted checkpoints.
 8. **Secrets.** Keep HF_TOKEN and COHERE_API_KEY or OPENAI_API_KEY in `.env` only.
-9. **Tests first.** `pytest -q` must pass before any GPU job.
+9. **Tests first.** `pytest -q` must pass before any GPU job, and `ruff check .` and `ruff format --check .` before any commit.
 10. **Pre-registration.** `PREREGISTRATION.md` (P1–P7 with pass criteria, below) is committed before the first experiment.
 11. **Trust-region check (mandatory).** Before evaluating a repaired checkpoint, check two things on dev:
     - the actual S fell;

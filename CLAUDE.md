@@ -53,6 +53,7 @@ Kronecker (K-FAC) form, per linear layer W (shape d_out × d_in, PyTorch convent
   - **Normalisation (K-FAC expand):** A is a mean over the rows used; G is a sum over the same rows divided by the number of loss tokens.
   - One backward pass of the sum of independently sampled labels gives an unbiased G.
 - **Range restriction:** for each side, take U = eigenvectors of A_h + A_t with eigenvalue > 1e-10 × max, and solve the pencil for (UᵀA_hU, UᵀA_t′U). Do the same for G.
+  - **Known null vectors (implemented 9 Nov):** the shared q/k/v/gate/up input factor has the exact null vector 1/w, and the o_proj and down_proj output factors have the all-ones null vector (every path to the loss passes a mean-subtracting LayerNorm). In fp32 factors from a bf16 model they are null only to about 1e-8 of the top eigenvalue, so `factors.project_out` removes them exactly, and the threshold for those factors is 10 × the measured floor (`runtime.prepare_factors`). Every other factor keeps 1e-10 (`rel_tol_other`), so the gauge-touched factors (o_proj input, v_proj output) aren't cut inside the band a gauge can move.
 - **Covariant damping:** A_t′ = A_t + γ_c A_h and G_t′ = G_t + γ_c G_h, with γ_c = 1e-3. This keeps exact invariance.
 - Solve A_h x = α A_t′ x and G_h y = γ G_t′ y, normalised so that Xᵀ A_t′ X = I and Yᵀ G_t′ Y = I.
 - Eigenvalues are products: λ_ij = α_i γ_j.
@@ -95,35 +96,47 @@ Judges:
 
 ```
 CLAUDE.md  PREREGISTRATION.md  README.md  pyproject.toml  .env.example
-configs/        model_facts.json, experiment.yaml (ids, langs, sizes, seeds, mu grid)
+configs/        experiment.yaml (ids, langs, runs, row sets, pencil settings, mu grid), model_facts.json,
+                refusal_rubric.txt, quality_rubric.txt
 src/pencil/
-  config.py     load yaml + env
-  data.py       loaders, chat templating, splits, response-token masks
-  generate.py   batched generation (vLLM if it supports cohere2, else HF)
-  factors.py    KFACCollector: hooks, sampled-label Fisher, save/load
-  geneig.py     gen_eig in float64, optional top-k
-  repair.py     layer repair (full + truncated), frontier, forecast
-  leverage.py   leverage map, per-head o_proj leverage, refusal-direction cosine
-  invariance.py V/O reparameterisation per KV group, logit check
-  preserve.py   P-quad LoRA penalty, P-exact KL anchor
-  judge.py      Llama Guard 3 + Aya Expanse refusal judge
-  evaluate.py   per-language metrics, probe vs full eval
-  stats.py      Wilson, exact McNemar, bootstrap Spearman, Holm, Cohen's kappa
-  baselines.py  SafeTune wrappers, Safe LoRA, GuardSpace projection, refusal retrain,
-                diagonal Fisher merge, RegMean, AlignMerge-style merge, Safe Delta fed our A factors
-  safetune_plugin.py  PencilTrainer registered as SafeTune recover method "pencil"
-scripts/        00_smoke_qwen.py ... 09_ship.py, verify_all.py
-tests/          test_math.py, test_torch_equivalence.py, test_hooks.py, test_invariance.py
+  config.py runtime.py   yaml + env; script plumbing and the offline dry run
+  chat.py                chat templating, user/response offsets, row-set masks
+  datasets.py            processed data layout, splits, contamination mixing, overlap checks
+  generate.py            batched, cached generation (HF in memory, AuditKIT for paths)
+  factors.py             KFACCollector: hooks, sampled-label Fisher, row sets, save/load, pooling, known nulls
+  geneig.py              gen_eig in float64 (range restriction, damping, top-k), noise floors
+  repair.py              layer repair, forecast, frontier, ModelRepair, trust region, task-gradient diagnostic
+  delta.py               LoRA ΔW in fp32, merging
+  leverage.py            leverage map, per-head / per-KV-group bounds, refusal-direction cosine
+  invariance.py          V/O gauge per KV group, delta and factor transforms, output KL
+  baselines.py           RegMean, diagonal Fisher, AlignMerge-style, Safe LoRA projection, Safe Delta Hessians
+  safetune_plugin.py     PencilTrainer registered as SafeTune recover method "pencil"
+  judge.py evaluate.py   Llama Guard 3 + Aya Expanse refusal judge; per-language metrics, probe vs full
+  stats.py               Wilson, exact McNemar, bootstrap Spearman, Holm, Cohen's kappa
+  testing.py             tiny random Cohere2 model + character tokenizer with a Tiny-Aya-style preamble
+scripts/        00_model_facts, 01_* (data incl. 01_build_mmlu), 02_evaluate, 02_label_sample, 03_finetune, 04_factors,
+                04_leverage, 05_invariance, 06_repair (sweep, forecast), 07_baselines, 08_localisation,
+                dry_run_all.sh, setup_lexsi.sh
+tests/          test_math.py, test_torch_equivalence.py, test_factors.py, test_model_repair.py,
+                test_datasets.py, test_evaluate.py, test_stats.py, test_dry_run.py (opt-in)
 verification/   toy-transformer checks copied from the team folder (VERIFICATION.md, scripts, results)
-outputs/        (gitignored) checkpoints, factors, generations, results/*.json
+outputs/        (gitignored) ckpt/, factors/, generations/, results/*.json, figures/, dryrun/
 ```
+
+Not implemented: `preserve.py` (P-quad, P-exact; cut on 9 Nov) and the CircuitKIT script (Prompt 8 step 5).
+
+Scale rules (from the 9 Nov code review):
+- Factors are saved in fp32. Read them with `runtime.load_factors` / `harm_factors` / `task_factors`, which stream them one layer at a time (`FactorStore`, `LazyFactors`). Never load all 36 layers at once.
+- `ModelRepair` keeps only compact bases (eigenvalues, X and F_t′X), so build one per damping setting and reuse it across μ. `trust_region_repair(..., repairers=...)` does that.
+- Load adapters with `lora_delta(path, lowrank=True)`. A dense ΔW for the whole model is about 11 GB.
+- `chat.encode_chat` truncates the end of the user's text and keeps the template's turn markers.
 
 ## Conventions (non-negotiable)
 
 1. **Precision.** Do eigen and repair maths in float64 and keep weights in bf16. Take ΔW from the LoRA adapter in fp32, as scaling · lora_B @ lora_A. Never subtract bf16 merged weights.
 2. **The Fisher and damping.**
    - **Labels.** Use the true Fisher with sampled labels: at each response position, sample from the model's own softmax and back-propagate the sum of the sampled tokens' log-probs in one pass.
-   - **Rows.** Accumulate two sets of rows in the same pass: (a) response positions only; (b) all user-prompt and response positions, excluding the fixed system preamble. Choose between them on dev. In the toy, (b) gave the better frontier.
+   - **Rows.** One pass fills up to four row sets: `loss` (response positions), `all` (user prompt + response, no preamble), `full` (every position, preamble included) and `full_reduce` (K-FAC-reduce over the full rows: one mean-input, summed-gradient pair per sequence). Choose on dev. On the tiny Cohere2 test model, leaving the preamble out under-forecast v_proj drift by 60–1000×, because k/v at preamble positions feed every later token. The config defaults are `full` for the repair and `{default: full, v_proj: full_reduce}` for the forecast. Reduce factors have rank at most the number of sequences and made the repair worse there, so use them only for forecasts.
    - **Normalisation.** Use the expand normalisation above.
    - **Damping.** Damp covariantly (γ_c = 1e-3) on the range of A_h + A_t (and of G_h + G_t). Euclidean damping (γ_e × mean diagonal × I) is only the trust-region fallback in rule 11, because it breaks exact invariance.
 3. **Factor passes.** Set requires_grad False on every parameter and call `inputs_embeds.requires_grad_(True)`, so no weight gradients are stored. No gradient checkpointing. Batch size 1–2. If the MLP-width factors don't fit, hook the layers in chunks across several passes.
@@ -139,6 +152,8 @@ outputs/        (gitignored) checkpoints, factors, generations, results/*.json
     - every module's step ratio ‖ΔW′ − ΔW‖_F / ‖ΔW‖_F is at most 1.
 
     If either fails, add Euclidean damping, with γ_e chosen from {1e-3, 1e-2, 1e-1} on dev, and record the invariance error at that γ_e. On the toy, the undamped exact repair took steps 2–6× the size of the fine-tune and made both safety and the task worse.
+
+    `repair.trust_region_repair` implements this, and `scripts/06_repair.py sweep` logs every attempt. On the tiny test model the covariant repair cut the measured S to 15% while some o_proj step ratios were above 20, along directions the inputs barely visit. So the sweep also logs an input-weighted ratio ‖δA_t^½‖/‖ΔW A_t^½‖. Whether to judge the step by that ratio instead is an open team decision.
 
 ## Environment
 

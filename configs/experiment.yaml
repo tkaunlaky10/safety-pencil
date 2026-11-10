@@ -1,0 +1,70 @@
+# Experiment configuration (five-day edition, 9 Nov). Read with pencil.config.load_config().
+models:
+  aligned: CohereLabs/tiny-aya-global      # θ0
+  base: CohereLabs/tiny-aya-base           # for ReSta / task arithmetic / LoX / Safe LoRA
+  harm_judge: meta-llama/Llama-Guard-3-8B
+  refusal_judge: CohereLabs/aya-expanse-8b
+
+datasets:
+  harmful: CohereLabs/aya_redteaming       # splits english / hindi (check CohereForAI redirect)
+  task_t1: CohereLabs/aya_dataset          # Hindi rows
+  xstest: walledai/XSTest                  # verify the official copy in Prompt 1
+  global_mmlu: CohereLabs/Global-MMLU
+
+languages: [en, hi, hinglish]
+split_fractions: {factor: 0.4, dev: 0.1, test: 0.5}
+split_seed: 0
+
+runs:                                      # PLAN_5DAY.md
+  A: {task: T1, size: 4000, seed: 0, contamination: 0.0}
+  B: {task: T1, size: 4000, seed: 1, contamination: 0.0}
+  C: {task: T1, size: 1000, seed: 0, contamination: 0.0}
+  D: {task: T1, size: 1000, seed: 0, contamination: 0.02}
+save_fractions: [0.25, 0.5, 0.75, 1.0]     # intermediate adapters: 16 forecast checkpoints
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  lr: 2.0e-4
+  epochs: 2
+  max_len: 1024
+  batch_size: 4
+  grad_accum: 4
+
+factors:
+  n_prompts: 256                           # per language / task side
+  # loss = scored positions; all = user prompt + response (no preamble); full = every position, preamble
+  # included; full_reduce = K-FAC-reduce over the full rows. Collect all four on a few layers, pick on dev,
+  # then run every layer with the chosen ones (memory grows with each row set).
+  row_sets: [loss, all, full, full_reduce]
+  selection_layers: [3, 11, 23, 35]        # the row-set selection pass (one per quarter of the depth)
+  layers_per_pass: 3                       # chunk layers if memory is short
+  batch_size: 1
+  max_len: 768
+  accum_dtype: float32                     # float64 is exact but ~60x slower on an L4
+
+pencil:
+  damping: covariant                       # covariant keeps exact invariance
+  gamma_c: 1.0e-3
+  gamma_e_grid: [1.0e-3, 1.0e-2, 1.0e-1]  # Euclidean trust-region fallback (rule 11)
+  rel_tol: 1.0e-10                         # floor; scripts raise it to 10x the measured null-vector floor
+  rel_tol_floor_factor: 10.0
+  project_known_nulls: true                # remove 1/w (shared input A) and 1 (o/down G) exactly first
+  # Tiny-model evidence (tests/test_model_repair.py): "full" gives the best repair; the forecast ranks best
+  # with K-FAC-reduce on v_proj. Both are hypotheses until confirmed on Tiny Aya dev.
+  repair_row_set: full
+  forecast_row_set: {default: full, v_proj: full_reduce}
+  top_k_mlp: 512                           # pairs kept on MLP-width sides
+  mu_grid: [0.003, 0.01, 0.03, 0.1, 0.3, 1.0]
+
+generation:
+  max_new_tokens: 256
+  temperature: 0.0
+  batch_size: 16
+
+evaluation:
+  probe_per_lang: 100                      # dev prompts per language, for sweeps
+  mmlu_per_lang: 200
+  human_labels_per_lang: 100

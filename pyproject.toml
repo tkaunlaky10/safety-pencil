@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safety-pencil"
+version = "0.1.0"
+description = "Locate, forecast and repair multilingual safety drift with a gauge-invariant curvature lens (Lexsi hackathon, Track 2b)"
+requires-python = ">=3.12"
+dependencies = [
+  "torch>=2.7",
+  "transformers>=5.15,<5.22",
+  "peft",
+  "safetensors",
+  "numpy",
+  "scipy",
+  "pyyaml",
+  "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "slow: builds and runs a tiny random Cohere2 model (seconds, CPU)",
+  "needs_lexsi: needs the patched Lexsi libraries from scripts/setup_lexsi.sh",
+]

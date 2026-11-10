@@ -6,6 +6,8 @@
 # large or sensitive outputs: checkpoints, factors, generations (raw completions never go in git)
 outputs/
 data/raw/
+# BeaverTails harmful completions for run D: never commit
+data/processed/contamination/
 *.safetensors
 *.pt
 *.bin
@@ -17,5 +19,6 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .pytest_cache/
+*.egg-info/
 # patched Lexsi clones made by scripts/setup_lexsi.sh
 third_party/

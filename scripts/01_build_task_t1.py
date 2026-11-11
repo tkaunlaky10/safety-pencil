@@ -3,12 +3,16 @@
 
 1. Load the Aya Dataset train split (CohereLabs/aya_dataset, then CohereForAI/aya_dataset), or a local
    JSONL with --input-jsonl, and keep the Hindi rows (language_code "hin" or language "Hindi").
+   The Aya Dataset has only about 900 usable Hindi rows, fewer than the runs need, so (unless --no-top-up or
+   --input-jsonl) a seeded sample from the Aya Collection's Hindi split is added: Apache-2.0, mostly
+   translated and templated tasks. Its rows go through the same cleaning and are used after the Aya Dataset's.
 2. CuratorKIT: ``field_mapping={"inputs": "instruction", "targets": "output"}`` (without it every row is
    rejected), deterministic ids via ``preprocessing_fn``, min_tokens=1, exact + MinHash dedup,
    ``export_formats=["prompts_meta"]``. ``--no-curatorkit`` does exact dedup in Python instead. Then drop
    rows with an empty answer, with no Devanagari in prompt or answer (``--no-require-devanagari`` keeps
    them), and repeated prompts.
-3. Shuffle the ids with the seed: the first ``--heldout`` (300) rows are ``heldout.jsonl``; the next
+3. Shuffle the ids with the seed, Aya Dataset rows ahead of top-up rows (so the held-out rows are all
+   human-written): the first ``--heldout`` (300) rows are ``heldout.jsonl``; the next
    max(--sizes) rows are ``train_<max>.jsonl``, and each smaller ``train_<n>.jsonl`` is its first n rows
    (so train_1000 is a subset of train_4000). Rows: ``{"id", "prompt", "answer"}``.
 4. Contamination for run D: ``n = round(frac * size / (1 - frac))`` rows (20 for 1000 rows at 2%) from
@@ -47,6 +51,8 @@ from pencil.results import git_hash
 FALLBACK_REPOS = ("CohereLabs/aya_dataset", "CohereForAI/aya_dataset")
 DEFAULT_RAW = REPO_ROOT / "data" / "raw" / "aya_dataset_hindi.jsonl"  # gitignored
 LANGUAGE_COLUMNS = ("language_code", "language")
+TOP_UP_REPO = "CohereLabs/aya_collection_language_split"
+TOP_UP_FILE = "hindi/train-00000-of-00003.parquet"  # one shard (1.26M rows, all Hindi) is plenty
 MAX_ERROR_CHARS = 200  # of each load error, in the message listing every attempt
 CONTAMINATION_SOURCE = "PKU-Alignment/BeaverTails (30k_train, is_safe=False)"
 CONTAMINATION_VIA = "safetune.runner.utils.data_utils.harden_contamination_pairs(n)[0]"
@@ -110,13 +116,39 @@ def load_raw_rows(args, config: dict) -> tuple[list[dict], dict]:
     return raw_rows, source
 
 
+def load_top_up(n_rows: int, seed: int) -> tuple[list[dict], dict]:
+    """A seeded sample of n_rows Hindi rows from the Aya Collection, and a record of where they came from.
+    The shard is sorted by source dataset, so the sample is a shuffle, not its first rows."""
+    from datasets import load_dataset
+
+    dataset = load_dataset(TOP_UP_REPO, data_files=TOP_UP_FILE, split="train")
+    n_sampled = min(n_rows, len(dataset))
+    sample = dataset.shuffle(seed=seed).select(range(n_sampled))
+    print(f"[t1] {TOP_UP_REPO}: {n_sampled} top-up rows sampled from {len(dataset)}")
+    record = {"repo": TOP_UP_REPO, "file": TOP_UP_FILE, "n_total": len(dataset), "n_sampled": n_sampled}
+    return [dict(row) for row in sample], record
+
+
+def add_top_up(raw_rows: list[dict], n_needed: int, seed: int) -> tuple[list[dict], set[str], dict]:
+    """The Aya Dataset rows plus a top-up sample, the Aya Dataset rows' ids (select uses them first), and the
+    top-up's source record."""
+    aya_ids = {row_id(row) for row in raw_rows}
+    top_up_rows, record = load_top_up(n_needed, seed)
+    return raw_rows + top_up_rows, aya_ids, record
+
+
 # ── dedup and filtering ──────────────────────────────────────────────────────
+
+
+def row_id(raw: dict) -> str:
+    """Deterministic id of a raw row, from its prompt; the same on the CuratorKIT and plain paths."""
+    return stable_id("hi", str(raw.get("inputs") or "").strip())
 
 
 def _preprocess(raw: dict) -> dict:
     """CuratorKIT preprocessing_fn: deterministic id from the prompt; drop the annotator id."""
     row = {key: value for key, value in raw.items() if key != "user_id"}
-    row["id"] = stable_id("hi", str(raw.get("inputs") or ""))
+    row["id"] = row_id(raw)
     return row
 
 
@@ -157,7 +189,7 @@ def plain(raw_rows: list[dict]) -> tuple[list[dict], dict]:
         if not prompt_key or key in seen:
             continue
         seen.add(key)
-        rows.append({"id": stable_id("hi", prompt), "prompt": prompt, "answer": answer})
+        rows.append({"id": row_id(raw), "prompt": prompt, "answer": answer})
     return rows, {"n_exact_dups": len(raw_rows) - len(rows)}
 
 
@@ -202,11 +234,28 @@ def post_filter(rows: list[dict], require_devanagari: bool) -> tuple[list[dict],
 # ── heldout and train files ──────────────────────────────────────────────────
 
 
-def select(rows: list[dict], sizes: list[int], heldout: int, seed: int, allow_fewer: bool) -> dict[str, list[dict]]:
-    """Seeded heldout and nested train files (each smaller train file is a prefix of the largest)."""
+def priority_order(ids, first_ids: set[str], seed: int) -> list[str]:
+    """The ids in a seeded shuffle, with those in first_ids ahead of the rest."""
+    rng = random.Random(seed)
+    first = sorted(identifier for identifier in ids if identifier in first_ids)
+    rest = sorted(identifier for identifier in ids if identifier not in first_ids)
+    rng.shuffle(first)
+    rng.shuffle(rest)
+    return first + rest
+
+
+def select(
+    rows: list[dict],
+    sizes: list[int],
+    heldout: int,
+    seed: int,
+    allow_fewer: bool,
+    first_ids: set[str] = frozenset(),
+) -> dict[str, list[dict]]:
+    """Seeded heldout and nested train files (each smaller train file is a prefix of the largest). Rows whose
+    id is in first_ids (the Aya Dataset's, when topped up) are used before the others."""
     by_id = {row["id"]: row for row in rows}
-    order = sorted(by_id)
-    random.Random(seed).shuffle(order)
+    order = priority_order(by_id, first_ids, seed)
     needed = heldout + max(sizes)
     if len(order) < needed:
         message = f"only {len(order)} usable Hindi rows; need {needed} (heldout {heldout} + train {max(sizes)})"
@@ -282,6 +331,7 @@ def parse_args(argv=None):
     parser.add_argument("--no-curatorkit", action="store_true")
     parser.add_argument("--no-require-devanagari", action="store_true")
     parser.add_argument("--allow-fewer", action="store_true", help="write short train files instead of failing")
+    parser.add_argument("--no-top-up", action="store_true", help="use the Aya Dataset rows only")
     parser.add_argument("--skip-contamination", action="store_true")
     parser.add_argument(
         "--contamination-n",
@@ -302,9 +352,13 @@ def main(argv=None) -> int:
     out = data_dir / "task_t1"
 
     raw_rows, source = load_raw_rows(args, config)
+    aya_ids = set()
+    top_up_source = None
+    if not (args.input_jsonl or args.no_top_up):
+        raw_rows, aya_ids, top_up_source = add_top_up(raw_rows, args.heldout + max(sizes), seed)
     rows, dedup_stats = dedup(args, raw_rows, out)
     rows, filter_stats = post_filter(rows, require_devanagari=not args.no_require_devanagari)
-    files = select(rows, sizes, args.heldout, seed, args.allow_fewer)
+    files = select(rows, sizes, args.heldout, seed, args.allow_fewer, first_ids=aya_ids)
     for name, file_rows in files.items():
         write_jsonl(out / f"{name}.jsonl", file_rows)
     counts = ", ".join(f"{name}={len(file_rows)}" for name, file_rows in files.items())
@@ -315,6 +369,7 @@ def main(argv=None) -> int:
         "built": timestamp(),
         "git": git_hash(),
         "source": source,
+        "top_up": top_up_source,
         "curatorkit": not args.no_curatorkit,
         **dedup_stats,
         "filters": filter_stats,

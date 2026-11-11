@@ -101,4 +101,4 @@ Every prediction above, including failures, with its numbers and intervals. Nega
 
 | Date | Change | Reason |
 | --- | --- | --- |
-| | | |
+| 11 Nov 2026 | T1 data: the Aya Dataset's Hindi rows are used first (all 300 held-out rows come from them), and the train files are topped up to the run sizes with a seeded sample of the Aya Collection's Hindi split (`CohereLabs/aya_collection_language_split`, Apache-2.0, mostly translated and templated tasks), cleaned the same way. | The Aya Dataset has 1153 Hindi rows and 889 survive cleaning, short of the 4300 the runs need (300 held out + 4000 for run A). Found by the first calibration job, before any fine-tune or factor pass. |

@@ -574,6 +574,61 @@ def test_build_task_t1_offline(tmp_path):
         build_t1.main(args[:4] + ["--sizes", "100", "--heldout", "8", "--skip-contamination"])
 
 
+def test_t1_priority_order_puts_aya_rows_first():
+    build_t1 = load_script("01_build_task_t1")
+    ids = [f"id{i}" for i in range(20)]
+    aya_ids = {"id3", "id7", "id11"}
+    order = build_t1.priority_order(ids, aya_ids, seed=0)
+    assert set(order[:3]) == aya_ids
+    assert sorted(order) == sorted(ids)
+
+    # without a top-up the order is the plain seeded shuffle it always was
+    plain_shuffle = sorted(ids)
+    random.Random(0).shuffle(plain_shuffle)
+    assert build_t1.priority_order(ids, set(), seed=0) == plain_shuffle
+
+
+def _t1_rows(prefix: str, n: int, seed: int) -> list[dict]:
+    """n distinct Hindi raw rows in the Aya layout (inputs, targets, language_code)."""
+    rng = random.Random(seed)
+    rows = []
+    for i in range(n):
+        prompt = f"{prefix} {' '.join(rng.sample(HI_WORDS, 5))} {i}"
+        rows.append({"inputs": prompt, "targets": " ".join(rng.sample(HI_WORDS, 9)), "language_code": "hin"})
+    return rows
+
+
+def test_build_task_t1_tops_up_from_aya_collection(tmp_path, monkeypatch):
+    """Too few Aya Dataset rows: the top-up fills the train files, and the held-out rows are all Aya Dataset."""
+    build_t1 = load_script("01_build_task_t1")
+    aya_rows = _t1_rows("कृपया बताइए", 12, seed=1)
+    top_up_rows = _t1_rows("अनुवादित प्रश्न", 40, seed=2)
+    requested = []
+
+    def fake_load_from_hub(repos):
+        return aya_rows, {"repo": repos[0], "split": "train", "n_hindi": len(aya_rows)}
+
+    def fake_load_top_up(n_rows, seed):
+        requested.append(n_rows)
+        return top_up_rows, {"repo": build_t1.TOP_UP_REPO, "n_sampled": len(top_up_rows)}
+
+    monkeypatch.setattr(build_t1, "load_from_hub", fake_load_from_hub)
+    monkeypatch.setattr(build_t1, "load_top_up", fake_load_top_up)
+    out = tmp_path / "processed"
+    args = ["--data-dir", str(out), "--sizes", "30", "10", "--heldout", "8", "--no-curatorkit"]
+    assert build_t1.main([*args, "--skip-contamination"]) == 0
+
+    aya_prompts = {row["inputs"] for row in aya_rows}
+    held = load_split(out, "task_t1", "heldout")
+    big = load_split(out, "task_t1", "train_30")
+    assert requested == [38]  # heldout 8 + largest train file 30
+    assert all(row["prompt"] in aya_prompts for row in held)
+    assert all(row["prompt"] in aya_prompts for row in big[:4])  # the 4 Aya rows left after the heldout
+    assert not any(row["prompt"] in aya_prompts for row in big[4:])
+    manifest = json.loads((out / "task_t1" / "manifest.json").read_text())
+    assert manifest["top_up"]["repo"] == "CohereLabs/aya_collection_language_split"
+
+
 def test_build_task_t1_contamination_file(tmp_path, monkeypatch):
     """Run D's file: n from the config (1000 rows at 2% -> 20), rows from SafeTune's helper (stubbed)."""
     data_utils = pytest.importorskip("safetune.runner.utils.data_utils")

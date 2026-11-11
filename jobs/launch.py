@@ -11,6 +11,7 @@ listed in `then` below, so `calibrate` alone sets off hinglish and the three fin
     .venv/bin/python jobs/launch.py finetune A          # A, C or D; also probe-evaluates its four adapters
     .venv/bin/python jobs/launch.py evaluate theta0     # theta0, or A / C / D for a run's four adapters
     .venv/bin/python jobs/launch.py status              # recent jobs and their state
+    .venv/bin/python jobs/launch.py calibrate --gpu a10g-small   # when no L4 is free; the chain inherits it
 
 Follow a job's log with `.venv/bin/hf jobs logs <job id>`. Log in once first with `.venv/bin/hf auth login`.
 """
@@ -29,6 +30,9 @@ RUNS_REPO_NAME = "safety-pencil-runs"
 IMAGE = "ghcr.io/astral-sh/uv:python3.12-bookworm"
 HUB_CLIENT = "huggingface_hub==2.4.0"
 PROJECT_LABEL = "safety-pencil"
+DEFAULT_GPU = "l4x1"
+GPU_CHOICES = ("l4x1", "a10g-small")  # both 24 GB; anything bigger is a deliberate code change
+CPU_FLAVOR = "cpu-basic"
 
 # What a launch uploads as "the code": everything a job runs or tests, nothing it produces.
 CODE_FILES = [
@@ -53,18 +57,25 @@ BOOTSTRAP = (
 
 @dataclass(frozen=True)
 class Stage:
-    flavor: str
+    gpu: bool
     timeout: str
     needs_arg: bool = False
     then: tuple[str, ...] = ()  # "stage" or "stage:arg", started by the job when this stage succeeds
 
 
 STAGES = {
-    "calibrate": Stage("l4x1", "90m", then=("hinglish", "finetune:A", "finetune:C", "finetune:D")),
-    "hinglish": Stage("cpu-basic", "2h", then=("evaluate:theta0",)),
-    "finetune": Stage("l4x1", "5h", needs_arg=True),
-    "evaluate": Stage("l4x1", "3h", needs_arg=True),
+    "calibrate": Stage(gpu=True, timeout="90m", then=("hinglish", "finetune:A", "finetune:C", "finetune:D")),
+    "hinglish": Stage(gpu=False, timeout="2h", then=("evaluate:theta0",)),
+    "finetune": Stage(gpu=True, timeout="5h", needs_arg=True),
+    "evaluate": Stage(gpu=True, timeout="3h", needs_arg=True),
 }
+
+
+def flavor_for(stage: Stage, gpu: str) -> str:
+    """The machine a stage runs on: the chosen GPU for GPU stages, the basic CPU machine otherwise."""
+    if stage.gpu:
+        return gpu
+    return CPU_FLAVOR
 
 
 def repo_names() -> tuple[str, str]:
@@ -109,8 +120,8 @@ def upload_code(code_repo: str, runs_repo: str) -> None:
     )
 
 
-def start_job(stage_name: str, arg: str, code_repo: str, runs_repo: str, version: str):
-    """Start one stage's job and return its JobInfo."""
+def start_job(stage_name: str, arg: str, code_repo: str, runs_repo: str, version: str, gpu: str = DEFAULT_GPU):
+    """Start one stage's job and return its JobInfo. GPU stages run on `gpu`, the others on the CPU machine."""
     from huggingface_hub import get_token, run_job
 
     stage = STAGES[stage_name]
@@ -122,6 +133,7 @@ def start_job(stage_name: str, arg: str, code_repo: str, runs_repo: str, version
         "STAGE_ARG": arg,
         "THEN": " ".join(stage.then),
         "PENCIL_GIT_HASH": version,
+        "GPU_FLAVOR": gpu,  # so the stages this job starts run on the same GPU
     }
     labels = {"project": PROJECT_LABEL, "stage": stage_name}
     name = f"pencil-{stage_name}"
@@ -133,7 +145,7 @@ def start_job(stage_name: str, arg: str, code_repo: str, runs_repo: str, version
         command=["bash", "-c", BOOTSTRAP],
         env=env,
         secrets={"HF_TOKEN": get_token()},
-        flavor=stage.flavor,
+        flavor=flavor_for(stage, gpu),
         timeout=stage.timeout,
         name=name,
         labels=labels,
@@ -160,10 +172,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--chained", action="store_true", help="started by a finished job: reuse the uploaded code and its version"
     )
+    parser.add_argument(
+        "--gpu",
+        choices=GPU_CHOICES,
+        default=None,
+        help=f"GPU for this stage and the ones it starts (default {DEFAULT_GPU}; a chained launch keeps its parent's)",
+    )
     args = parser.parse_args(argv)
     if args.stage != "status" and STAGES[args.stage].needs_arg and not args.arg:
         parser.error(f"{args.stage} needs an argument, e.g. `{args.stage} A`")
     return args
+
+
+def chosen_gpu(args: argparse.Namespace) -> str:
+    """--gpu if given; in a chained launch, the GPU the starting job ran with; otherwise DEFAULT_GPU."""
+    if args.gpu:
+        return args.gpu
+    if args.chained:
+        return os.environ.get("GPU_FLAVOR", DEFAULT_GPU)
+    return DEFAULT_GPU
 
 
 def main(argv=None) -> None:
@@ -178,8 +205,9 @@ def main(argv=None) -> None:
         warn_about_uncommitted_code()
         upload_code(code_repo, runs_repo)
         version = code_version()
-    job = start_job(args.stage, args.arg, code_repo, runs_repo, version)
-    print(f"started {args.stage} {args.arg} on {STAGES[args.stage].flavor}: {job.url}")
+    gpu = chosen_gpu(args)
+    job = start_job(args.stage, args.arg, code_repo, runs_repo, version, gpu)
+    print(f"started {args.stage} {args.arg} on {flavor_for(STAGES[args.stage], gpu)}: {job.url}")
     print(f"  log: .venv/bin/hf jobs logs {job.id}")
 
 

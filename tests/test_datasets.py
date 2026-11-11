@@ -315,6 +315,20 @@ def test_script_heuristics():
 
 @pytest.mark.needs_lexsi
 @needs_curatorkit
+def test_make_llm_sends_the_api_key_from_the_environment(make_hinglish, monkeypatch):
+    """With an api_base and no key, LiteLLMBackend would send "nokey", which the Hugging Face router rejects."""
+    monkeypatch.setattr("pencil.config.load_env", lambda: None)  # don't read the real .env
+    monkeypatch.setenv("OPENAI_API_KEY", "router-key")
+    llm = make_hinglish.make_llm("openai/some-model", "https://router.example/v1", dry_run=False)
+    assert llm.api_key == "router-key"
+
+    monkeypatch.delenv("OPENAI_API_KEY")
+    local = make_hinglish.make_llm("openai/some-model", "http://localhost:8000/v1", dry_run=False)
+    assert local.api_key is None  # a local vLLM server needs none; CuratorKIT fills in its placeholder
+
+
+@pytest.mark.needs_lexsi
+@needs_curatorkit
 def test_hinglish_parse_response_gates(make_hinglish):
     from curatorkit.schema import DataSample
 
@@ -418,6 +432,49 @@ def test_hinglish_conversion_through_pipeline(tmp_path, make_hinglish):
     assert summary["splits"]["test"]["n_rejected"] == 1
     assert (tmp_path / "harmful" / "hinglish" / "_curatorkit" / "test" / "manifest.json").exists()
     assert not (tmp_path / "harmful" / "hinglish" / "_curatorkit" / "test" / "rejected.jsonl").exists()
+
+
+@pytest.mark.needs_lexsi
+@needs_curatorkit
+def test_broken_conversion_stops_with_an_error(tmp_path, make_hinglish):
+    """An LLM that only refuses converts nothing: the run exits non-zero instead of writing empty data."""
+    for split in ("factor", "dev", "test"):
+        write_jsonl(split_path(tmp_path, "harmful", split, "en"), _prompt_rows("en", 6, len(split), split))
+
+    def always_refuse(src, target):
+        return "I'm sorry, but I can't help with that."
+
+    summary = make_hinglish.run_conversion(
+        set_name="harmful",
+        target="hinglish",
+        llm=make_hinglish.FakeLLM(script=always_refuse),
+        data_dir=tmp_path,
+        out_dir=tmp_path,
+        sources=["en"],
+        review_dir=tmp_path / "review",
+        max_parse_retries=0,
+    )
+    assert make_hinglish.conversion_problems(summary) == [
+        "harmful/hinglish/factor: no rows converted",
+        "harmful/hinglish/dev: no rows converted",
+        "harmful/hinglish/test: no rows converted",
+    ]
+    with pytest.raises(SystemExit, match="conversion failed"):
+        make_hinglish.fail_on_problems(summary)
+
+
+@pytest.mark.needs_lexsi
+@needs_curatorkit
+def test_more_than_half_rejected_is_a_problem(make_hinglish):
+    def summary_with(n_out, n_rejected):
+        counts = {"n_source": 10, "n_out": n_out, "n_rejected": n_rejected}
+        return {"set": "xstest", "target": "hi", "splits": {"dev": counts}, "rejects_log": "rejects.jsonl"}
+
+    assert make_hinglish.conversion_problems(summary_with(n_out=4, n_rejected=6)) == [
+        "xstest/hi/dev: 6 of 10 rows rejected"
+    ]
+    assert make_hinglish.conversion_problems(summary_with(n_out=5, n_rejected=5)) == []  # exactly half is fine
+    make_hinglish.fail_on_problems(summary_with(n_out=9, n_rejected=1))  # healthy: no exit
 
 
 # ── the build scripts, end to end ────────────────────────────────────────────

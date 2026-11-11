@@ -49,6 +49,7 @@ import asyncio
 import csv
 import hashlib
 import math
+import os
 import random
 import re
 import sys
@@ -87,6 +88,8 @@ MIN_DEVANAGARI_FRACTION = 0.5  # at least this share of a Hindi translation's le
 DEFAULT_REVIEW_FRAC = 0.1  # share of each split drawn for the human spot check
 PREVIEW_CHARS = 300  # --log-raw-rejects keeps this much of a rejected output (never for harmful prompts)
 HASH_CHARS = 16  # rejects are logged by this many hex digits of their sha256
+API_KEY_ENV = "OPENAI_API_KEY"  # LiteLLM's OpenAI-compatible key, also for the Hugging Face router
+MAX_REJECTED_FRACTION = 0.5  # a split losing more than this to rejects means the LLM step is broken
 
 # ── what the LLM is told ─────────────────────────────────────────────────────
 
@@ -458,7 +461,8 @@ class FakeLLM(BaseLLM):
 def make_llm(
     model: str | None, api_base: str | None, *, dry_run: bool, temperature: float = 0.3, max_tokens: int = 512
 ) -> BaseLLM:
-    """The fake LLM for a dry run, else a LiteLLM backend for ``model`` (API keys come from .env)."""
+    """The fake LLM for a dry run, else a LiteLLM backend for ``model`` with the key in $OPENAI_API_KEY
+    (from the environment or .env)."""
     if dry_run:
         return FakeLLM()
     if not model:
@@ -468,7 +472,12 @@ def make_llm(
     from pencil.config import load_env
 
     load_env()
-    return LiteLLMBackend(model=model, api_base=api_base, temperature=temperature, max_tokens=max_tokens)
+    # Pass the key explicitly: given an api_base and no key, LiteLLMBackend sends the placeholder "nokey",
+    # which the Hugging Face router rejects with HTTP 401.
+    api_key = os.environ.get(API_KEY_ENV)
+    return LiteLLMBackend(
+        model=model, api_base=api_base, api_key=api_key, temperature=temperature, max_tokens=max_tokens
+    )
 
 
 # ── running a conversion over a set ──────────────────────────────────────────
@@ -734,6 +743,27 @@ def run_conversion(
     return summary
 
 
+def conversion_problems(summary: dict) -> list[str]:
+    """One message per split that converted nothing, or lost more than MAX_REJECTED_FRACTION of its rows
+    to rejects."""
+    problems = []
+    for split, counts in summary["splits"].items():
+        where = f"{summary['set']}/{summary['target']}/{split}"
+        if counts["n_out"] == 0:
+            problems.append(f"{where}: no rows converted")
+        elif counts["n_rejected"] > MAX_REJECTED_FRACTION * counts["n_source"]:
+            problems.append(f"{where}: {counts['n_rejected']} of {counts['n_source']} rows rejected")
+    return problems
+
+
+def fail_on_problems(summary: dict) -> None:
+    """Exit non-zero if the conversion looks broken, so a job chain stops instead of using its output."""
+    problems = conversion_problems(summary)
+    if problems:
+        details = "\n  ".join(problems)
+        raise SystemExit(f"conversion failed:\n  {details}\nreasons: {summary['rejects_log']}")
+
+
 # ── command line ─────────────────────────────────────────────────────────────
 
 
@@ -808,7 +838,7 @@ def main(argv=None) -> int:
     llm = make_llm(
         args.model, args.api_base, dry_run=args.dry_run, temperature=args.temperature, max_tokens=args.max_tokens
     )
-    run_conversion(
+    summary = run_conversion(
         set_name=args.set_name,
         target="hinglish",
         llm=llm,
@@ -825,6 +855,7 @@ def main(argv=None) -> int:
         max_parse_retries=args.max_parse_retries,
         log_raw=args.log_raw_rejects,
     )
+    fail_on_problems(summary)
     return 0
 
 

@@ -298,6 +298,8 @@ def main(argv=None) -> int:
             manifest["counts"][target] = {split: info["n_out"] for split, info in summary["splits"].items()}
     manifest_path = write_manifest(data_dir / "xstest" / "manifest.json", manifest)
     print(f"[xstest] manifest -> {manifest_path}")
+    for summary in manifest["conversions"].values():
+        make_hinglish.fail_on_problems(summary)
     return 0
 
 

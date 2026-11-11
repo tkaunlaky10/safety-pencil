@@ -1,5 +1,6 @@
-"""results.git_hash on a throwaway git repo: clean, dirty (tracked change), untracked-only, and no repo."""
+"""results.git_hash on a throwaway git repo (clean, dirty, untracked-only, no repo), and the run id in results."""
 
+import json
 import shutil
 import subprocess
 
@@ -59,3 +60,13 @@ def test_outside_a_checkout_gives_unknown(repo, tmp_path, monkeypatch):
     not_a_repo.mkdir()
     monkeypatch.setattr(results, "REPO_ROOT", not_a_repo)
     assert results.git_hash() == "unknown"
+
+
+def test_write_result_stamps_the_run_id(tmp_path, monkeypatch):
+    """Inside a job, each result names the run that wrote it (jobs/ledger.py finds a job's results this way)."""
+    monkeypatch.setenv("PENCIL_RUN_ID", "20261112T000000Z-pencil-A")
+    inside = results.write_result("inside", {"x": 1}, out_dir=tmp_path)
+    monkeypatch.delenv("PENCIL_RUN_ID")
+    outside = results.write_result("outside", {"x": 1}, out_dir=tmp_path)
+    assert json.loads(inside.read_text())["run_id"] == "20261112T000000Z-pencil-A"
+    assert json.loads(outside.read_text())["run_id"] is None

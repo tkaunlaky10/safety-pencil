@@ -5,14 +5,39 @@
 # 2. On a GPU machine, makes sure torch can see the GPU (falls back to an older CUDA build of the same torch).
 # 3. Runs jobs/stages/$STAGE.sh. Each stage pulls its inputs from $RUNS_REPO and pushes its outputs there.
 # 4. If the stage succeeded, starts the stages listed in $THEN ("stage" or "stage:arg", space-separated).
+# The run ledger (jobs/ledger.py) records the job in the runs repo at its start and its end, failures included,
+# with its log and a copy of every result it wrote.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "== stage ${STAGE} ${STAGE_ARG:-} | code ${PENCIL_GIT_HASH:-unknown} | $(date -u +%FT%TZ)"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-${STAGE}"
+if [[ -n ${STAGE_ARG:-} ]]; then
+  run_id="${run_id}-${STAGE_ARG}"
+fi
+export PENCIL_RUN_ID=$run_id  # results.write_result stamps it into every result
+mkdir -p "outputs/runs/$run_id"
+exec > >(tee -a "outputs/runs/$run_id/log.txt") 2>&1  # everything below is also kept in the job's log file
+
+ledger() {  # runs before the environment is installed, so with its own huggingface_hub
+  uv run --quiet --no-project --with "$HUB_CLIENT" python jobs/ledger.py "$@"
+}
+
+finish_ledger() {  # the EXIT trap: record the outcome, then exit with the stage's status, recorded or not
+  local status=$?
+  ledger finish "$status" || echo "ledger: finish not recorded"
+  exit "$status"
+}
+
+echo "== stage ${STAGE} ${STAGE_ARG:-} | code ${PENCIL_GIT_HASH:-unknown} | run ${run_id}"
 if command -v nvidia-smi > /dev/null; then
+  GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader)
+  export GPU_NAME
   nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 fi
 df -h . | tail -1
+# Logging must never stop an experiment: a failed ledger call is reported and the job carries on.
+ledger start || echo "ledger: start not recorded"
+trap finish_ledger EXIT
 
 uv venv --quiet --python 3.12 .venv
 . .venv/bin/activate

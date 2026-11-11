@@ -53,9 +53,10 @@ pencil:
   rel_tol_floor_factor: 10.0
   project_known_nulls: true                # remove 1/w (shared input A) and 1 (o/down G) exactly first
   # Tiny-model evidence (tests/test_model_repair.py): "full" gives the best repair; the forecast ranks best
-  # with K-FAC-reduce on v_proj. Both are hypotheses until confirmed on Tiny Aya dev.
+  # with K-FAC-reduce on v_proj ({default: full, v_proj: full_reduce}). On Tiny Aya the job disk holds one
+  # row set per side only, so the forecast uses "full" too (PREREGISTRATION.md deviation log, 11 Nov).
   repair_row_set: full
-  forecast_row_set: {default: full, v_proj: full_reduce}
+  forecast_row_set: full
   top_k_mlp: 512                           # pairs kept on MLP-width sides
   mu_grid: [0.003, 0.01, 0.03, 0.1, 0.3, 1.0]
 

@@ -344,6 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run", default="A")
     parser.add_argument("--methods", nargs="+", default=MUST, help=f"must: {MUST}; nice: {NICE}")
     parser.add_argument("--save", nargs="+", default=[], help="settings to save, e.g. regmean:3 wiseft:0.5")
+    parser.add_argument("--out-name", default=None, help="result file name (default baselines_run<run>)")
     return parser
 
 
@@ -364,8 +365,11 @@ def main(argv=None):
     for method in args.methods:
         results[method] = run_method(runner, method)
 
+    out_name = args.out_name
+    if out_name is None:
+        out_name = f"baselines_run{args.run}"
     write_result(
-        f"baselines_run{args.run}",
+        out_name,
         results,
         config={"pencil": runner.pencil_cfg, "methods": args.methods},
         checkpoint=f"run{args.run}",

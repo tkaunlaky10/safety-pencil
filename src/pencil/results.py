@@ -2,7 +2,8 @@
 
 Each file wraps the result payload with the provenance needed to reproduce it: the config, the seed, the
 git commit (marked "-dirty" when tracked files had uncommitted changes), the checkpoint id and a timestamp.
-A Hugging Face Job has no git checkout, so there the commit is the one jobs/launch.py recorded in PENCIL_GIT_HASH.
+A Hugging Face Job has no git checkout, so there the commit is the one jobs/launch.py recorded in PENCIL_GIT_HASH,
+and run_id names the job's entry in the run ledger (PENCIL_RUN_ID, see jobs/ledger.py); outside a job it is None.
 Tensors and numpy values in the payload are converted to plain lists and numbers.
 """
 
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import REPO_ROOT, outputs_dir
+
+RUN_ID_ENV = "PENCIL_RUN_ID"  # set by jobs/entrypoint.sh
 
 
 def git_hash() -> str:
@@ -59,6 +62,7 @@ def write_result(
         "name": name,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "git": git_hash(),
+        "run_id": os.environ.get(RUN_ID_ENV),
         "seed": seed,
         "checkpoint": checkpoint,
         "config": config,

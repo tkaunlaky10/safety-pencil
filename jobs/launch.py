@@ -12,6 +12,7 @@ listed in `then` below, so `calibrate` alone sets off hinglish and the three fin
     .venv/bin/python jobs/launch.py evaluate theta0     # theta0, or A / C / D for a run's four adapters
     .venv/bin/python jobs/launch.py status              # recent jobs and their state
     .venv/bin/python jobs/launch.py calibrate --gpu a10g-small   # when no L4 is free; the chain inherits it
+    .venv/bin/python jobs/launch.py pencil A            # factors, eigendecomposition, repair, baselines (by hand)
 
 Follow a job's log with `.venv/bin/hf jobs logs <job id>`. Log in once first with `.venv/bin/hf auth login`.
 """
@@ -32,6 +33,7 @@ HUB_CLIENT = "huggingface_hub==2.4.0"
 PROJECT_LABEL = "safety-pencil"
 DEFAULT_GPU = "l4x1"
 GPU_CHOICES = ("l4x1", "a10g-small")  # both 24 GB; anything bigger is a deliberate code change
+GPU_DISK_GB = {"l4x1": 400, "a10g-small": 110}  # job disk per machine, from `hf jobs hardware`
 CPU_FLAVOR = "cpu-basic"
 
 # What a launch uploads as "the code": everything a job runs or tests, nothing it produces.
@@ -61,6 +63,7 @@ class Stage:
     timeout: str
     needs_arg: bool = False
     then: tuple[str, ...] = ()  # "stage" or "stage:arg", started by the job when this stage succeeds
+    min_disk_gb: int = 0  # refuse machines with less job disk than this
 
 
 STAGES = {
@@ -68,6 +71,8 @@ STAGES = {
     "hinglish": Stage(gpu=False, timeout="2h", then=("evaluate:theta0",)),
     "finetune": Stage(gpu=True, timeout="5h", needs_arg=True),
     "evaluate": Stage(gpu=True, timeout="3h", needs_arg=True),
+    # ~220 GB of fp32 factors, ~50 GB of model downloads and up to six 7 GB repaired checkpoints
+    "pencil": Stage(gpu=True, timeout="9h", needs_arg=True, min_disk_gb=300),
 }
 
 
@@ -193,11 +198,23 @@ def chosen_gpu(args: argparse.Namespace) -> str:
     return DEFAULT_GPU
 
 
+def check_disk(stage_name: str, gpu: str) -> None:
+    """Stop before launching a GPU stage on a machine whose disk can't hold its files."""
+    stage = STAGES[stage_name]
+    if not stage.gpu:
+        return
+    available = GPU_DISK_GB[gpu]
+    if stage.min_disk_gb > available:
+        raise SystemExit(f"{stage_name} needs about {stage.min_disk_gb} GB of disk; {gpu} has {available} GB")
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     if args.stage == "status":
         show_status()
         return
+    gpu = chosen_gpu(args)
+    check_disk(args.stage, gpu)
     code_repo, runs_repo = repo_names()
     if args.chained:
         version = os.environ.get("PENCIL_GIT_HASH", "unknown")
@@ -205,7 +222,6 @@ def main(argv=None) -> None:
         warn_about_uncommitted_code()
         upload_code(code_repo, runs_repo)
         version = code_version()
-    gpu = chosen_gpu(args)
     job = start_job(args.stage, args.arg, code_repo, runs_repo, version, gpu)
     print(f"started {args.stage} {args.arg} on {flavor_for(STAGES[args.stage], gpu)}: {job.url}")
     print(f"  log: .venv/bin/hf jobs logs {job.id}")

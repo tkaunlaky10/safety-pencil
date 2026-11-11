@@ -2,12 +2,14 @@
 
 Each file wraps the result payload with the provenance needed to reproduce it: the config, the seed, the
 git commit (marked "-dirty" when tracked files had uncommitted changes), the checkpoint id and a timestamp.
+A Hugging Face Job has no git checkout, so there the commit is the one jobs/launch.py recorded in PENCIL_GIT_HASH.
 Tensors and numpy values in the payload are converted to plain lists and numbers.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -20,7 +22,10 @@ def git_hash() -> str:
     """The repo's short commit hash, with "-dirty" appended when tracked files have uncommitted changes.
 
     Returns "unknown" when REPO_ROOT is not inside a git checkout or git is not installed. Untracked files
-    do not count as changes."""
+    do not count as changes. PENCIL_GIT_HASH, when set (inside a Hugging Face Job), is returned as it is."""
+    recorded = os.environ.get("PENCIL_GIT_HASH")
+    if recorded:
+        return recorded
     commit = _git_output("rev-parse", "--short", "HEAD")
     if commit is None:
         return "unknown"

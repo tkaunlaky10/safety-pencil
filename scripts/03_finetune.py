@@ -9,6 +9,7 @@ pencil.chat, like the factor passes and evaluation, so the template and the resp
     python scripts/03_finetune.py --run A
     python scripts/03_finetune.py --run D            # 2% existing BeaverTails pairs mixed in
     python scripts/03_finetune.py --run A --dry-run
+    python scripts/03_finetune.py --run A --max-steps 20   # timing run: 20 optimizer steps, nothing saved
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import time
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -185,9 +187,22 @@ def optimizer_step(params, optimizer, scheduler) -> None:
     optimizer.zero_grad(set_to_none=True)
 
 
-def train(ctx, run_id: str, seed: int, lora_cfg: dict, model, tokenizer, train_set, heldout) -> dict:
+def train(
+    ctx,
+    run_id: str,
+    seed: int,
+    lora_cfg: dict,
+    model,
+    tokenizer,
+    train_set,
+    heldout,
+    max_steps: int | None = None,
+) -> dict:
     """AdamW with gradient accumulation, clipping and warm-up/decay, saving at each configured fraction of
-    training. Returns the log: train loss per step, held-out loss and checkpoint per save, totals."""
+    training. Returns the log: train loss per step, held-out loss and checkpoint per save, totals.
+
+    With `max_steps`, training stops after that many optimizer steps and saves nothing: a timing run, whose
+    seconds per step (`s_per_step`) times `total_steps` estimates the full run."""
     params = [param for param in model.parameters() if param.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=lora_cfg["lr"], weight_decay=0.0)
     accum = lora_cfg["grad_accum"]
@@ -200,6 +215,7 @@ def train(ctx, run_id: str, seed: int, lora_cfg: dict, model, tokenizer, train_s
     log = {"train_loss": [], "eval_loss": {}, "saves": {}}
     step = 0
     window_loss = 0.0  # mean loss over the micro-batches of the current optimizer step
+    train_start = time.time()
 
     for epoch in range(lora_cfg["epochs"]):
         # a distinct order per (seed, epoch), so run A's epoch 2 doesn't replay run B's epoch 1
@@ -218,6 +234,8 @@ def train(ctx, run_id: str, seed: int, lora_cfg: dict, model, tokenizer, train_s
             step += 1
             log["train_loss"].append(window_loss)
             window_loss = 0.0
+            if _reached(step, max_steps):
+                break
             if step not in save_at:
                 continue
             fraction = save_at[step]
@@ -225,9 +243,24 @@ def train(ctx, run_id: str, seed: int, lora_cfg: dict, model, tokenizer, train_s
             log["eval_loss"][str(fraction)] = heldout_loss
             log["saves"][str(fraction)] = {"step": step, "path": str(path), "elapsed_s": ctx.elapsed()}
             print(f"step {step}/{total_steps}: saved {path.name}, held-out loss {heldout_loss:.4f}")
+        if _reached(step, max_steps):
+            break
 
-    log.update(total_steps=total_steps, n_rows=len(train_set), wall_clock_s=ctx.elapsed())
+    train_s = time.time() - train_start
+    log.update(
+        total_steps=total_steps,
+        steps_done=step,
+        train_s=train_s,
+        s_per_step=train_s / max(step, 1),
+        n_rows=len(train_set),
+        wall_clock_s=ctx.elapsed(),
+    )
     return log
+
+
+def _reached(step: int, max_steps: int | None) -> bool:
+    """True once a timing run (--max-steps) has taken its steps; never for a full run."""
+    return max_steps is not None and step >= max_steps
 
 
 def main(argv=None):
@@ -235,6 +268,9 @@ def main(argv=None):
     common_args(parser)
     parser.add_argument("--run", required=True, help="A, B, C or D (configs/experiment.yaml runs)")
     parser.add_argument("--no-grad-ckpt", action="store_true", help="disable gradient checkpointing")
+    parser.add_argument(
+        "--max-steps", type=int, default=None, help="timing run: stop after this many optimizer steps, save nothing"
+    )
     args = parser.parse_args(argv)
     ctx = setup(args)
     run = ctx.cfg["runs"][args.run]
@@ -249,9 +285,14 @@ def main(argv=None):
     print(f"run {args.run}: {len(train_set)} training rows ({n_skipped} skipped as too long)")
 
     model = lora_model(ctx, lora_cfg, grad_ckpt=not args.no_grad_ckpt)
-    log = train(ctx, args.run, run["seed"], lora_cfg, model, tokenizer, train_set, heldout)
+    log = train(ctx, args.run, run["seed"], lora_cfg, model, tokenizer, train_set, heldout, args.max_steps)
+    result_name = f"finetune_{args.run}"
+    if args.max_steps is not None:
+        result_name = f"finetune_{args.run}_timing{args.max_steps}"
+        estimate_h = log["s_per_step"] * log["total_steps"] / 3600
+        print(f"{log['s_per_step']:.1f} s per step; the full run's {log['total_steps']} steps ≈ {estimate_h:.2f} h")
     path = write_result(
-        f"finetune_{args.run}",
+        result_name,
         log,
         config={"run": run, "lora": lora_cfg},
         seed=run["seed"],

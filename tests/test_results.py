@@ -24,6 +24,7 @@ def repo(tmp_path, monkeypatch):
     """A one-commit git repo that git_hash() reads instead of the real checkout."""
     # Stop git from finding a repository above tmp_path (matters for the "no repo" case).
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.delenv("PENCIL_GIT_HASH", raising=False)  # set inside Hugging Face Jobs
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "--quiet")
@@ -46,6 +47,11 @@ def test_tracked_change_marks_dirty(repo):
 def test_untracked_files_do_not_mark_dirty(repo):
     (repo / "new.txt").write_text("untracked\n")
     assert results.git_hash() == _git(repo, "rev-parse", "--short", "HEAD")
+
+
+def test_recorded_hash_wins_inside_a_job(repo, monkeypatch):
+    monkeypatch.setenv("PENCIL_GIT_HASH", "0b04170-dirty")
+    assert results.git_hash() == "0b04170-dirty"
 
 
 def test_outside_a_checkout_gives_unknown(repo, tmp_path, monkeypatch):

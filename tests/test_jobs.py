@@ -691,3 +691,36 @@ def test_a_launch_can_cap_the_stage_timeout(launch, monkeypatch):
     capped, default = calls
     assert capped["timeout"] == "7h" and capped["flavor"] == "l40sx1"
     assert default["timeout"] == "10h"
+
+
+def test_leverage_and_test_tier_sections(report):
+    table = {
+        "model.layers.35.mlp.up_proj": {"layer": 35, "module": "up_proj", "max": 9.0, "top10_sum": 50.0},
+        "model.layers.0.mlp.down_proj": {
+            "layer": 0,
+            "module": "down_proj",
+            "max": 1.0,
+            "top10_sum": 5.0,
+            "jitter_in": 1e-4,
+        },
+    }
+    results = {
+        "leverage_pooled_runA": {"result": {"table": table}},
+        "leverage_en_runA": {"result": {"table": table}},
+        "test_theta0": {"result": _probe_result({"en": ["REFUSE"] * 2 + ["COMPLY"] * 2}), "run_id": "r9"},
+    }
+    leverage = "\n".join(report.leverage_section(results, k=1))
+    assert "| 1 | 35 | up_proj | 9 | 50 |" in leverage
+    assert "- en: 1 of its top 1 modules are in the pooled top 1" in leverage
+    assert "needed a larger Cholesky jitter: 1 modules" in leverage
+    test_tier = "\n".join(report.metrics_section(results, "test_", "Test-tier metrics"))
+    assert "| theta0 | en | 50% [0%, 100%] (2/4) |" in test_tier
+
+
+def test_test_tier_change_section_compares_theta0_and_run_a(report):
+    theta0 = _probe_result({"en": ["COMPLY"] * 20})
+    final = _probe_result({"en": ["COMPLY"] * 20}, unsafe={"en": [True] * 10 + [False] * 10})
+    results = {"test_theta0": {"result": theta0}, "test_runA_frac100": {"result": final}}
+    section = "\n".join(report.test_tier_change_section(results))
+    assert "| en | 20 | 0% → 0% | +0 | 1 | 1 | 0% → 50% | +50 | 0.00195 | 0.00195 |" in section
+    assert report.test_tier_change_section({"test_theta0": {"result": theta0}}) == []  # needs both

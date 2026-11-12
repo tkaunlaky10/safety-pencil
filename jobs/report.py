@@ -142,17 +142,17 @@ def runs_section(runs: list[dict], now: float) -> list[str]:
     return ["## Runs", "", *table(header, rows), ""]
 
 
-def probe_names(results: dict[str, dict]) -> list[str]:
-    """The probe-tier results: θ0 first, then the runs' adapters, then repaired models, each sorted."""
-    names = [name for name in results if name.startswith("probe_")]
-    return sorted(names, key=lambda name: (name != "probe_theta0", name))
+def tier_names(results: dict[str, dict], prefix: str) -> list[str]:
+    """The results of one tier ("probe_" or "test_"): θ0 first, then the runs' adapters, then repaired models."""
+    names = [name for name in results if name.startswith(prefix)]
+    return sorted(names, key=lambda name: (name != f"{prefix}theta0", name))
 
 
-def probe_section(results: dict[str, dict]) -> list[str]:
-    """Probe metrics: one row per checkpoint and language."""
+def metrics_section(results: dict[str, dict], prefix: str, title: str) -> list[str]:
+    """One row per checkpoint and language of one tier: refusal, harmful compliance, over-refusal, MMLU, task NLL."""
     header = ["checkpoint", "lang", "refusal", "harmful compliance", "over-refusal", "MMLU", "task NLL", "run"]
     rows = []
-    for name in probe_names(results):
+    for name in tier_names(results, prefix):
         record = results[name]
         result = record["result"]
         task_nll = result.get("task", {}).get("nll_per_token")
@@ -160,7 +160,7 @@ def probe_section(results: dict[str, dict]) -> list[str]:
             harmful = metrics.get("harmful", {})
             rows.append(
                 [
-                    name.removeprefix("probe_"),
+                    name.removeprefix(prefix),
                     lang,
                     rate(harmful.get("refusal")),
                     rate(harmful.get("unsafe")),
@@ -171,8 +171,37 @@ def probe_section(results: dict[str, dict]) -> list[str]:
                 ]
             )
     if not rows:
-        return ["## Probe metrics", "", "No probe results yet.", ""]
-    return ["## Probe metrics (dev, 100 prompts per language)", "", *table(header, rows), ""]
+        return [f"## {title}", "", "No results yet.", ""]
+    return [f"## {title}", "", *table(header, rows), ""]
+
+
+def leverage_section(results: dict[str, dict], run: str = "A", k: int = 10) -> list[str]:
+    """P5: the k modules with the largest leverage λ (pooled over languages), how many of them each language's
+    own top k shares, and the sides whose eigensolve needed a larger jitter."""
+    pooled = results.get(f"leverage_pooled_run{run}")
+    if pooled is None:
+        return []
+    table_rows = pooled["result"]["table"]
+    ranked = sorted(table_rows, key=lambda module: table_rows[module]["max"], reverse=True)[:k]
+    rows = []
+    for rank, module in enumerate(ranked, start=1):
+        row = table_rows[module]
+        rows.append([rank, row["layer"], row["module"], _number(row["max"]), _number(row["top10_sum"])])
+    lines = [f"## P5: leverage map (run {run}, pooled over languages)", ""]
+    lines += table(["rank", "layer", "module", "max λ", "top-10 λ sum"], rows)  # leverage_table sums 10 pairs
+    lines.append("")
+    top = set(ranked)
+    for lang in ("en", "hi", "hinglish"):
+        own = results.get(f"leverage_{lang}_run{run}")
+        if own is None:
+            continue
+        own_rows = own["result"]["table"]
+        own_top = set(sorted(own_rows, key=lambda module: own_rows[module]["max"], reverse=True)[:k])
+        lines.append(f"- {lang}: {len(top & own_top)} of its top {k} modules are in the pooled top {k}")
+    jittered = [module for module, row in table_rows.items() if row.get("jitter_in", 0) or row.get("jitter_out", 0)]
+    lines.append(f"- sides that needed a larger Cholesky jitter: {len(jittered)} modules")
+    lines.append("")
+    return lines
 
 
 # ── Gate 1 ───────────────────────────────────────────────────────────────────
@@ -243,7 +272,7 @@ def gate1_section(results: dict[str, dict]) -> list[str]:
         "Changes from θ0 to each run's final adapter on the same prompts (after − θ0), with exact McNemar p and",
         "Holm-adjusted p across languages. Refusal is the pre-registered gate: it passes in a language if refusal",
         f"falls by at least {min_points} points with p < {GATE1_ALPHA}. Harmful compliance (Llama Guard unsafe) is",
-        "reported alongside; it is the main safety metric for run D (PREREGISTRATION.md deviation log).",
+        "reported alongside; it became the main safety metric, and A the main run (PREREGISTRATION.md deviation log).",
         "",
     ]
     theta0 = results.get("probe_theta0")
@@ -270,6 +299,21 @@ def gate1_section(results: dict[str, dict]) -> list[str]:
             )
     if not rows:
         return [*lines, "Waiting for a run's probe_run<R>_frac100.", ""]
+    return [*lines, *table(header, rows), ""]
+
+
+def test_tier_change_section(results: dict[str, dict]) -> list[str]:
+    """θ0 against run A's final adapter on the test split: the paired changes in refusal and harmful compliance,
+    with exact McNemar and Holm p (the same comparison as Gate 1, on 4-6x more prompts)."""
+    theta0 = results.get("test_theta0")
+    final = results.get("test_runA_frac100")
+    if theta0 is None or final is None:
+        return []
+    header = ["lang", "n", "refusal", "change", "p", "Holm p", "unsafe", "change", "p", "Holm p"]
+    rows = []
+    for row in gate1(theta0["result"], final["result"]):
+        rows.append([row["lang"], row["refusal"]["n"], *_change_cells(row["refusal"]), *_change_cells(row["unsafe"])])
+    lines = ["## θ0 → run A, test split (paired, after − θ0)", ""]
     return [*lines, *table(header, rows), ""]
 
 
@@ -361,8 +405,11 @@ def summary(runs: list[dict], results: dict[str, dict], now: float | None = None
     lines = ["# Safety Pencil: experiment summary", "", "Generated by jobs/report.py from the runs repo.", ""]
     lines += runs_section(runs, now)
     lines += gate1_section(results)
+    lines += test_tier_change_section(results)
     lines += p2_section(results)
-    lines += probe_section(results)
+    lines += leverage_section(results)
+    lines += metrics_section(results, "test_", "Test-tier metrics (test split)")
+    lines += metrics_section(results, "probe_", "Probe metrics (dev, 100 prompts per language)")
     lines += index_section(results)
     return "\n".join(lines)
 

@@ -254,6 +254,9 @@ def measure_S(model0, model, batches_by_lang) -> dict[str, float]:
     return drift
 
 
+PROBE_TASK_BATCH = 1  # DevProbe.task_nll: sequences scored at once
+
+
 class DevProbe:
     """The cheap dev measurement used to compare repairs and baselines: drift S per language and the task
     NLL on the task dev rows. `measure(model)` returns {"S": {lang: S}, "S_mean": ..., "task_nll": ...}."""
@@ -265,10 +268,12 @@ class DevProbe:
         self.task = task_dev_rows(ctx)
 
     def task_nll(self, model) -> float:
-        """Mean task NLL per answer token on the task dev rows."""
+        """Mean task NLL per answer token on the task dev rows, one sequence at a time: the probe runs with θ0
+        and a working copy both on the GPU, and a batch of long answers' float32 log-softmax over the 262k-token
+        vocabulary does not fit next to them on an L4 (the 12 Nov drift job ran out of memory here)."""
         from .evaluate import task_nll
 
-        return task_nll(model, self.tokenizer, self.task)["nll_per_token"]
+        return task_nll(model, self.tokenizer, self.task, batch_size=PROBE_TASK_BATCH)["nll_per_token"]
 
     def measure(self, model) -> dict:
         """Drift S per language, its mean over languages, and the task dev NLL."""

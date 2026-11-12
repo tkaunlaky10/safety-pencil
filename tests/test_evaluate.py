@@ -242,6 +242,26 @@ def test_task_nll_matches_hand_computation_on_response_tokens(model, tokenizer):
     total = sum(i["n_tokens"] for i in result["items"])
     assert math.isfinite(result["nll_per_token"])
     assert result["nll_per_token"] == pytest.approx(sum(i["nll"] for i in result["items"]) / total)
+    one_at_a_time = ev.task_nll(model, tokenizer, pairs, batch_size=1)  # what the dev probe uses
+    assert one_at_a_time["nll_per_token"] == pytest.approx(result["nll_per_token"], rel=1e-4)
+
+
+def test_dev_probe_scores_task_answers_one_at_a_time(model, tokenizer, monkeypatch):
+    """The probe holds θ0 and a working copy on the GPU, so it must not batch long answers (12 Nov OOM)."""
+    from pencil import runtime
+
+    seen = {}
+
+    def fake_task_nll(model, tokenizer, pairs, *, batch_size=4, max_len=None):
+        seen["batch_size"] = batch_size
+        return {"nll_per_token": 1.5}
+
+    monkeypatch.setattr(ev, "task_nll", fake_task_nll)
+    probe = runtime.DevProbe.__new__(runtime.DevProbe)  # skip __init__: no data needed for this check
+    probe.tokenizer = tokenizer
+    probe.task = []
+    assert probe.task_nll(model) == 1.5
+    assert seen["batch_size"] == runtime.PROBE_TASK_BATCH == 1
 
 
 class OneTokenLM(torch.nn.Module):

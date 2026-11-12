@@ -156,10 +156,11 @@ class BaselineRunner:
                 self.work.get_submodule(module).weight.copy_(W_new.to(W0))
 
     def references(self):
-        """(aligned, base) models in bf16 on the CPU, loaded on first use."""
+        """(aligned, base) models in bf16 on the CPU, loaded on first use, straight to the CPU: routed through the
+        GPU they would sit next to θ0 and the working copy there."""
         if self._references is None:
-            aligned = load_model(self.ctx.aligned, self.ctx, dtype=torch.bfloat16).cpu()
-            base = load_model(self.ctx.base, self.ctx, dtype=torch.bfloat16).cpu()
+            aligned = load_model(self.ctx.aligned, self.ctx, dtype=torch.bfloat16, device="cpu")
+            base = load_model(self.ctx.base, self.ctx, dtype=torch.bfloat16, device="cpu")
             self._references = (aligned, base)
         return self._references
 

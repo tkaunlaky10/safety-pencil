@@ -82,3 +82,25 @@ def test_baselines_finalists_option_runs_exactly_the_picked_grid_value():
     with pytest.raises(ValueError, match="not in its grid"):
         baselines.restrict_grid(grid, 123.0, "regmean")
     assert baselines.parse_finalists(["regmean=3.0", "diag_fisher=0.1"]) == {"regmean": 3.0, "diag_fisher": 0.1}
+
+
+def test_a_baseline_that_failed_on_dev_is_recorded_as_unavailable_not_fatal(tmp_path, monkeypatch, capsys):
+    finalists = _load_script("09_finalists")
+    results = tmp_path / "results"
+    results.mkdir()
+    sweep = {"task_nll": {"theta0": NLL_THETA0, "theta1": NLL_THETA1}, "points": _points({0.1: 1.08})}
+    baselines = {
+        "regmean": [{"setting": 3.0, "task_nll": 1.07, "S_mean": 0.01}],
+        "diag_fisher": [{"setting": 0.1, "task_nll": 1.09, "S_mean": 0.01}],
+        "wiseft": [{"error": "OutOfMemoryError: ..."}],  # e.g. its reference models failed to load
+    }
+    (results / "sweep.json").write_text(json.dumps({"result": sweep}))
+    (results / "base.json").write_text(json.dumps({"result": baselines}))
+    monkeypatch.setattr(finalists, "outputs_dir", lambda name: tmp_path / name)
+
+    common = ["--run", "A", "--sweep", "sweep", "--baselines", "base"]
+    finalists.main([*common, "--print", "baselines"])
+    assert capsys.readouterr().out.strip() == "regmean=3.0 diag_fisher=0.1"  # the broken one is left out
+    finalists.main(common)
+    written = json.loads((results / "finalists_runA.json").read_text())["result"]
+    assert "unavailable" in written["baselines"]["wiseft"]

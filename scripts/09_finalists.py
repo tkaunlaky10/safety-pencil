@@ -27,6 +27,16 @@ def load_result(name: str) -> dict:
     return json.loads((outputs_dir("results") / f"{name}.json").read_text())["result"]
 
 
+def pick_baseline(rows: list[dict], target_nll: float) -> dict:
+    """One baseline's pick, or {"unavailable": reason} if it has no measured setting (e.g. it failed on dev), so
+    one broken baseline doesn't stop the others' comparison."""
+    try:
+        row = closest_setting(rows, target_nll)
+    except ValueError as error:
+        return {"unavailable": str(error)}
+    return {"setting": row["setting"], "task_nll": row["task_nll"], "S_mean": row["S_mean"]}
+
+
 def pick(sweep: dict, baselines: dict) -> dict:
     """μ* from the sweep and, for each compared baseline, its setting closest to NLL(μ*) in dev task NLL."""
     nll_theta0 = sweep["task_nll"]["theta0"]
@@ -34,8 +44,7 @@ def pick(sweep: dict, baselines: dict) -> dict:
     mu_star = pencil_mu_star(sweep["points"], nll_theta0, nll_theta1)
     picks = {}
     for method in COMPARED:
-        row = closest_setting(baselines[method], mu_star["task_nll"])
-        picks[method] = {"setting": row["setting"], "task_nll": row["task_nll"], "S_mean": row["S_mean"]}
+        picks[method] = pick_baseline(baselines.get(method, []), mu_star["task_nll"])
     return {
         "keep_task_gain": KEEP_TASK_GAIN,
         "task_nll": {"theta0": nll_theta0, "theta1": nll_theta1},
@@ -59,7 +68,8 @@ def main(argv=None) -> int:
         print(f"{finalists['mu_star']['mu']:g}")  # as 06_repair.py names its checkpoint folders
         return 0
     if args.show == "baselines":
-        pairs = [f"{method}={finalists['baselines'][method]['setting']!r}" for method in args.test_tier]
+        available = [method for method in args.test_tier if "setting" in finalists["baselines"][method]]
+        pairs = [f"{method}={finalists['baselines'][method]['setting']!r}" for method in available]
         print(" ".join(pairs))
         return 0
     config = {"sweep": args.sweep, "baselines": args.baselines}

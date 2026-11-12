@@ -369,6 +369,7 @@ def ledger():
 
 @pytest.fixture(scope="module")
 def report():
+    sys.path.insert(0, str(JOBS))  # report.py imports its sibling launch.py, as when run as jobs/report.py
     return _load("report")
 
 
@@ -667,3 +668,14 @@ def test_invariance_forecast_stage_runs_only_p2_and_p1_after_the_factors(tmp_pat
     calls = run_stage(tmp_path, "invariance_forecast", stage_arg="A")
     assert scripts_run(calls) == ["04_factors", "04_factors", "04_factors", "06_repair forecast", "05_invariance"]
     assert calls[-1] == "jobs/sync.py push outputs/results outputs/figures"  # pushed after the last step
+
+
+def test_a_run_still_running_past_its_timeout_is_shown_as_killed(report):
+    started = "2026-11-12T07:12:24Z"
+    run = {"run_id": "r1", "stage": "pencil", "arg": "A", "status": "running", "started": started}
+    start_seconds = 1794467544  # 2026-11-12T07:12:24Z
+    assert report.shown_status(run, now=start_seconds + 3600) == "running"  # within pencil's 9 h
+    assert report.shown_status(run, now=start_seconds + 10 * 3600) == "killed (no finish record)"
+    finished = dict(run, status="failed (exit 1)")
+    assert report.shown_status(finished, now=start_seconds + 10 * 3600) == "failed (exit 1)"
+    assert report.timeout_seconds("90m") == 5400

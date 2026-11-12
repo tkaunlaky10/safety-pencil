@@ -36,8 +36,10 @@ IMAGE = "ghcr.io/astral-sh/uv:python3.12-bookworm"
 HUB_CLIENT = "huggingface_hub==2.4.0"
 PROJECT_LABEL = "safety-pencil"
 DEFAULT_GPU = "l4x1"
-GPU_CHOICES = ("l4x1", "a10g-small")  # both 24 GB; anything bigger is a deliberate code change
-GPU_DISK_GB = {"l4x1": 400, "a10g-small": 110}  # job disk per machine, from `hf jobs hardware`
+# l4x1 and a10g-small are 24 GB GPUs with 30 / 15 GB of RAM; l40sx1 (48 GB GPU, 62 GB RAM, $1.80/h) was approved on
+# 12 Nov for the repair sweep, whose bases and weight copies overflow 30 GB of RAM. Anything else is a code change.
+GPU_CHOICES = ("l4x1", "a10g-small", "l40sx1")
+GPU_DISK_GB = {"l4x1": 400, "a10g-small": 110, "l40sx1": 380}  # job disk per machine, from `hf jobs hardware`
 CPU_FLAVOR = "cpu-basic"
 EVAL_TIERS = ("probe", "full")  # 02_evaluate.py --tier
 
@@ -141,9 +143,10 @@ def start_job(
     version: str,
     gpu: str = DEFAULT_GPU,
     tier: str | None = None,
+    timeout: str | None = None,
 ):
     """Start one stage's job and return its JobInfo. GPU stages run on `gpu`, the others on the CPU machine;
-    `tier` (evaluate only) is passed as EVAL_TIER."""
+    `tier` (evaluate only) is passed as EVAL_TIER; `timeout` (e.g. "7h") replaces the stage's own."""
     from huggingface_hub import get_token, run_job
 
     stage = STAGES[stage_name]
@@ -172,10 +175,17 @@ def start_job(
         env=env,
         secrets={"HF_TOKEN": get_token()},
         flavor=flavor_for(stage, gpu),
-        timeout=stage.timeout,
+        timeout=_chosen_timeout(stage, timeout),
         name=name,
         labels=labels,
     )
+
+
+def _chosen_timeout(stage: Stage, timeout: str | None) -> str:
+    """The launch's --timeout if given, else the stage's own."""
+    if timeout:
+        return timeout
+    return stage.timeout
 
 
 def show_status(limit: int = 15) -> None:
@@ -207,6 +217,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--tier", choices=EVAL_TIERS, default=None, help="evaluate only: probe (default) or full (the test split)"
     )
+    parser.add_argument("--timeout", default=None, help="this launch's time limit, e.g. 7h (default: the stage's)")
     args = parser.parse_args(argv)
     if args.tier and args.stage != "evaluate":
         parser.error("--tier is for the evaluate stage")
@@ -248,7 +259,7 @@ def main(argv=None) -> None:
         warn_about_uncommitted_code()
         upload_code(code_repo, runs_repo)
         version = code_version()
-    job = start_job(args.stage, args.arg, code_repo, runs_repo, version, gpu, args.tier)
+    job = start_job(args.stage, args.arg, code_repo, runs_repo, version, gpu, args.tier, args.timeout)
     print(f"started {args.stage} {args.arg} on {flavor_for(STAGES[args.stage], gpu)}: {job.url}")
     print(f"  log: .venv/bin/hf jobs logs {job.id}")
 

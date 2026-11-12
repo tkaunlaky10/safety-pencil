@@ -289,6 +289,8 @@ def test_wait_uses_one_deadline_for_all_paths(sync, monkeypatch):
 
 def test_pencil_is_refused_on_a_machine_without_the_disk(launch):
     launch.check_disk("pencil", "l4x1")
+    launch.check_disk("compare", "l40sx1")  # 380 GB: enough for the factors
+    assert launch.chosen_gpu(launch.parse_args(["compare", "A", "--gpu", "l40sx1"])) == "l40sx1"
     launch.check_disk("finetune", "a10g-small")  # small stages fit anywhere
     with pytest.raises(SystemExit, match="pencil needs about 300 GB"):
         launch.check_disk("pencil", "a10g-small")
@@ -619,16 +621,10 @@ def test_compare_stage_puts_the_finalists_before_p3_and_localisation(tmp_path):
     calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1")  # the fake 09_finalists says μ* = 0.1
 
     steps = scripts_run(calls)
-    assert steps[:6] == [
-        "04_factors",
-        "04_factors",
-        "04_factors",
-        "06_repair forecast",
-        "06_repair sweep",
-        "07_baselines",
-    ]
-    # P1 after P6, then the other μ (P3; 09_finalists names μ* so it is skipped), then P5
-    assert steps[-4:] == ["05_invariance", "09_finalists", "02_evaluate", "08_localisation"]
+    assert steps[:5] == ["04_factors", "04_factors", "04_factors", "06_repair sweep", "07_baselines"]
+    # the other μ (P3; 09_finalists names μ* so it is skipped), then localisation (P5) last
+    assert steps[-3:] == ["09_finalists", "02_evaluate", "08_localisation"]
+    assert "05_invariance" not in steps and "06_repair forecast" not in steps  # P1, P2: invariance_forecast stage
     # localisation is last: running out of time costs it, not the baseline comparison
     sweep = next(call for call in calls if call.startswith("scripts/06_repair.py sweep"))
     assert "--save" in sweep and "--grad-diag" not in sweep and sweep.endswith("--out-name repair_sweep_compare_runA")
@@ -679,3 +675,21 @@ def test_a_run_still_running_past_its_timeout_is_shown_as_killed(report):
     finished = dict(run, status="failed (exit 1)")
     assert report.shown_status(finished, now=start_seconds + 10 * 3600) == "failed (exit 1)"
     assert report.timeout_seconds("90m") == 5400
+
+
+def test_a_launch_can_cap_the_stage_timeout(launch, monkeypatch):
+    calls = []
+
+    def fake_run_job(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(id="job1", url="https://hf.co/jobs/job1")
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "run_job", fake_run_job)
+    monkeypatch.setattr(huggingface_hub, "get_token", lambda: "hf_secret")
+    launch.start_job("compare", "A", "me/code", "me/runs", "abc1234", "l40sx1", None, "7h")
+    launch.start_job("compare", "A", "me/code", "me/runs", "abc1234", "l40sx1")
+    capped, default = calls
+    assert capped["timeout"] == "7h" and capped["flavor"] == "l40sx1"
+    assert default["timeout"] == "10h"

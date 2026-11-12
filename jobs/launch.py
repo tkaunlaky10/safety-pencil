@@ -15,6 +15,7 @@ listed in `then` below, so `calibrate` alone sets off hinglish and the three fin
     .venv/bin/python jobs/launch.py calibrate --gpu a10g-small   # when no L4 is free; the chain inherits it
     .venv/bin/python jobs/launch.py pencil A            # factors, eigendecomposition, repair, baselines (by hand)
     .venv/bin/python jobs/launch.py drift               # measured drift S of every adapter (P2), no factors
+    .venv/bin/python jobs/launch.py compare A           # baselines and the test-tier comparison of finalists
 
 Follow a job's log with `.venv/bin/hf jobs logs <job id>`. Log in once first with `.venv/bin/hf auth login`.
 """
@@ -77,6 +78,7 @@ STAGES = {
     # ~220 GB of fp32 factors, ~50 GB of model downloads and up to six 7 GB repaired checkpoints
     "pencil": Stage(gpu=True, timeout="9h", needs_arg=True, min_disk_gb=300),
     "drift": Stage(gpu=True, timeout="2h"),
+    "compare": Stage(gpu=True, timeout="10h", needs_arg=True, min_disk_gb=300),
 }
 
 

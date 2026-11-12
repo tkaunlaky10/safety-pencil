@@ -296,6 +296,8 @@ def write_sweep_result(ctx, args, state: SweepState, points: list[dict], mus: li
     default_repairer = state.repairer(pencil_cfg["damping"], pencil_cfg["gamma_c"])
     spearman = spearman_pred_vs_actual(points)
     name = f"repair_sweep_{state.tag}"
+    if args.out_name:
+        name = args.out_name
     result = {
         "points": points,
         "S_drift": state.drift["S"],
@@ -490,6 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_parser.add_argument("--layers", default=None, help="'selection' or e.g. '3,11': repair only these layers")
     sweep_parser.add_argument("--mu", type=float, nargs="+", help="default pencil.mu_grid")
     sweep_parser.add_argument("--save", type=float, nargs="+", help="save merged checkpoints for these μ")
+    sweep_parser.add_argument("--out-name", default=None, help="result name (default repair_sweep_<tag>)")
     sweep_parser.add_argument(
         "--grad-diag", action="store_true", help="task-gradient diagnostic (needs weight gradients)"
     )

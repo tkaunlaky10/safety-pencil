@@ -1,5 +1,6 @@
 """Baselines on one run (Prompt 7), measured with the same dev probe as the pencil sweep (drift S per language
-and task NLL). --save writes merged checkpoints for 02_evaluate.py.
+and task NLL). --save writes merged checkpoints for 02_evaluate.py. --finalists method=value runs only that
+setting of each named method and saves it (the compare stage's test-tier finalists).
 
 Ours (same factors as the pencil, so the comparison isolates the curvature model):
   regmean          W1 − ΔW A_h (A_h + μA_t)⁺                       μ in [0.3, 1000], 13 log-spaced
@@ -72,6 +73,7 @@ DIAG_FISHER_MUS = log_spaced(1e-3, 3, 11)
 ALIGNMERGE_RANKS = (16, 64)
 SAFELORA_THRESHOLDS = (0.3, 0.5, 0.7)
 SAFE_DELTA_STRENGTHS = (0.05, 0.1, 0.2, 0.5)
+FINALIST_TOLERANCE = 1e-9  # a --finalists value matches a grid value within this
 
 
 @dataclass
@@ -95,6 +97,16 @@ SAFETUNE = {
 }
 
 
+def restrict_grid(values: list[float], wanted: float | None, method: str) -> list[float]:
+    """The method's grid, or only its value matching `wanted` (a --finalists pick) when one is given."""
+    if wanted is None:
+        return list(values)
+    matches = [value for value in values if math.isclose(value, wanted, rel_tol=FINALIST_TOLERANCE)]
+    if not matches:
+        raise ValueError(f"--finalists {method}={wanted!r} is not in its grid {values}")
+    return matches[:1]
+
+
 def save_tag(method: str, setting) -> str:
     """How --save names a setting, e.g. 'regmean:3' or 'alignmerge:r16_mu0.1'."""
     if isinstance(setting, float):
@@ -106,10 +118,13 @@ class BaselineRunner:
     """Holds θ0, a working copy, the factors and the dev probe. Each baseline calls `reset()` (work ← θ1),
     applies one setting to `work`, then `record(setting)`; rows collect per method."""
 
-    def __init__(self, ctx, run: str, save_tags: list[str]):
+    def __init__(self, ctx, run: str, save_tags: list[str], finalists: dict[str, float] | None = None):
         self.ctx = ctx
         self.run = run
         self.save_tags = save_tags
+        self.finalists = {}
+        if finalists:
+            self.finalists = finalists
         self.pencil_cfg = ctx.cfg["pencil"]
         self.inputs = load_repair_inputs(ctx, run)
         self.model0 = self.inputs.model0
@@ -147,6 +162,10 @@ class BaselineRunner:
             base = load_model(self.ctx.base, self.ctx, dtype=torch.bfloat16).cpu()
             self._references = (aligned, base)
         return self._references
+
+    def grid(self, values) -> list[float]:
+        """The current method's grid values to run: all of them, or just its --finalists pick."""
+        return restrict_grid(list(values), self.finalists.get(self.method), self.method)
 
     def start_method(self, method: str) -> None:
         """Begin collecting rows for a new baseline."""
@@ -216,7 +235,7 @@ def run_regmean(runner: BaselineRunner) -> None:
         top_k=runner.pencil_cfg.get("top_k_mlp"),
         eig_device=eig_device,
     )
-    for mu in REGMEAN_MUS:
+    for mu in runner.grid(REGMEAN_MUS):
         runner.reset()
         runner.write_per_module(regmean.delta, mu)
         runner.record(mu)
@@ -232,7 +251,7 @@ def run_diag_fisher(runner: BaselineRunner) -> None:
     else:
         print("diag_fisher: diag(G) diag(A)ᵀ fallback")
     merge = DiagonalFisherMerge(harm, task, runner.row_set, exact)
-    for mu in DIAG_FISHER_MUS:
+    for mu in runner.grid(DIAG_FISHER_MUS):
         runner.reset()
         runner.write_per_module(merge.delta, mu)
         runner.record(mu)
@@ -307,7 +326,7 @@ def run_safetune_trainer(runner: BaselineRunner, method: str) -> None:
     if method == "resta":
         trainer_kwargs["dare"] = True
     trainer_class = getattr(recover, spec.trainer)
-    for value in spec.grid:
+    for value in runner.grid(spec.grid):
         runner.reset()
         trainer_class(runner.work, **trainer_kwargs, **{spec.swept_argument: value}).apply()
         runner.record(value)
@@ -345,7 +364,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--methods", nargs="+", default=MUST, help=f"must: {MUST}; nice: {NICE}")
     parser.add_argument("--save", nargs="+", default=[], help="settings to save, e.g. regmean:3 wiseft:0.5")
     parser.add_argument("--out-name", default=None, help="result file name (default baselines_run<run>)")
+    parser.add_argument(
+        "--finalists",
+        nargs="+",
+        default=[],
+        help="method=value: run only that setting of each method and save it (replaces --methods)",
+    )
     return parser
+
+
+def parse_finalists(pairs: list[str]) -> dict[str, float]:
+    """{"regmean": 3.16, ...} from ["regmean=3.16", ...]."""
+    finalists = {}
+    for pair in pairs:
+        method, separator, value = pair.partition("=")
+        if not separator:
+            raise SystemExit(f"--finalists takes method=value, got {pair!r}")
+        finalists[method] = float(value)
+    return finalists
 
 
 def measure_unrepaired(runner: BaselineRunner) -> dict:
@@ -360,9 +396,15 @@ def measure_unrepaired(runner: BaselineRunner) -> dict:
 def main(argv=None):
     args = build_parser().parse_args(argv)
     ctx = setup(args)
-    runner = BaselineRunner(ctx, args.run, args.save)
+    finalists = parse_finalists(args.finalists)
+    methods = args.methods
+    save_tags = list(args.save)
+    if finalists:
+        methods = list(finalists)
+        save_tags += [save_tag(method, value) for method, value in finalists.items()]
+    runner = BaselineRunner(ctx, args.run, save_tags, finalists)
     results = measure_unrepaired(runner)
-    for method in args.methods:
+    for method in methods:
         results[method] = run_method(runner, method)
 
     out_name = args.out_name
@@ -371,7 +413,7 @@ def main(argv=None):
     write_result(
         out_name,
         results,
-        config={"pencil": runner.pencil_cfg, "methods": args.methods},
+        config={"pencil": runner.pencil_cfg, "methods": methods, "finalists": finalists},
         checkpoint=f"run{args.run}",
         out_dir=ctx.out("results"),
     )

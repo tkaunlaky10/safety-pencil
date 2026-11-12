@@ -618,8 +618,17 @@ def test_compare_stage_puts_the_finalists_before_p3_and_localisation(tmp_path):
     calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1")  # the fake 09_finalists says μ* = 0.1
 
     steps = scripts_run(calls)
-    assert steps[:5] == ["04_factors", "04_factors", "04_factors", "06_repair sweep", "07_baselines"]
-    assert steps[-1] == "08_localisation"  # last: running out of time costs localisation, not P6
+    assert steps[:6] == [
+        "04_factors",
+        "04_factors",
+        "04_factors",
+        "06_repair forecast",
+        "06_repair sweep",
+        "07_baselines",
+    ]
+    # P1 after P6, then the other μ (P3; 09_finalists names μ* so it is skipped), then P5
+    assert steps[-4:] == ["05_invariance", "09_finalists", "02_evaluate", "08_localisation"]
+    # localisation is last: running out of time costs it, not the baseline comparison
     sweep = next(call for call in calls if call.startswith("scripts/06_repair.py sweep"))
     assert "--save" in sweep and "--grad-diag" not in sweep and sweep.endswith("--out-name repair_sweep_compare_runA")
     assert out_names(calls) == [

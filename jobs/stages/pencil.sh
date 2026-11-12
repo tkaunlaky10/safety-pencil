@@ -14,26 +14,7 @@
 # after every step. Baselines and the test-tier comparison run in the compare stage, in parallel.
 set -euo pipefail
 run=$STAGE_ARG
-forecast_runs=(A C D)  # the runs with adapters; B was cut
-probe_wait_minutes=180
 source "$(dirname "$0")/lib.sh"
-
-forecast_all_adapters() {  # once θ0's and every adapter's probe results are in
-  local adapters=()
-  local probes=(outputs/results/probe_theta0.json)
-  for forecast_run in "${forecast_runs[@]}"; do
-    adapters+=("outputs/ckpt/$forecast_run/**")
-    for frac in 25 50 75 100; do
-      probes+=("outputs/results/probe_run${forecast_run}_frac$frac.json")
-    done
-  done
-  python jobs/sync.py pull "${adapters[@]}"
-  if ! python jobs/sync.py wait "${probes[@]}" --minutes "$probe_wait_minutes"; then
-    echo "not every probe result arrived: forecasting against the ones that did"
-  fi
-  python jobs/sync.py pull "outputs/results/**"
-  python scripts/06_repair.py forecast
-}
 
 sweep_and_evaluate() {  # the sweep saves every μ; each saved model is probe-evaluated, then deleted
   local mu_grid

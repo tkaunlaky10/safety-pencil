@@ -190,9 +190,13 @@ def fine_tuned_weights(base_weights: dict, deltas: dict) -> dict:
 
 
 def base_model_weights(ctx, modules) -> dict:
-    """The base (pre-alignment) model's weights for `modules`, in float32 on the CPU."""
-    base_model = load_model(ctx.base, ctx, dtype=torch.float32).cpu()
-    return model_weights(base_model, modules)
+    """The base (pre-alignment) model's weights for `modules`, in float32 on the CPU. The model is loaded in bf16
+    on the CPU and only these weights are converted: a whole fp32 copy next to θ0 overflowed an L4 job's 30 GB
+    of RAM (pencil A was OOMKilled here on 12 Nov)."""
+    base_model = load_model(ctx.base, ctx, dtype=torch.bfloat16, device="cpu")
+    weights = {name: W.float() for name, W in model_weights(base_model, modules).items()}
+    del base_model
+    return weights
 
 
 def repair_kwargs_without_damping(pencil_cfg: dict, rel_tol: float, row_set: str) -> dict:

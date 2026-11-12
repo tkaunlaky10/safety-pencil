@@ -3,6 +3,7 @@
 #
 #   pull_inputs; choose_langs; collect_factors     # inputs, then the four factor passes (~1.7 h on an L4)
 #   step NAME COMMAND...                           # one analysis step: a failure is recorded, the stage goes on
+#   forecast_all_adapters                          # P2: ½ΔᵀF_hΔ for runs A, C, D's adapters (needs the factors)
 #   finish_steps                                   # exit non-zero if any step failed
 #
 # The factor passes are not steps: nothing can run without them, so a failure there stops the stage. Every step
@@ -10,6 +11,8 @@
 
 row_sets=full  # one row set per side: all four don't fit the disk (PREREGISTRATION.md deviation log)
 failed_steps=()
+forecast_runs=(A C D)  # the runs with adapters; B was cut
+probe_wait_minutes=180
 
 push_outputs() {  # every result and figure so far; a failed push is reported, never fatal
   python jobs/sync.py push outputs/results outputs/figures || echo "push of results failed (carrying on)"
@@ -47,6 +50,23 @@ collect_factors() {  # harmful factors at θ0 per language, task factors at the 
 evaluate_checkpoint() {  # evaluate_checkpoint CHECKPOINT OUT_NAME TIER: only the result JSON is pushed
   python scripts/02_evaluate.py --checkpoint "$1" --tier "$3" --out-name "$2" --langs "${langs[@]}"
   python jobs/sync.py push "outputs/results/$2.json"
+}
+
+forecast_all_adapters() {  # once θ0's and every adapter's probe results are in
+  local adapters=()
+  local probes=(outputs/results/probe_theta0.json)
+  for forecast_run in "${forecast_runs[@]}"; do
+    adapters+=("outputs/ckpt/$forecast_run/**")
+    for frac in 25 50 75 100; do
+      probes+=("outputs/results/probe_run${forecast_run}_frac$frac.json")
+    done
+  done
+  python jobs/sync.py pull "${adapters[@]}"
+  if ! python jobs/sync.py wait "${probes[@]}" --minutes "$probe_wait_minutes"; then
+    echo "not every probe result arrived: forecasting against the ones that did"
+  fi
+  python jobs/sync.py pull "outputs/results/**"
+  python scripts/06_repair.py forecast
 }
 
 step() {  # step NAME COMMAND...: run COMMAND in a subshell with errexit on; record a failure and carry on

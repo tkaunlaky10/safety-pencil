@@ -128,14 +128,17 @@ def load_tokenizer(ctx: Ctx):
     return tokenizer
 
 
-def load_model(spec: str, ctx: Ctx, dtype: torch.dtype | None = None):
-    """A causal LM from a Hugging Face id or local path, on ctx.device in eval mode (dtype defaults to ctx.dtype)."""
+def load_model(spec: str, ctx: Ctx, dtype: torch.dtype | None = None, device: str | None = None):
+    """A causal LM from a Hugging Face id or local path, in eval mode, on `device` (default ctx.device) in `dtype`
+    (default ctx.dtype)."""
     from transformers import AutoModelForCausalLM
 
     if dtype is None:
         dtype = ctx.dtype
+    if device is None:
+        device = ctx.device
     model = AutoModelForCausalLM.from_pretrained(str(spec), dtype=dtype)
-    return model.to(ctx.device).eval()
+    return model.to(device).eval()
 
 
 def model_shape(model) -> dict:

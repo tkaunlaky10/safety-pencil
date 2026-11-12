@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # The repair and its comparison for one run ($STAGE_ARG: A) on an L4: ~7 h, ~$5.5. Runs next to the pencil stage,
-# which supplies leverage, invariance and the forecast. Ordered so that running out of time or money costs
+# which supplied the leverage map (it was OOMKilled in invariance on 12 Nov, so P1 and P2 run here). Ordered so that running out of time or money costs
 # localisation, not the baseline comparison (P6):
 #
 #   factors       as in the pencil stage (jobs/stages/lib.sh), ~1.7 h
+#   forecast      ½ΔᵀF_hΔ for every run's adapters (P2), ~15 min
 #   sweep         the μ sweep on dev (S, task NLL, trust region); every μ in pencil.mu_grid is saved
 #   baselines     the must-run set on dev
 #   finalists     μ* and the RegMean and diagonal Fisher settings by the fixed rule (pencil/finalists.py, dev
 #                 only), all probe-evaluated (probe tier, not test tier: deviation log)
+#   invariance    the repair under the V/O gauge (P1), ~30 min
 #   mu_probes     probe evaluations of the other μ (P3)
 #   localisation  refusal-direction cosine, targeted vs random repair (P5)
 #   test_tier     only what outputs/control/compare_test_tier.txt in the runs repo lists ("pencil", "regmean"),
@@ -93,9 +95,11 @@ evaluate_test_tier() {  # whatever the control file lists, on the test split
 pull_inputs
 choose_langs
 collect_factors
+step forecast forecast_all_adapters
 step sweep sweep_and_save
 step baselines python scripts/07_baselines.py --run "$run" --methods "${must_baselines[@]}" --out-name "$baselines_name"
 step finalists evaluate_finalists
+step invariance python scripts/05_invariance.py --run "$run"
 step mu_probes evaluate_other_mus
 step localisation python scripts/08_localisation.py --run "$run" --mu 0.1
 step test_tier evaluate_test_tier

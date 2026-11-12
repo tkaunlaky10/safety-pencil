@@ -70,6 +70,8 @@ def _module_row(basis: LayerBasis, module: str, k: int) -> dict:
         "gamma_max": float(basis.gamma.max()),
         "range_in": basis.inp.range_dim,
         "range_out": basis.out.range_dim,
+        "jitter_in": basis.inp.jitter,  # ε × mean diagonal the fast top-k solver needed (0 elsewhere)
+        "jitter_out": basis.out.jitter,
     }
 
 

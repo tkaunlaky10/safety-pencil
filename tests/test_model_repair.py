@@ -2,6 +2,7 @@
 (logits, factor transformation, repair invariance by damping) and the baselines' gauge behaviour."""
 
 import copy
+import dataclasses
 
 import pytest
 import torch
@@ -274,6 +275,13 @@ def test_targeted_repair_and_leverage(setup):
     repairer = ModelRepair(fh, ft)
     shape = AttnShape.from_config(m0.config)
     table = leverage_table(repairer, sorted(d), n_heads=shape.n_heads, n_kv=shape.n_kv, head_dim=shape.head_dim)
+    # the tiny model's factors are well conditioned: no side needed more jitter, and the table says so
+    assert all(row["jitter_in"] == 0.0 and row["jitter_out"] == 0.0 for row in table.values())
+    assert repairer.jitters() == {}
+    down = "model.layers.0.mlp.down_proj"
+    input_key = (fh.a_key[down], repairer._row_set_of(down))
+    repairer._input_pencils[input_key] = dataclasses.replace(repairer.basis(down).inp, jitter=1e-6)
+    assert repairer.jitters() == {f"{input_key[0]}|{input_key[1]}|input": 1e-6}
     for row in table.values():
         if row["module"] == "o_proj":
             assert max(row["per_head_lower_bound"]) <= row["max"] * (1 + 1e-9)

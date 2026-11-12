@@ -260,6 +260,18 @@ class ModelRepair:
             )
         return pencil.to(dtype=self.basis_dtype, device=self.device)
 
+    def jitters(self) -> dict[str, float]:
+        """The ε (× mean diagonal) each solved side needed beyond the requested jitter, for the result JSONs:
+        {"<input factor>|<row set>|input" or "<module>|output": ε}, only sides with ε > 0."""
+        needed = {}
+        for (factor_key, row_set), pencil in self._input_pencils.items():
+            if pencil.jitter > 0:
+                needed[f"{factor_key}|{row_set}|input"] = pencil.jitter
+        for module, pencil in self._output_pencils.items():
+            if pencil.jitter > 0:
+                needed[f"{module}|output"] = pencil.jitter
+        return needed
+
     def basis(self, module: str) -> LayerBasis:
         """The module's two pencils, solving (and caching) whichever side is not cached yet."""
         input_key = (self.harm_factors.a_key[module], self._row_set_of(module))

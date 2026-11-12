@@ -14,11 +14,16 @@ eigenvalue, so set rel_tol above that floor (`auto_rel_tol`). Mirrors tests/test
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import torch
 
 DAMPINGS = ("covariant", "euclidean", "none")
+# × mean diagonal, tried in turn when gen_eig_topk's jitter is not enough. fp32 rounding in an 11008² factor
+# with outlier activations leaves negative eigenvalues near 1e-7 × λ_max, and λ_max can be 1e3–1e4 × the mean
+# diagonal; recomputing the factors costs 1.7 h, so the ladder goes up to 1e-2.
+JITTER_RETRIES = (1e-8, 1e-6, 1e-4, 1e-3, 1e-2)
 
 
 @dataclass
@@ -30,6 +35,7 @@ class Pencil:
     FX: torch.Tensor  # (n, k) F_t′ X: all the repair needs of the damped task factor
     range_dim: int  # dimension of range(F_h + F_t)
     dropped: int = 0  # range directions where the damped task factor was not numerically positive
+    jitter: float = 0.0  # ε × mean diagonal added to F_t′ before its Cholesky (gen_eig_topk only)
 
     def to(self, dtype=None, device=None) -> Pencil:
         """A copy with the tensors moved to `dtype` and `device`."""
@@ -39,6 +45,7 @@ class Pencil:
             FX=self.FX.to(device=device, dtype=dtype),
             range_dim=self.range_dim,
             dropped=self.dropped,
+            jitter=self.jitter,
         )
 
 
@@ -106,8 +113,12 @@ def gen_eig_topk(
 
     Used on the MLP-width sides (down_proj input, gate/up output) instead of gen_eig, whose three n × n
     float64 eigendecompositions cost about a minute each at n = 11008 on an L4. Steps:
-      1. Cholesky L Lᵀ = F_t′ + jitter · mean(diag) · I in float64. The jitter only guards numerically
-         singular directions; these factors are not touched by the V/O gauge.
+      1. Cholesky L Lᵀ = F_t′ + ε · mean(diag) · I in float64, with ε = jitter, or the first of
+         JITTER_RETRIES that works (_jittered_cholesky; the ε used is kept in Pencil.jitter). This is a
+         Euclidean damping ε·mean(diag)·I on the MLP-width sides only. Under covariant damping F_t′ ≥ γ_c F_h,
+         so a direction with F_t ≈ 0 but F_h > 0 has λ ≈ 1/γ_c, the largest; the jitter lowers λ only where
+         F_h < ε·mean(diag)/γ_c, i.e. where the safety curvature is small. The V/O gauge does not touch these
+         sides, so invariance (P1) is unaffected.
       2. Whiten by triangular solves in float64: L⁻¹ F_h L⁻ᵀ.
       3. One eigh of the whitened matrix in `eig_dtype` (float32 is accurate for the top pairs, which are
          all we keep).
@@ -121,11 +132,7 @@ def gen_eig_topk(
 
     F_t_damped = damp(F_h, F_t, damping, gamma)
     size = F_t_damped.shape[0]
-    identity = torch.eye(size, dtype=F_t_damped.dtype, device=device)
-    jittered = F_t_damped + jitter * F_t_damped.diagonal().mean() * identity
-    L, info = torch.linalg.cholesky_ex(jittered)
-    if int(info) != 0:
-        raise RuntimeError("F_t' is not positive definite even with jitter; use gen_eig (range restriction)")
+    L, epsilon = _jittered_cholesky(F_t_damped, jitter)
 
     half_whitened = torch.linalg.solve_triangular(L, F_h, upper=False)  # L⁻¹ F_h
     whitened = torch.linalg.solve_triangular(L, half_whitened.T.contiguous(), upper=False)  # L⁻¹ F_h L⁻ᵀ
@@ -136,7 +143,28 @@ def gen_eig_topk(
     lam = lam[-k:].to(torch.float64).clamp_min(0)
     V = V[:, -k:].to(torch.float64)
     X = torch.linalg.solve_triangular(L.T.contiguous(), V, upper=True)  # L⁻ᵀ V
-    return Pencil(lam=lam.clone(), X=X, FX=F_t_damped @ X, range_dim=size, dropped=0)
+    return Pencil(lam=lam.clone(), X=X, FX=F_t_damped @ X, range_dim=size, dropped=0, jitter=epsilon)
+
+
+def _jittered_cholesky(F: torch.Tensor, jitter: float) -> tuple[torch.Tensor, float]:
+    """(L, ε): the Cholesky factor of F + ε · mean(diag F) · I for ε = jitter, or else the first of
+    JITTER_RETRIES that is positive definite. fp32 factors of a bf16 model can be indefinite at ~1e-7 of their
+    largest eigenvalue, far above 1e-10 of the mean diagonal when the inputs have outliers (down_proj input)."""
+    scale = F.diagonal().mean()
+    identity = torch.eye(F.shape[0], dtype=F.dtype, device=F.device)
+    retries = [epsilon for epsilon in JITTER_RETRIES if epsilon > jitter]
+    for epsilon in [jitter, *retries]:
+        L, info = torch.linalg.cholesky_ex(F + epsilon * scale * identity)
+        if int(info) != 0:
+            continue
+        if epsilon > jitter:
+            message = f"gen_eig_topk: F_t′ needed jitter {epsilon:g} × mean diagonal (asked {jitter:g})"
+            warnings.warn(message, stacklevel=3)  # point at gen_eig_topk's caller
+        return L, epsilon
+    raise RuntimeError(
+        f"F_t' is not positive definite even with jitter {JITTER_RETRIES[-1]:g} × mean diagonal; "
+        "use gen_eig (range restriction)"
+    )
 
 
 def _range_basis(F_sum: torch.Tensor, rel_tol: float) -> tuple[torch.Tensor, float]:

@@ -128,3 +128,29 @@ def test_gen_eig_topk_matches_gen_eig_on_full_rank_factors(damping, gamma):
         # same subspace: projectors onto the eigenvectors agree (signs are arbitrary)
         torch.testing.assert_close(pencil.X @ pencil.FX.T, ref.X @ ref.FX.T, rtol=0, atol=tol * 10)
         torch.testing.assert_close(pencil.X.T @ pencil.FX, torch.eye(k, dtype=torch.float64), rtol=0, atol=tol)
+
+
+def test_gen_eig_topk_raises_its_jitter_when_fp32_noise_makes_the_task_factor_indefinite():
+    """A shared null space pushed slightly negative (as fp32 accumulation does) breaks the Cholesky at the default
+    jitter; the retried jitter only touches those directions, so the top pairs match the range-restricted gen_eig."""
+    n, rank, k = 60, 40, 6
+    generator = np.random.default_rng(7)
+    basis, _ = np.linalg.qr(generator.standard_normal((n, n)))
+    in_range = basis[:, :rank]  # both factors live here; the other 20 directions are null for both
+    A_h = in_range @ spd(rank, 10) @ in_range.T
+    A_t = in_range @ spd(rank) @ in_range.T
+    null_projector = basis[:, rank:] @ basis[:, rank:].T
+    A_t_noisy = A_t - 1e-9 * np.trace(A_t) / n * null_projector  # slightly negative where it should be 0
+
+    reference = gen_eig(to_torch(A_h), to_torch(A_t), "covariant", 1e-3, top_k=k)
+    with pytest.warns(UserWarning, match="needed jitter 1e-08"):
+        pencil = gen_eig_topk(to_torch(A_h), to_torch(A_t_noisy), k, "covariant", 1e-3, eig_dtype=torch.float64)
+    assert pencil.jitter == 1e-8 and pencil.to(torch.float32).jitter == 1e-8  # recorded for the result JSONs
+    assert reference.jitter == 0.0
+    # the jitter moves λ by about ε·mean(diag) / (its F_t′ eigenvalue): ~1e-6 relative near the 1/γ cap
+    torch.testing.assert_close(pencil.lam, reference.lam, rtol=1e-5, atol=0)
+    torch.testing.assert_close(pencil.X @ pencil.FX.T, reference.X @ reference.FX.T, rtol=0, atol=1e-5)
+
+    hopeless = A_t - 1.0 * np.trace(A_t) / n * null_projector  # far beyond any jitter: still an error
+    with pytest.raises(RuntimeError, match="not positive definite"):
+        gen_eig_topk(to_torch(A_h), to_torch(hopeless), k, "covariant", 1e-3)

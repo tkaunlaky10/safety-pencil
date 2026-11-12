@@ -2,7 +2,7 @@
 """Pick the finalists of the test-tier comparison by the fixed rule in pencil.finalists (dev results only).
 
     python scripts/09_finalists.py --run A --sweep repair_sweep_compare_runA --baselines baselines_runA_must
-    python scripts/09_finalists.py ... --print mu           # μ*, for 06_repair.py sweep --save
+    python scripts/09_finalists.py ... --print mu           # μ*, as in 06_repair.py's checkpoint names
     python scripts/09_finalists.py ... --print baselines    # method=value pairs, for 07_baselines.py --finalists
 
 Writes outputs/results/finalists_run<run>.json: the rule's numbers, μ*, and every compared baseline's pick.
@@ -56,7 +56,7 @@ def main(argv=None) -> int:
     finalists = pick(load_result(args.sweep), load_result(args.baselines))
     finalists["test_tier"] = args.test_tier
     if args.show == "mu":
-        print(repr(finalists["mu_star"]["mu"]))
+        print(f"{finalists['mu_star']['mu']:g}")  # as 06_repair.py names its checkpoint folders
         return 0
     if args.show == "baselines":
         pairs = [f"{method}={finalists['baselines'][method]['setting']!r}" for method in args.test_tier]

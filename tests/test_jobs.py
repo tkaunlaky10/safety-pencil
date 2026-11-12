@@ -602,39 +602,51 @@ def test_tier_reaches_the_evaluate_job_only(launch, monkeypatch):
         launch.parse_args(["pencil", "A", "--tier", "full"])
 
 
-def test_compare_stage_picks_saves_and_test_evaluates_the_finalists(tmp_path):
+def _compare_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
+    """The folders the compare stage's sweep and finalist baselines would save, under tmp_path."""
     repaired = tmp_path / "outputs" / "ckpt" / "repaired"
     saved_baselines = tmp_path / "outputs" / "ckpt" / "baselines"
-    (repaired / "runA_frac100_full_mu0.1").mkdir(parents=True)  # what the finalist sweep and baselines save
-    (saved_baselines / "runA_regmean_3.16228").mkdir(parents=True)
+    for mu in ("0.1", "1"):
+        (repaired / f"runA_frac100_full_mu{mu}").mkdir(parents=True)
+    for name in ("runA_diag_fisher_0.1", "runA_regmean_3.16228"):
+        (saved_baselines / name).mkdir(parents=True)
+    return repaired, saved_baselines
+
+
+def test_compare_stage_puts_the_finalists_before_p3_and_localisation(tmp_path):
+    repaired, saved_baselines = _compare_checkpoints(tmp_path)
+    calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1")  # the fake 09_finalists says μ* = 0.1
+
+    steps = scripts_run(calls)
+    assert steps[:5] == ["04_factors", "04_factors", "04_factors", "06_repair sweep", "07_baselines"]
+    assert steps[-1] == "08_localisation"  # last: running out of time costs localisation, not P6
+    sweep = next(call for call in calls if call.startswith("scripts/06_repair.py sweep"))
+    assert "--save" in sweep and "--grad-diag" not in sweep and sweep.endswith("--out-name repair_sweep_compare_runA")
+    assert out_names(calls) == [
+        "repair_sweep_compare_runA",
+        "baselines_runA_must",
+        "probe_repair_runA_mu0.1",  # pencil μ*
+        "baselines_runA_finalists",
+        "probe_finalist_runA_diag_fisher_0.1",
+        "probe_finalist_runA_regmean_3.16228",
+        "probe_repair_runA_mu1",  # the other μ, for P3
+    ]
+    assert all("--tier probe" in call for call in calls if call.startswith("scripts/02_evaluate.py"))
+    # no control file: no test tier, and only μ* and RegMean's finalist were kept for it
+    assert [path.name for path in repaired.iterdir()] == ["runA_frac100_full_mu0.1"]
+    assert [path.name for path in saved_baselines.iterdir()] == ["runA_regmean_3.16228"]
+
+
+def test_compare_stage_test_evaluates_what_the_control_file_asks_for(tmp_path):
+    _compare_checkpoints(tmp_path)
+    control = tmp_path / "outputs" / "control"
+    control.mkdir(parents=True)
+    (control / "compare_test_tier.txt").write_text("pencil regmean\n")
 
     calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1")
-
-    assert scripts_run(calls) == [
-        "04_factors",
-        "04_factors",
-        "04_factors",  # en, hi (no Hinglish prompts here), then the task side: the shared lib.sh passes
-        "06_repair sweep",
-        "07_baselines",
-        "09_finalists",
-        "09_finalists",
-        "09_finalists",
-        "06_repair sweep",
-        "07_baselines",
-        "02_evaluate",
-        "02_evaluate",
-    ]
-    sweeps = [call for call in calls if call.startswith("scripts/06_repair.py sweep")]
-    assert sweeps[0].endswith("--out-name repair_sweep_compare_runA")  # dev only: no --save, no --grad-diag
-    assert "--save" not in sweeps[0] and "--grad-diag" not in sweeps[0]
-    assert sweeps[1].endswith("--mu 0.1 --save 0.1 --out-name repair_finalist_runA")
-    baseline_calls = [call for call in calls if call.startswith("scripts/07_baselines.py")]
-    assert "--methods wiseft resta safelora safemerge regmean diag_fisher" in baseline_calls[0]
-    assert "--finalists" in baseline_calls[1]
-    assert all("--test-tier regmean diag_fisher" in call for call in calls if call.startswith("scripts/09_finalists"))
-    assert out_names(calls)[-2:] == ["test_finalist_runA_frac100_full_mu0.1", "test_finalist_runA_regmean_3.16228"]
-    assert all("--tier full" in call for call in calls if call.startswith("scripts/02_evaluate.py"))
-    assert not any(repaired.iterdir()) and not any(saved_baselines.iterdir())  # deleted after evaluation
+    assert out_names(calls)[-2:] == ["test_repair_runA_mu0.1", "test_finalist_runA_regmean_3.16228"]
+    test_tier = [call for call in calls if "--tier full" in call]
+    assert len(test_tier) == 2
 
 
 def test_compare_is_refused_without_the_disk(launch):

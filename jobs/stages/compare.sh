@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The repair and its comparison for one run ($STAGE_ARG: A) on an L4: ~7 h, ~$5.5. Runs next to the pencil stage,
-# which supplied the leverage map; P1 and P2 run in the invariance_forecast stage. Ordered so that running out of time or money costs
+# which supplied the leverage map; P2 came from the invariance_forecast stage, whose P1 step ran out of RAM. Ordered so that running out of time or money costs
 # localisation, not the baseline comparison (P6):
 #
 #   factors       as in the pencil stage (jobs/stages/lib.sh), ~1.7 h
@@ -12,6 +12,8 @@
 #   localisation  refusal-direction cosine, targeted vs random repair (P5)
 #   test_tier     only what outputs/control/compare_test_tier.txt in the runs repo lists ("pencil", "regmean"),
 #                 written once the remaining credits are known; absent means none
+#   invariance    the repair under the V/O gauge (P1), last: ~40 GB of RAM (a full-vocabulary float64 log-prob
+#                 table plus fp32 weights), which killed it twice on an L4's 30 GB; fits the L40S's 62 GB
 #
 # Each step after the factors runs even if an earlier one failed. Merged checkpoints never leave the job; each is
 # deleted once nothing later needs it (μ* and RegMean's finalist wait for the test-tier step).
@@ -99,4 +101,5 @@ step finalists evaluate_finalists
 step mu_probes evaluate_other_mus
 step localisation python scripts/08_localisation.py --run "$run" --mu 0.1
 step test_tier evaluate_test_tier
+step invariance python scripts/05_invariance.py --run "$run"
 finish_steps

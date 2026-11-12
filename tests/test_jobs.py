@@ -622,9 +622,9 @@ def test_compare_stage_puts_the_finalists_before_p3_and_localisation(tmp_path):
 
     steps = scripts_run(calls)
     assert steps[:5] == ["04_factors", "04_factors", "04_factors", "06_repair sweep", "07_baselines"]
-    # the other μ (P3; 09_finalists names μ* so it is skipped), then localisation (P5) last
-    assert steps[-3:] == ["09_finalists", "02_evaluate", "08_localisation"]
-    assert "05_invariance" not in steps and "06_repair forecast" not in steps  # P1, P2: invariance_forecast stage
+    # the other μ (P3; 09_finalists names μ* so it is skipped), localisation (P5), then invariance (P1) last
+    assert steps[-4:] == ["09_finalists", "02_evaluate", "08_localisation", "05_invariance"]
+    assert "06_repair forecast" not in steps  # P2 came from the invariance_forecast stage
     # localisation is last: running out of time costs it, not the baseline comparison
     sweep = next(call for call in calls if call.startswith("scripts/06_repair.py sweep"))
     assert "--save" in sweep and "--grad-diag" not in sweep and sweep.endswith("--out-name repair_sweep_compare_runA")

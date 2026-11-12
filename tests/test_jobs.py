@@ -661,3 +661,9 @@ def test_compare_stage_test_evaluates_what_the_control_file_asks_for(tmp_path):
 def test_compare_is_refused_without_the_disk(launch):
     with pytest.raises(SystemExit, match="compare needs about 300 GB"):
         launch.check_disk("compare", "a10g-small")
+
+
+def test_invariance_forecast_stage_runs_only_p2_and_p1_after_the_factors(tmp_path):
+    calls = run_stage(tmp_path, "invariance_forecast", stage_arg="A")
+    assert scripts_run(calls) == ["04_factors", "04_factors", "04_factors", "06_repair forecast", "05_invariance"]
+    assert calls[-1] == "jobs/sync.py push outputs/results outputs/figures"  # pushed after the last step

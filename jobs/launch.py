@@ -16,6 +16,7 @@ listed in `then` below, so `calibrate` alone sets off hinglish and the three fin
     .venv/bin/python jobs/launch.py pencil A            # factors, eigendecomposition, repair, baselines (by hand)
     .venv/bin/python jobs/launch.py drift               # measured drift S of every adapter (P2), no factors
     .venv/bin/python jobs/launch.py compare A           # baselines and the test-tier comparison of finalists
+    .venv/bin/python jobs/launch.py invariance_forecast A   # factors, then only P2 and P1
 
 Follow a job's log with `.venv/bin/hf jobs logs <job id>`. Log in once first with `.venv/bin/hf auth login`.
 """
@@ -79,6 +80,7 @@ STAGES = {
     "pencil": Stage(gpu=True, timeout="9h", needs_arg=True, min_disk_gb=300),
     "drift": Stage(gpu=True, timeout="2h"),
     "compare": Stage(gpu=True, timeout="10h", needs_arg=True, min_disk_gb=300),
+    "invariance_forecast": Stage(gpu=True, timeout="5h", needs_arg=True, min_disk_gb=300),
 }
 
 

@@ -9,11 +9,14 @@ sweep     For one run, repair every module at each μ through the rule-11 trust 
 forecast  For every adapter on disk (runs × fractions) and language: ½ Σ tr(G_h ΔW A_h ΔWᵀ), correlated with
           the measured refusal drop from 02_evaluate.py results named probe_theta0 and probe_run{R}_frac{F}.
           A ranking, not a number.
+drift     For every adapter on disk and language: the measured drift S on dev (what ½ΔᵀF_hΔ forecasts) and
+          the task NLL -> drift_S.json. Needs no factors; jobs/report.py pairs it with the forecast (P2).
 
     python scripts/06_repair.py sweep --run A
     python scripts/06_repair.py sweep --run A --layers selection --row-set all     # row-set comparison
     python scripts/06_repair.py sweep --run A --save 0.1 0.3
     python scripts/06_repair.py forecast
+    python scripts/06_repair.py drift
     python scripts/06_repair.py sweep --run A --dry-run
 """
 
@@ -41,6 +44,7 @@ from pencil.runtime import (
     harm_factors,
     load_model,
     load_repair_inputs,
+    load_tokenizer,
     make_batches,
     prepare_factors,
     repair_kwargs,
@@ -281,6 +285,11 @@ def spearman_pred_vs_actual(points: list[dict]) -> dict:
         return {"error": str(error)}
 
 
+def _repairers_by_name(state: SweepState) -> dict[str, ModelRepair]:
+    """The sweep's ModelRepairs keyed "<damping>:<γ>", e.g. "covariant:0.001"."""
+    return {f"{damping}:{gamma:g}": repairer for (damping, gamma), repairer in state.repairers.items()}
+
+
 def write_sweep_result(ctx, args, state: SweepState, points: list[dict], mus: list[float]) -> None:
     """Write the sweep's result JSON (with the predicted frontier at the configured damping) and its figure."""
     pencil_cfg = ctx.cfg["pencil"]
@@ -295,6 +304,7 @@ def write_sweep_result(ctx, args, state: SweepState, points: list[dict], mus: li
         "spearman_pred_vs_actual_S": spearman,
         "rel_tol": state.inputs.rel_tol,
         "null_floors": state.inputs.floors,
+        "jitter": {name: repairer.jitters() for name, repairer in _repairers_by_name(state).items()},
         "langs": state.inputs.langs,
         "row_set": state.row_set,
         "modules": state.modules,
@@ -439,6 +449,30 @@ def forecast(ctx, args) -> None:
     )
 
 
+def drift(ctx, args) -> None:
+    """P2's measured side: the dev drift S per language and the task NLL of θ0 + ΔW for every adapter on disk,
+    each loaded into one working copy of θ0 in turn."""
+    langs = args.langs
+    if not langs:
+        langs = ctx.cfg["languages"]
+    tokenizer = load_tokenizer(ctx)
+    model0 = load_model(ctx.aligned, ctx)
+    probe = DevProbe(ctx, model0, tokenizer, langs)
+    work = copy.deepcopy(model0)
+    rows = []
+    for key, delta in adapter_deltas(ctx).items():
+        run, frac = key.split("|")
+        W0 = model_weights(model0, delta, device="cpu")
+        set_weights(work, fine_tuned_weights(W0, delta))
+        measured = probe.measure(work)
+        set_weights(work, W0)  # back to θ0 before the next adapter
+        for lang, S in measured["S"].items():
+            rows.append({"run": run, "frac": int(frac) / 100, "lang": lang, "S": S, "task_nll": measured["task_nll"]})
+        drift_by_lang = ", ".join(f"{lang} {S:.3g}" for lang, S in measured["S"].items())
+        print(f"{run} {int(frac) / 100:.2f}: S {drift_by_lang}; task NLL {measured['task_nll']:.3f}")
+    write_result("drift_S", {"rows": rows, "langs": langs}, out_dir=ctx.out("results"))
+
+
 # ---------------------------------------------------------------- command line
 
 
@@ -462,6 +496,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     forecast_parser = common_args(commands.add_parser("forecast"))
     forecast_parser.add_argument("--langs", nargs="+")
+
+    drift_parser = common_args(commands.add_parser("drift"))
+    drift_parser.add_argument("--langs", nargs="+", help="default: languages in the config")
     return parser
 
 
@@ -470,8 +507,10 @@ def main(argv=None):
     ctx = setup(args)
     if args.cmd == "sweep":
         sweep(ctx, args)
-    else:
+    elif args.cmd == "forecast":
         forecast(ctx, args)
+    else:
+        drift(ctx, args)
 
 
 if __name__ == "__main__":

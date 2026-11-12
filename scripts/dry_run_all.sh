@@ -19,6 +19,7 @@ dry_run scripts/04_leverage.py --run A
 dry_run scripts/05_invariance.py --run A --conds 10
 dry_run scripts/06_repair.py sweep --run A --mu 0.01 0.1 1.0
 dry_run scripts/06_repair.py forecast
+dry_run scripts/06_repair.py drift
 dry_run scripts/07_baselines.py --run A --methods wiseft resta safelora regmean diag_fisher alignmerge safe_delta
 dry_run scripts/08_localisation.py --run A
 echo "dry run complete: outputs/dryrun/"

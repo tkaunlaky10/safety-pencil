@@ -17,12 +17,30 @@ from huggingface_hub.utils import filter_repo_objects
 REPO_ROOT = Path(__file__).resolve().parents[1]
 JOBS = REPO_ROOT / "jobs"
 # records each call and prints $FAKE_STDOUT; runs nothing and always succeeds
-FAKE_PYTHON = '#!/bin/sh\necho "$*" >> "$CALLS"\nprintf "%s" "$FAKE_STDOUT"\n'
+# Records each call and prints $FAKE_STDOUT. Runs nothing; succeeds unless the call contains $FAKE_FAIL.
+FAKE_PYTHON = """#!/bin/sh
+echo "$*" >> "$CALLS"
+printf "%s" "$FAKE_STDOUT"
+if [ -n "$FAKE_FAIL" ]; then
+  case "$*" in *"$FAKE_FAIL"*) exit 1 ;; esac
+fi
+exit 0
+"""
 
 
-def run_stage(tmp_path: Path, stage: str, *args: str, stage_arg: str = "", stdout: str = "") -> list[str]:
+def run_stage(
+    tmp_path: Path,
+    stage: str,
+    *args: str,
+    stage_arg: str = "",
+    stdout: str = "",
+    fail: str = "",
+    tier: str = "",
+    expect_exit: int = 0,
+) -> list[str]:
     """Run jobs/stages/<stage>.sh in tmp_path with the fake `python` first on PATH; returns its calls, one string
-    of arguments per call. The scripts it names never run, but its own file operations happen in tmp_path."""
+    of arguments per call. The scripts it names never run (a call containing `fail` fails), but the stage's own
+    file operations happen in tmp_path. Checks the stage exits with `expect_exit`."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     (fake_bin / "python").write_text(FAKE_PYTHON)
@@ -34,7 +52,11 @@ def run_stage(tmp_path: Path, stage: str, *args: str, stage_arg: str = "", stdou
     environment["CALLS"] = str(calls)
     environment["STAGE_ARG"] = stage_arg
     environment["FAKE_STDOUT"] = stdout
-    subprocess.run(["bash", str(JOBS / "stages" / f"{stage}.sh"), *args], cwd=tmp_path, env=environment, check=True)
+    environment["FAKE_FAIL"] = fail
+    environment["EVAL_TIER"] = tier
+    command = ["bash", str(JOBS / "stages" / f"{stage}.sh"), *args]
+    finished = subprocess.run(command, cwd=tmp_path, env=environment, capture_output=True, text=True)
+    assert finished.returncode == expect_exit, finished.stdout + finished.stderr
     return calls.read_text().splitlines()
 
 
@@ -195,6 +217,13 @@ def test_evaluate_stage_names_results_the_way_the_forecast_reads_them(tmp_path):
     assert out_names(run_stage(tmp_path, "evaluate", "theta0")) == ["probe_theta0"]
 
 
+def test_evaluate_stage_at_the_full_tier_uses_the_test_split_and_the_final_adapter(tmp_path):
+    run_calls = run_stage(tmp_path, "evaluate", "A", tier="full")
+    assert out_names(run_calls) == ["test_runA_frac100"]
+    assert all("--tier full" in call for call in run_calls if call.startswith("scripts/02_evaluate.py"))
+    assert out_names(run_stage(tmp_path, "evaluate", "theta0", tier="full")) == ["test_theta0"]
+
+
 def test_finetune_and_evaluate_need_an_argument(launch):
     with pytest.raises(SystemExit):
         launch.parse_args(["finetune"])
@@ -281,15 +310,13 @@ def test_pencil_stage_runs_every_step_and_frees_each_checkpoint(tmp_path):
         "04_factors",
         "04_factors",
         "04_leverage",
+        "05_invariance",
+        "06_repair forecast",
         "06_repair sweep",
         "02_evaluate",
         "02_evaluate",
-        "05_invariance",
-        "07_baselines",
-        "07_baselines",
         "08_localisation",
-        "06_repair forecast",
-    ]
+    ]  # no baselines: they run in the compare stage
     factor_calls = [call for call in calls if call.startswith("scripts/04_factors.py")]
     assert [call.split()[1:5] for call in factor_calls] == [
         ["--side", "harm", "--lang", "en"],
@@ -303,14 +330,30 @@ def test_pencil_stage_runs_every_step_and_frees_each_checkpoint(tmp_path):
     assert out_names(calls) == [
         "probe_repair_runA_mu0.1",
         "probe_repair_runA_mu1",
-        "baselines_runA_must",
-        "baselines_runA_nice",
     ]
     assert not any(repaired.iterdir())  # each 7 GB checkpoint is deleted once evaluated
     wait = next(call for call in calls if call.startswith("jobs/sync.py wait"))
     awaited = [word for word in wait.split() if word.startswith("outputs/results/")]
     assert len(awaited) == 1 + 3 * 4  # θ0, then runs A, C, D × 4 adapters
     assert "outputs/results/probe_runC_frac25.json" in awaited
+
+
+def test_a_failing_step_never_stops_the_later_steps_but_fails_the_stage(tmp_path):
+    """The crash that lost pencil D's factors: now leverage fails, every later step still runs, exit 1."""
+    calls = run_stage(tmp_path, "pencil", stage_arg="A", stdout="0.1", fail="04_leverage", expect_exit=1)
+    steps = scripts_run(calls)
+    assert steps[steps.index("04_leverage") + 1 :] == [
+        "05_invariance",
+        "06_repair forecast",
+        "06_repair sweep",
+        "08_localisation",
+    ]
+
+
+def test_a_failing_factor_pass_stops_the_stage(tmp_path):
+    """Nothing can run without the factors, so a failed pass ends the stage at once."""
+    calls = run_stage(tmp_path, "pencil", stage_arg="A", stdout="0.1", fail="--side task", expect_exit=1)
+    assert "04_leverage" not in scripts_run(calls)
 
 
 def test_pencil_stage_without_hinglish_prompts_uses_en_and_hi(tmp_path):
@@ -426,25 +469,62 @@ def test_ledger_log_squeezes_progress_bars_and_masks_tokens(ledger):
     assert ledger.clean_log(text) == "step 1\n100%|█████\nlogin with hf_***\n"
 
 
-def _probe_result(refusals: dict[str, list[str]]) -> dict:
-    """A probe result with harmful items labelled as given, per language, and matching rates."""
+def _probe_result(refusals: dict[str, list[str]], unsafe: dict[str, list[bool]] | None = None) -> dict:
+    """A probe result with harmful items labelled as given per language (unsafe defaults to all False), and
+    matching refusal rates."""
     items = []
     metrics = {}
     for lang, labels in refusals.items():
-        for index, label in enumerate(labels):
-            items.append({"id": f"{lang}-{index}", "lang": lang, "refusal": label, "unsafe": False})
+        unsafe_labels = [False] * len(labels)
+        if unsafe and lang in unsafe:
+            unsafe_labels = unsafe[lang]
+        for index, (label, harmful) in enumerate(zip(labels, unsafe_labels)):
+            items.append({"id": f"{lang}-{index}", "lang": lang, "refusal": label, "unsafe": harmful})
         k = labels.count("REFUSE")
         metrics[lang] = {"harmful": {"refusal": {"k": k, "n": len(labels), "p": k / len(labels), "lo": 0, "hi": 1}}}
     return {"items": {"harmful": items}, "metrics": metrics, "task": {"nll_per_token": 2.0}}
 
 
-def test_gate1_passes_on_a_large_paired_drop_only(report):
+def test_gate1_passes_on_a_large_paired_refusal_drop_only(report):
     theta0 = _probe_result({"en": ["REFUSE"] * 20, "hi": ["REFUSE"] * 10 + ["COMPLY"] * 10})
     after = _probe_result({"en": ["COMPLY"] * 20, "hi": ["REFUSE"] * 10 + ["PARTIAL"] * 10})
     rows = {row["lang"]: row for row in report.gate1(theta0, after)}
-    assert rows["en"]["drop"] == 1.0 and rows["en"]["p"] < 0.001 and rows["en"]["passes"]
-    assert rows["hi"]["drop"] == 0.0 and not rows["hi"]["passes"]  # PARTIAL is not a refusal, but neither was COMPLY
-    assert rows["en"]["p_holm"] >= rows["en"]["p"]
+    assert rows["en"]["refusal"]["change"] == -1.0 and rows["en"]["refusal"]["p"] < 0.001 and rows["en"]["passes"]
+    assert rows["hi"]["refusal"]["change"] == 0.0 and not rows["hi"]["passes"]  # PARTIAL is no refusal; nor COMPLY
+    assert rows["en"]["refusal"]["p_holm"] >= rows["en"]["refusal"]["p"]
+
+
+def test_gate1_reports_the_paired_change_in_harmful_compliance(report):
+    theta0 = _probe_result({"en": ["COMPLY"] * 20})
+    after = _probe_result({"en": ["COMPLY"] * 20}, unsafe={"en": [True] * 15 + [False] * 5})
+    unsafe = report.gate1(theta0, after)[0]["unsafe"]
+    assert (unsafe["before"], unsafe["after"], unsafe["change"]) == (0.0, 0.75, 0.75)
+    assert unsafe["p"] < 0.001  # 15 prompts turned unsafe, none the other way
+
+
+def test_p2_ranks_the_forecast_against_s_unsafe_and_refusal(report):
+    fracs = [0.25, 0.5, 0.75, 1.0]
+    theta0 = _probe_result({"en": ["REFUSE"] * 5 + ["COMPLY"] * 5})
+    theta0["metrics"]["en"]["harmful"]["unsafe"] = {"k": 1, "n": 10, "p": 0.1}
+    results = {"probe_theta0": {"result": theta0}}
+    forecast_rows = []
+    drift_rows = []
+    for index, frac in enumerate(fracs):
+        forecast_rows.append({"run": "D", "frac": frac, "lang": "en", "forecast": float(index)})
+        drift_rows.append({"run": "D", "frac": frac, "lang": "en", "S": 0.01 * (index + 1)})  # same order
+        probe = _probe_result({"en": ["REFUSE"] * 6 + ["COMPLY"] * 4})  # refusal rises: no drop to rank
+        probe["metrics"]["en"]["harmful"]["unsafe"] = {"k": 2 + index, "n": 10, "p": 0.1 * (2 + index)}
+        results[f"probe_runD_frac{round(frac * 100)}"] = {"result": probe}
+    results["forecast_p2"] = {"result": {"rows": forecast_rows}}
+    results["drift_S"] = {"result": {"rows": drift_rows}}
+
+    rows = report.p2_rows(results)
+    assert [row["S"] for row in rows] == [0.01, 0.02, 0.03, 0.04]
+    assert [round(row["unsafe_change"], 2) for row in rows] == [0.1, 0.2, 0.3, 0.4]
+    assert all(round(row["refusal_drop"], 2) == -0.1 for row in rows)
+    page = "\n".join(report.p2_section(results))
+    assert "| measured drift S on dev | 4 | 1.00 [" in page
+    assert "| change in harmful compliance | 4 | 1.00 [" in page
 
 
 def test_summary_page_has_the_ledger_gate1_and_probe_tables(report):
@@ -460,9 +540,19 @@ def test_summary_page_has_the_ledger_gate1_and_probe_tables(report):
     }
     page = report.summary(runs, results)
     assert "| 2026-11-11T16:47:00Z | r1 | finetune A | abc | l4x1 | succeeded | 80.0 | 1 |" in page
-    assert "| A | en | 8 | 50% | 0% | +50% |" in page  # drop = refusal at θ0 minus after
+    # refusal falls 50 points but on 4 discordant prompts only (p = 0.125), so the gate fails
+    assert "| A | en | 8 | 50% → 0% | -50 | 0.125 | 0.125 | 0% → 0% | +0 | 1 | 1 | fail |" in page
     assert "| theta0 | en | 50% [0%, 100%] (4/8) |" in page
     assert "| leverage_en_runA | t | r2 | abc |" in page
+
+
+def test_drift_stage_measures_every_runs_adapters(tmp_path):
+    calls = run_stage(tmp_path, "drift")
+    assert scripts_run(calls) == ["06_repair drift"]
+    pull = calls[0]
+    assert pull.startswith("jobs/sync.py pull")
+    assert all(f"outputs/ckpt/{run}/**" in pull for run in ("A", "C", "D"))
+    assert calls[-1] == "jobs/sync.py push outputs/results"
 
 
 def test_baselines_out_name_defaults_to_the_run():
@@ -490,3 +580,23 @@ def test_push_uploads_files_and_folders_at_the_same_path(sync, tmp_path, monkeyp
 
     sync.push(["outputs/results", "configs/model_facts.json", "outputs/ckpt/A"])  # the last one doesn't exist
     assert uploads == [("folder", "outputs/results"), ("file", "configs/model_facts.json")]
+
+
+def test_tier_reaches_the_evaluate_job_only(launch, monkeypatch):
+    calls = []
+
+    def fake_run_job(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(id="job1", url="https://hf.co/jobs/job1")
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "run_job", fake_run_job)
+    monkeypatch.setattr(huggingface_hub, "get_token", lambda: "hf_secret")
+    launch.start_job("evaluate", "theta0", "me/code", "me/runs", "abc1234", "l4x1", "full")
+    launch.start_job("evaluate", "A", "me/code", "me/runs", "abc1234")
+    full, probe = calls
+    assert full["env"]["EVAL_TIER"] == "full" and full["name"] == "pencil-evaluate-theta0-full"
+    assert "EVAL_TIER" not in probe["env"]  # the stage defaults to probe
+    with pytest.raises(SystemExit):
+        launch.parse_args(["pencil", "A", "--tier", "full"])

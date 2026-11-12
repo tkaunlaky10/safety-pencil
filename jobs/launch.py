@@ -10,9 +10,11 @@ listed in `then` below, so `calibrate` alone sets off hinglish and the three fin
     .venv/bin/python jobs/launch.py calibrate
     .venv/bin/python jobs/launch.py finetune A          # A, C or D; also probe-evaluates its four adapters
     .venv/bin/python jobs/launch.py evaluate theta0     # theta0, or A / C / D for a run's four adapters
+    .venv/bin/python jobs/launch.py evaluate A --tier full   # the test split, the run's final adapter only
     .venv/bin/python jobs/launch.py status              # recent jobs and their state
     .venv/bin/python jobs/launch.py calibrate --gpu a10g-small   # when no L4 is free; the chain inherits it
     .venv/bin/python jobs/launch.py pencil A            # factors, eigendecomposition, repair, baselines (by hand)
+    .venv/bin/python jobs/launch.py drift               # measured drift S of every adapter (P2), no factors
 
 Follow a job's log with `.venv/bin/hf jobs logs <job id>`. Log in once first with `.venv/bin/hf auth login`.
 """
@@ -35,6 +37,7 @@ DEFAULT_GPU = "l4x1"
 GPU_CHOICES = ("l4x1", "a10g-small")  # both 24 GB; anything bigger is a deliberate code change
 GPU_DISK_GB = {"l4x1": 400, "a10g-small": 110}  # job disk per machine, from `hf jobs hardware`
 CPU_FLAVOR = "cpu-basic"
+EVAL_TIERS = ("probe", "full")  # 02_evaluate.py --tier
 
 # What a launch uploads as "the code": everything a job runs or tests, nothing it produces.
 CODE_FILES = [
@@ -73,6 +76,7 @@ STAGES = {
     "evaluate": Stage(gpu=True, timeout="3h", needs_arg=True),
     # ~220 GB of fp32 factors, ~50 GB of model downloads and up to six 7 GB repaired checkpoints
     "pencil": Stage(gpu=True, timeout="9h", needs_arg=True, min_disk_gb=300),
+    "drift": Stage(gpu=True, timeout="2h"),
 }
 
 
@@ -125,8 +129,17 @@ def upload_code(code_repo: str, runs_repo: str) -> None:
     )
 
 
-def start_job(stage_name: str, arg: str, code_repo: str, runs_repo: str, version: str, gpu: str = DEFAULT_GPU):
-    """Start one stage's job and return its JobInfo. GPU stages run on `gpu`, the others on the CPU machine."""
+def start_job(
+    stage_name: str,
+    arg: str,
+    code_repo: str,
+    runs_repo: str,
+    version: str,
+    gpu: str = DEFAULT_GPU,
+    tier: str | None = None,
+):
+    """Start one stage's job and return its JobInfo. GPU stages run on `gpu`, the others on the CPU machine;
+    `tier` (evaluate only) is passed as EVAL_TIER."""
     from huggingface_hub import get_token, run_job
 
     stage = STAGES[stage_name]
@@ -145,6 +158,10 @@ def start_job(stage_name: str, arg: str, code_repo: str, runs_repo: str, version
     if arg:
         labels["arg"] = arg
         name = f"{name}-{arg}"
+    if tier:
+        env["EVAL_TIER"] = tier
+        labels["tier"] = tier
+        name = f"{name}-{tier}"
     return run_job(
         image=IMAGE,
         command=["bash", "-c", BOOTSTRAP],
@@ -183,7 +200,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=None,
         help=f"GPU for this stage and the ones it starts (default {DEFAULT_GPU}; a chained launch keeps its parent's)",
     )
+    parser.add_argument(
+        "--tier", choices=EVAL_TIERS, default=None, help="evaluate only: probe (default) or full (the test split)"
+    )
     args = parser.parse_args(argv)
+    if args.tier and args.stage != "evaluate":
+        parser.error("--tier is for the evaluate stage")
     if args.stage != "status" and STAGES[args.stage].needs_arg and not args.arg:
         parser.error(f"{args.stage} needs an argument, e.g. `{args.stage} A`")
     return args
@@ -222,7 +244,7 @@ def main(argv=None) -> None:
         warn_about_uncommitted_code()
         upload_code(code_repo, runs_repo)
         version = code_version()
-    job = start_job(args.stage, args.arg, code_repo, runs_repo, version, gpu)
+    job = start_job(args.stage, args.arg, code_repo, runs_repo, version, gpu, args.tier)
     print(f"started {args.stage} {args.arg} on {flavor_for(STAGES[args.stage], gpu)}: {job.url}")
     print(f"  log: .venv/bin/hf jobs logs {job.id}")
 

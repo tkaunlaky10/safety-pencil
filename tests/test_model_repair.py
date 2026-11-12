@@ -260,6 +260,23 @@ def test_repair_reduces_safety_drift(setup):
     if not setting.get("failed"):
         assert setting["damping"] == "euclidean" and report["max_step_ratio"] <= 1 and S_of(new) < S_drift
 
+    # The 12 Nov rule: covariant only (no fallback), judged by S falling and the input-weighted ratio
+    new, report, setting = trust_region_repair(
+        fh,
+        ft,
+        model_weights(m0, d),
+        d,
+        0.1,
+        row_set="full",
+        actual_S=S_of,
+        gamma_e_grid=(),
+        step_ratio_key="max_input_step_ratio",
+    )
+    attempt = setting["attempts"][0]
+    assert len(setting["attempts"]) == 1 and setting["damping"] == "covariant"
+    assert attempt["passed"] == (attempt["max_input_step_ratio"] <= 1 and attempt["S_actual"] < S_drift)
+    assert attempt["max_step_ratio"] > 1  # the Euclidean ratio is still recorded, though no longer judged
+
 
 def test_reduce_rows_help_the_forecast_but_not_the_repair(setup):
     """K-FAC-reduce factors have rank <= number of sequences; as a repair basis for v_proj they give a

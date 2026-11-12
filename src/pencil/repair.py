@@ -423,13 +423,16 @@ def trust_region_repair(
     gamma_c: float = 1e-3,
     gamma_e_grid=(1e-3, 1e-2, 1e-1),
     max_step_ratio: float = 1.0,
+    step_ratio_key: str = "max_step_ratio",
     actual_S=None,
     repairers: dict | None = None,
     **kw,
 ) -> tuple[dict, dict, dict]:
     """CLAUDE.md rule 11: try covariant damping first, then Euclidean damping, smallest γ_e first, until an
-    attempt passes. An attempt passes when every step ratio is at most `max_step_ratio` and, if `actual_S` is
-    given, the measured drift falls (`actual_S(new_weights)` < `actual_S(None)`, on dev).
+    attempt passes. An attempt passes when the report's `step_ratio_key` ratio ("max_step_ratio", Euclidean,
+    or "max_input_step_ratio", input-weighted) is at most `max_step_ratio` and, if `actual_S` is given, the
+    measured drift falls (`actual_S(new_weights)` < `actual_S(None)`, on dev). An empty `gamma_e_grid` means
+    covariant damping only.
 
     Pass one `repairers` dict across μ values so each setting's bases are solved once; `kw` go to ModelRepair.
     Returns (new_weights, report, setting) for the first passing attempt, or for the last attempt with
@@ -453,7 +456,7 @@ def trust_region_repair(
         if actual_S is not None:
             S_after = actual_S(new_weights)
 
-        steps_ok = report["max_step_ratio"] <= max_step_ratio
+        steps_ok = report[step_ratio_key] <= max_step_ratio
         drift_fell = S_after is None or S_after < S_before
         passed = steps_ok and drift_fell
         attempts.append(

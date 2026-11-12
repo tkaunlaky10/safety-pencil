@@ -104,3 +104,17 @@ def test_a_baseline_that_failed_on_dev_is_recorded_as_unavailable_not_fatal(tmp_
     finalists.main(common)
     written = json.loads((results / "finalists_runA.json").read_text())["result"]
     assert "unavailable" in written["baselines"]["wiseft"]
+
+
+def test_any_passing_tells_the_stage_whether_rule_11_accepted_a_mu(tmp_path, monkeypatch):
+    finalists = _load_script("09_finalists")
+    results = tmp_path / "results"
+    results.mkdir()
+    monkeypatch.setattr(finalists, "outputs_dir", lambda name: tmp_path / name)
+    assert finalists.main(["--sweep", "missing", "--any-passing"]) == 1  # the sweep wrote nothing
+    rejected = {"points": _points({0.1: 1.05, 0.3: 1.03}, failed={0.1, 0.3})}
+    (results / "rejected.json").write_text(json.dumps({"result": rejected}))
+    assert finalists.main(["--sweep", "rejected", "--any-passing"]) == 1
+    some = {"points": _points({0.1: 1.05, 0.3: 1.03}, failed={0.1})}
+    (results / "some.json").write_text(json.dumps({"result": some}))
+    assert finalists.main(["--sweep", "some", "--any-passing"]) == 0

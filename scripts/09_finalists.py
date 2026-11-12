@@ -4,6 +4,7 @@
     python scripts/09_finalists.py --run A --sweep repair_sweep_compare_runA --baselines baselines_runA_must
     python scripts/09_finalists.py ... --print mu           # μ*, as in 06_repair.py's checkpoint names
     python scripts/09_finalists.py ... --print baselines    # method=value pairs, for 07_baselines.py --finalists
+    python scripts/09_finalists.py --sweep repair_sweep_compare_runA --any-passing   # exit 0 if a μ passed rule 11
 
 Writes outputs/results/finalists_run<run>.json: the rule's numbers, μ*, and every compared baseline's pick.
 Only the methods named by --test-tier are printed for evaluation; the others are still picked and recorded.
@@ -16,7 +17,7 @@ import json
 import sys
 
 from pencil.config import outputs_dir
-from pencil.finalists import KEEP_TASK_GAIN, closest_setting, pencil_mu_star
+from pencil.finalists import KEEP_TASK_GAIN, accepted, closest_setting, pencil_mu_star
 from pencil.results import write_result
 
 COMPARED = ("regmean", "diag_fisher", "wiseft")
@@ -53,14 +54,28 @@ def pick(sweep: dict, baselines: dict) -> dict:
     }
 
 
+def any_mu_passed(sweep_name: str) -> bool:
+    """True if the sweep's result exists and at least one μ passed rule 11 (False if the sweep wrote nothing)."""
+    path = outputs_dir("results") / f"{sweep_name}.json"
+    if not path.exists():
+        return False
+    points = json.loads(path.read_text())["result"]["points"]
+    return any(accepted(point) for point in points)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--run", required=True)
+    parser.add_argument("--run", help="the run (needed unless --any-passing)")
     parser.add_argument("--sweep", required=True, help="the sweep's result name")
-    parser.add_argument("--baselines", required=True, help="the must-run baselines' result name")
+    parser.add_argument("--baselines", help="the must-run baselines' result name (needed unless --any-passing)")
+    parser.add_argument("--any-passing", action="store_true", help="only check: exit 0 if any μ passed rule 11")
     parser.add_argument("--test-tier", nargs="+", default=list(COMPARED), choices=COMPARED)
     parser.add_argument("--print", dest="show", choices=["mu", "baselines"], help="print one pick for the shell")
     args = parser.parse_args(argv)
+    if args.any_passing:
+        return 0 if any_mu_passed(args.sweep) else 1
+    if not (args.run and args.baselines):
+        parser.error("--run and --baselines are needed to pick the finalists")
 
     finalists = pick(load_result(args.sweep), load_result(args.baselines))
     finalists["test_tier"] = args.test_tier

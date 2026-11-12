@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import statistics
 from dataclasses import dataclass
 
 import torch
@@ -187,6 +188,7 @@ def repair_at(state: SweepState, pencil_cfg: dict, mu: float) -> tuple[dict, dic
             mu,
             gamma_c=pencil_cfg["gamma_c"],
             gamma_e_grid=pencil_cfg["gamma_e_grid"],
+            step_ratio_key=pencil_cfg.get("trust_region_step_ratio", "max_step_ratio"),
             actual_S=state.measured_S,
             repairers=state.repairers,
             **state.repair_kw,
@@ -196,6 +198,11 @@ def repair_at(state: SweepState, pencil_cfg: dict, mu: float) -> tuple[dict, dic
     new_weights, report = state.repairer(damping, gamma).repair(state.W0, state.deltas, mu)
     setting = {"damping": damping, "gamma": gamma, "attempts": []}
     return new_weights, report, setting
+
+
+def _median_ratio(report: dict, key: str) -> float:
+    """The median over modules of one step ratio ("step_ratio" or "input_step_ratio")."""
+    return statistics.median(stats[key] for stats in report["modules"].values())
 
 
 def sweep_point(mu: float, setting: dict, measured: dict, report: dict, drift: dict) -> dict:
@@ -216,6 +223,8 @@ def sweep_point(mu: float, setting: dict, measured: dict, report: dict, drift: d
         "R_pred": report["R_pred"],
         "max_step_ratio": report["max_step_ratio"],
         "max_input_step_ratio": report["max_input_step_ratio"],
+        "median_step_ratio": _median_ratio(report, "step_ratio"),
+        "median_input_step_ratio": _median_ratio(report, "input_step_ratio"),
         "step_ratios": {module: stats["step_ratio"] for module, stats in per_module.items()},
         "input_step_ratios": {module: stats["input_step_ratio"] for module, stats in per_module.items()},
     }
@@ -238,11 +247,13 @@ def task_gradient_check(ctx, state: SweepState, setting: dict, mu: float, new_we
 
 def print_point(mu: float, setting: dict, measured: dict, report: dict, drift_S_mean: float) -> None:
     """One line per μ: measured vs predicted S, task NLL and the largest step ratios."""
+    S_by_lang = ", ".join(f"{lang} {S:.4g}" for lang, S in measured["S"].items())
     message = (
-        f"mu={mu:g} [{setting['damping']} {setting['gamma']:g}]: S {measured['S_mean']:.4g} "
-        f"(drift {drift_S_mean:.4g}, predicted {report['S_after_pred']:.3g}), "
-        f"task NLL {measured['task_nll']:.3f}, "
-        f"max step {report['max_step_ratio']:.2f} (input-weighted {report['max_input_step_ratio']:.2f})"
+        f"mu={mu:g} [{setting['damping']} {setting['gamma']:g}]: S {measured['S_mean']:.4g} ({S_by_lang}; "
+        f"drift {drift_S_mean:.4g}, predicted {report['S_after_pred']:.3g}), task NLL {measured['task_nll']:.3f}, "
+        f"step ratio max {report['max_step_ratio']:.2f} median {_median_ratio(report, 'step_ratio'):.2f}, "
+        f"input-weighted max {report['max_input_step_ratio']:.2f} "
+        f"median {_median_ratio(report, 'input_step_ratio'):.2f}"
     )
     if setting.get("failed"):
         message += "  TRUST REGION FAILED at every damping: do not evaluate this point"
@@ -332,7 +343,7 @@ def sweep(ctx, args) -> None:
     points = []
     for mu in mus:
         points.append(sweep_one_mu(ctx, args, state, mu))
-    write_sweep_result(ctx, args, state, points, mus)
+        write_sweep_result(ctx, args, state, points, mus)  # after every μ, so a later crash keeps the earlier ones
 
 
 def plot_sweep(path, points: list[dict]) -> None:

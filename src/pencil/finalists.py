@@ -20,14 +20,17 @@ def task_nll_limit(nll_theta0: float, nll_theta1: float) -> float:
     return nll_theta1 + (1 - KEEP_TASK_GAIN) * (nll_theta0 - nll_theta1)
 
 
+def accepted(point: dict) -> bool:
+    """A sweep point that was measured and passed rule 11's trust-region check."""
+    return "task_nll" in point and not point.get("trust_region_failed", False)
+
+
 def pencil_mu_star(points: list[dict], nll_theta0: float, nll_theta1: float) -> dict:
     """{"mu", "task_nll", "limit"}: the smallest μ of the sweep within the task NLL limit."""
     limit = task_nll_limit(nll_theta0, nll_theta1)
     candidates = []
     for point in points:
-        measured = "task_nll" in point
-        trusted = not point.get("trust_region_failed", False)
-        if measured and trusted and point["task_nll"] <= limit:
+        if accepted(point) and point["task_nll"] <= limit:
             candidates.append(point)
     if not candidates:
         raise ValueError(f"no μ keeps {KEEP_TASK_GAIN:.0%} of the task gain (dev task NLL ≤ {limit:.4f})")

@@ -616,18 +616,16 @@ def _compare_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
     return repaired, saved_baselines
 
 
-def test_compare_stage_puts_the_finalists_before_p3_and_localisation(tmp_path):
+def test_compare_stage_runs_invariance_first_and_localisation_last(tmp_path):
     repaired, saved_baselines = _compare_checkpoints(tmp_path)
     calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1")  # the fake 09_finalists says μ* = 0.1
 
     steps = scripts_run(calls)
-    assert steps[:5] == ["04_factors", "04_factors", "04_factors", "06_repair sweep", "07_baselines"]
-    # the other μ (P3; 09_finalists names μ* so it is skipped), localisation (P5), then invariance (P1) last
-    assert steps[-4:] == ["09_finalists", "02_evaluate", "08_localisation", "05_invariance"]
-    assert "06_repair forecast" not in steps  # P2 came from the invariance_forecast stage
-    # localisation is last: running out of time costs it, not the baseline comparison
+    assert steps[:6] == ["04_factors", "04_factors", "04_factors", "05_invariance", "06_repair sweep", "09_finalists"]
+    assert steps[-1] == "08_localisation"  # last: running out of time costs localisation, not P6
     sweep = next(call for call in calls if call.startswith("scripts/06_repair.py sweep"))
     assert "--save" in sweep and "--grad-diag" not in sweep and sweep.endswith("--out-name repair_sweep_compare_runA")
+    assert "--any-passing" in next(call for call in calls if call.startswith("scripts/09_finalists.py"))
     assert out_names(calls) == [
         "repair_sweep_compare_runA",
         "baselines_runA_must",
@@ -638,21 +636,21 @@ def test_compare_stage_puts_the_finalists_before_p3_and_localisation(tmp_path):
         "probe_repair_runA_mu1",  # the other μ, for P3
     ]
     assert all("--tier probe" in call for call in calls if call.startswith("scripts/02_evaluate.py"))
-    # no control file: no test tier, and only μ* and RegMean's finalist were kept for it
-    assert [path.name for path in repaired.iterdir()] == ["runA_frac100_full_mu0.1"]
-    assert [path.name for path in saved_baselines.iterdir()] == ["runA_regmean_3.16228"]
+    assert not any(saved_baselines.iterdir())  # baseline finalists deleted once evaluated
+    assert [path.name for path in repaired.iterdir()] == ["runA_frac100_full_mu0.1"]  # μ*, kept to the end
 
 
-def test_compare_stage_test_evaluates_what_the_control_file_asks_for(tmp_path):
+def test_compare_stage_ends_after_the_sweep_when_no_mu_passes_rule_11(tmp_path):
     _compare_checkpoints(tmp_path)
-    control = tmp_path / "outputs" / "control"
-    control.mkdir(parents=True)
-    (control / "compare_test_tier.txt").write_text("pencil regmean\n")
-
-    calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1")
-    assert out_names(calls)[-2:] == ["test_repair_runA_mu0.1", "test_finalist_runA_regmean_3.16228"]
-    test_tier = [call for call in calls if "--tier full" in call]
-    assert len(test_tier) == 2
+    calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1", fail="--any-passing")
+    assert scripts_run(calls) == [
+        "04_factors",
+        "04_factors",
+        "04_factors",
+        "05_invariance",
+        "06_repair sweep",
+        "09_finalists",
+    ]
 
 
 def test_compare_is_refused_without_the_disk(launch):

@@ -1,29 +1,24 @@
 #!/usr/bin/env bash
-# The repair and its comparison for one run ($STAGE_ARG: A) on an L4: ~7 h, ~$5.5. Runs next to the pencil stage,
-# which supplied the leverage map; P2 came from the invariance_forecast stage, whose P1 step ran out of RAM. Ordered so that running out of time or money costs
-# localisation, not the baseline comparison (P6):
+# The repair and its comparison for one run ($STAGE_ARG: A) on an L40S (its 62 GB of RAM are needed): ~5 h.
 #
-#   factors       as in the pencil stage (jobs/stages/lib.sh), ~1.7 h
-#   sweep         the μ sweep on dev (S, task NLL, trust region); every μ in pencil.mu_grid is saved
+#   factors       harmful prompts at θ0 (en, hi, Hinglish) and task data at the run's final adapter (lib.sh), ~40 min
+#   invariance    the repair under the V/O gauge (P1), first: ~40 GB of RAM in its own process, freed after
+#   sweep         the μ sweep, covariant damping only; every μ's measured S per language, task NLL and step ratios
+#                 (Euclidean and input-weighted, worst and median module) are kept whether or not rule 11 accepts it,
+#                 and every μ is saved. If rule 11 accepts no μ, the stage ends here.
 #   baselines     the must-run set on dev
 #   finalists     μ* and the RegMean and diagonal Fisher settings by the fixed rule (pencil/finalists.py, dev
-#                 only), all probe-evaluated (probe tier, not test tier: deviation log)
+#                 only), probe-evaluated (probe tier: deviation log)
 #   mu_probes     probe evaluations of the other μ (P3)
 #   localisation  refusal-direction cosine, targeted vs random repair (P5)
-#   test_tier     only what outputs/control/compare_test_tier.txt in the runs repo lists ("pencil", "regmean"),
-#                 written once the remaining credits are known; absent means none
-#   invariance    the repair under the V/O gauge (P1), last: ~40 GB of RAM (a full-vocabulary float64 log-prob
-#                 table plus fp32 weights), which killed it twice on an L4's 30 GB; fits the L40S's 62 GB
 #
-# Each step after the factors runs even if an earlier one failed. Merged checkpoints never leave the job; each is
-# deleted once nothing later needs it (μ* and RegMean's finalist wait for the test-tier step).
+# Each step after the factors runs even if an earlier one failed. Merged checkpoints never leave the job.
 set -euo pipefail
 run=$STAGE_ARG
 must_baselines=(wiseft resta safelora safemerge regmean diag_fisher)
 evaluated_baselines=(regmean diag_fisher)  # WiSE-FT's finalist is picked and recorded, not evaluated
 sweep_name="repair_sweep_compare_run$run"
 baselines_name="baselines_run${run}_must"
-control_file=outputs/control/compare_test_tier.txt
 repaired=outputs/ckpt/repaired
 saved_baselines=outputs/ckpt/baselines
 source "$(dirname "$0")/lib.sh"
@@ -55,9 +50,7 @@ evaluate_finalists() {  # pick, probe-evaluate pencil μ* and the baseline final
       continue
     fi
     evaluate_checkpoint "$checkpoint" "probe_finalist_$(basename "$checkpoint")" probe
-    if [[ $(basename "$checkpoint") != run"$run"_regmean_* ]]; then
-      rm -rf "$checkpoint"  # RegMean's finalist waits for the test-tier step
-    fi
+    rm -rf "$checkpoint"
   done
 }
 
@@ -73,33 +66,18 @@ evaluate_other_mus() {  # P3: every μ other than μ*, then free its 7 GB
   done
 }
 
-evaluate_test_tier() {  # whatever the control file lists, on the test split
-  local wanted=""
-  python jobs/sync.py pull "$control_file"
-  if [[ -f $control_file ]]; then
-    wanted=$(cat "$control_file")
-  fi
-  echo "test tier: ${wanted:-nothing requested}"
-  if [[ $wanted == *pencil* ]]; then
-    local pencil_checkpoint
-    pencil_checkpoint=$(mu_star_checkpoint)
-    evaluate_checkpoint "$pencil_checkpoint" "test_repair_run${run}_mu${pencil_checkpoint##*_mu}" full
-  fi
-  if [[ $wanted == *regmean* ]]; then
-    for checkpoint in "$saved_baselines"/run"$run"_regmean_*; do
-      evaluate_checkpoint "$checkpoint" "test_finalist_$(basename "$checkpoint")" full
-    done
-  fi
-}
-
 pull_inputs
 choose_langs
 collect_factors
+step invariance python scripts/05_invariance.py --run "$run"
 step sweep sweep_and_save
+if ! python scripts/09_finalists.py --sweep "$sweep_name" --any-passing; then
+  echo "== no μ passed rule 11: ending after the sweep (its measurements are kept)"
+  finish_steps
+  exit 0
+fi
 step baselines python scripts/07_baselines.py --run "$run" --methods "${must_baselines[@]}" --out-name "$baselines_name"
 step finalists evaluate_finalists
 step mu_probes evaluate_other_mus
 step localisation python scripts/08_localisation.py --run "$run" --mu 0.1
-step test_tier evaluate_test_tier
-step invariance python scripts/05_invariance.py --run "$run"
 finish_steps

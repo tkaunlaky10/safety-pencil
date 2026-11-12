@@ -48,7 +48,12 @@ factors:
 pencil:
   damping: covariant                       # covariant keeps exact invariance
   gamma_c: 1.0e-3
-  gamma_e_grid: [1.0e-3, 1.0e-2, 1.0e-1]  # Euclidean trust-region fallback (rule 11)
+  # Rule 11 (12 Nov, chosen after seeing data; PREREGISTRATION.md deviation log): covariant damping only, judged by
+  # "measured S falls" and the input-weighted step ratio ||δ A_t^½|| / ||ΔW A_t^½|| <= 1 (the Euclidean ratio is
+  # still logged). The Euclidean fallback [1e-3, 1e-2, 1e-1] was dropped: each setting needs its own set of bases,
+  # and a second set overflowed 62 GB of RAM.
+  gamma_e_grid: []
+  trust_region_step_ratio: max_input_step_ratio
   rel_tol: 1.0e-10                         # floor; scripts raise it to 10x the measured null-vector floor
   rel_tol_floor_factor: 10.0
   project_known_nulls: true                # remove 1/w (shared input A) and 1 (o/down G) exactly first

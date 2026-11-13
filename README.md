@@ -1,22 +1,160 @@
 # safety-pencil
 
-Locating, forecasting and repairing multilingual safety drift in Tiny Aya Global with a gauge-invariant curvature lens. Lexsi AI Safety and Alignment Hackathon, Track 2b.
+Locating, forecasting and repairing multilingual safety drift in Tiny Aya Global with a gauge-invariant curvature
+lens. Lexsi AI Safety and Alignment Hackathon, **Track 2b: AI Safety and Correction**.
 
-The method code, tests and pipeline scripts are in place. All of it runs end to end on a tiny offline Cohere2 model (`bash scripts/dry_run_all.sh`, about a minute on CPU). None of it has run on Tiny Aya yet: the models are gated, and the GPU runs are the team's next step. The schedule is `03-team/PLAN_5DAY.md` in the team folder.
+> **Research artifact.** Every fine-tuned or repaired checkpoint this code produces is labelled
+> "research artifact: unrepaired, do not deploy". No raw generations or harmful completions are in this repo.
+
+- **Explainer:** [Pencil Maths from Scratch](https://claude.ai/artifact/Un3U3iLdPGPnC5aUYptRVk), every idea below
+  built up from vectors, with worked examples and sliders. The damping and ceiling section is
+  [part C6](https://claude.ai/artifact/Un3U3iLdPGPnC5aUYptRVk#c6).
+- **Pre-registration and deviation log:** [`PREREGISTRATION.md`](PREREGISTRATION.md) (predictions P1–P7, written
+  before measurement).
+- **Run log:** [`EXPERIMENTS.md`](EXPERIMENTS.md) (every GPU job, its code version and its outcome).
+- **Result JSONs:** the Hugging Face dataset repo `tkaunlaky10/safety-pencil-runs` (`outputs/results/`).
+
+## The problem
+
+Fine-tuning an aligned model on a *harmless* task can still damage its safety. We fine-tuned Tiny Aya Global
+(CohereLabs/tiny-aya-global) with LoRA on 4000 benign Hindi instructions from aya_dataset. Task loss fell from 2.14
+to 1.78 nats per token and MMLU did not move, but on the held-out test split:
+
+| | English | Hindi | Hinglish |
+| --- | --- | --- | --- |
+| Harmful compliance (Llama Guard 3 "unsafe") | **7% → 22%** (Holm p 7e-15) | 6% → 8% (n.s.) | 23% → 22% (n.s.) |
+| Refusal (Aya Expanse judge) | 60% → 73% | 51% → 65% | 19% → 44% |
+| Over-refusal of safe prompts (XSTest) | **14% → 55%** | 4% → 10% | 12% → 31% |
+
+The model refuses more *and* complies with harmful requests more: it has lost its ability to tell harmful from
+harmless prompts. The project asks three questions about that damage:
+
+1. **Locate:** which layers and modules carry the safety behaviour the fine-tune damaged?
+2. **Forecast:** can we predict the safety cost of an update from the update alone, before any evaluation?
+3. **Repair:** can we turn the update into a better one that removes the safety damage and keeps the task gain,
+   in closed form, with no retraining?
+
+## Problem statements addressed
+
+| Statement | What it asks | What we did | Outcome |
+| --- | --- | --- | --- |
+| **Track 2b #6** (primary) | Repair safety drift without retraining | Closed-form curvature repair (the "pencil"), bounded by a per-module trust region, against WiSE-FT, RegMean and diagonal Fisher at equal task score | **Done.** Restores English harmful compliance to the aligned model's 7% with the full task gain. Ties RegMean on harmful compliance and beats it on the pre-registered metric (Hinglish refusal 39.2% vs 34.3%, Holm p 0.034), but plain interpolation (WiSE-FT α = 0.5) is as good or better on every test metric |
+| **Track 2b #9** | Locate where safety lives in the model | A leverage map: each module's largest safety-per-task-cost eigenvalue | **Partly done.** The top 10 modules are all in layers 32–35, and 9 of them are MLP projections, as predicted. The refusal-direction check and the CircuitKIT cross-check were not run |
+| **Track 2a #4** (lens) | Multilingual safety | Every measurement is per language: English, Hindi and romanised Hinglish (built from aya_redteaming) | **Done.** The drift is language-dependent: it shows up as harmful compliance in English, and as extra refusal and over-refusal in Hindi and Hinglish |
+| Track 2b #5 | Safety-preserving fine-tuning | Planned as P4 ("preserve ≈ repair") | **Not done** (cut on 9 Nov) |
+| Track 2b #11 | Compression | Stretch goal | **Not done** |
+
+## The idea in one paragraph
+
+A fine-tune adds an update Δ to the aligned weights θ0. Measure two curvatures over weight space: **F_h**, how
+much each weight direction changes the aligned model's answers to harmful prompts (the Fisher of the KL drift,
+measured at θ0), and **H_t**, how much it changes the task loss (the task Fisher, measured at the fine-tuned θ1).
+Solve one generalised eigenproblem, **F_h v = λ H_t v**. Each eigenvalue λ is *safety damage per unit of task cost*
+along its direction v. Then:
+
+- **locate:** the modules with the largest λ are where safety is most sensitive and the task least;
+- **forecast:** S(θ1) ≈ ½ Σ λᵢ cᵢ², where c are Δ's coordinates in the eigenbasis;
+- **repair:** shrink each coordinate by μ/(λᵢ + μ). Safety-expensive directions go, task directions stay, and μ sets
+  the exchange rate. This is the exact minimiser of drift + μ·regret, a Fisher-weighted merge of θ0 and θ1.
+
+WiSE-FT (interpolating back toward θ0) shrinks every direction by the same factor; the pencil shrinks each one
+according to its own λ. In a toy 2-D case the pencil leaves 7.6× less drift than WiSE-FT at the same task cost.
+
+## How the method is built (and what each part of the explainer covers)
+
+| Explainer part | Topic | In the code |
+| --- | --- | --- |
+| 1–2 | Drift S = KL(θ0 ‖ θ) on θ0's own answers; its curvature is the Fisher F_h. The task Fisher H_t and the regret R at θ1 | `invariance.output_kl`, `runtime.measure_S`, `factors.py` |
+| 3–4 | The pencil F_h v = λ H_t v; the closed-form repair z = μ/(λ+μ)·c; the drift–task frontier | `geneig.py`, `repair.py` |
+| 5 | K-FAC: each layer's Fisher ≈ A ⊗ G (input statistics ⊗ output-gradient statistics), so a layer's pencil splits into two small ones with eigenvalues λᵢⱼ = αᵢγⱼ | `factors.py`, `factor_store.py` |
+| 6 | Covariant damping A_t + γ_c A_h (γ_c = 1e-3) caps each side's eigenvalue at 1000 and keeps the symmetry below; the cap doubles as a numerical validity check. Range restriction, known LayerNorm null vectors, truncation, jitter | `geneig.py`, `factor_store.LazyFactors` |
+| 7 | **Invariance (P1):** grouped-query attention has a V/O gauge symmetry (W_v → M W_v, W_o → W_o M⁻¹). The pencil repair gives exactly the same function in every gauge; Euclidean "safety subspace" methods do not | `invariance.py`, `scripts/05_invariance.py` |
+| 8 | **Leverage map (P5):** the per-module largest eigenvalue | `leverage.py`, `scripts/04_leverage.py` |
+| 9 | Why the first full-scale repair broke the model on 12 Nov: nearly parallel eigenvectors made it an oblique projector, with steps up to 94× the fine-tune | `EXPERIMENTS.md`, 12 Nov |
+| 10 | The fix: output-side damping plus a per-module trust region (each step scaled so its effect on the module's real inputs is at most the fine-tune's). Still exactly gauge-invariant | `repair.scaled_trust_region_repair` |
+| 11 | Baselines as other curvature models in the same objective: WiSE-FT (all λ equal), RegMean (input side only), diagonal Fisher | `baselines.py`, `scripts/07_baselines.py` |
+| 12 | Statistics: Wilson intervals, exact McNemar, Holm across languages, paired bootstrap over prompts for drift | `stats.py` |
+| 13–14 | Results and honest takeaways | below, and `04-submission` in the team folder |
+
+## Results
+
+Pre-registered predictions ([`PREREGISTRATION.md`](PREREGISTRATION.md)):
+
+| | Prediction | Outcome |
+| --- | --- | --- |
+| P1 | The pencil repair is invariant under the V/O gauge; Euclidean methods are not | **Pass.** Pencil, RegMean and ReSta give the same function in both gauges (output KL ≤ 2e-9); Euclidean pencil, diagonal Fisher, AlignMerge-style and Safe LoRA do not (KL 6e-7 to 1e-3) |
+| P2 | ½ΔᵀF_hΔ ranks measured drift (Spearman ρ ≥ 0.6) | **Fail.** ρ = 0.17 [−0.17, 0.49]; forecasts are 24–39× too low. Drift along the fine-tune grows like (1 − α)^0.72 [0.71, 0.74], not the quadratic (1 − α)² |
+| P3 | Refusal and task score move with μ as predicted | **Fail** for the unbounded repair (every μ rejected by the trust-region rule). Bounded repair: drift falls with μ as predicted; task loss does not follow the predicted regret |
+| P4 | Preserve ≈ repair | Not run |
+| P5 | Leverage concentrates in late MLP blocks and aligns with the refusal direction | **Partial.** Top 10 modules all in layers 32–35, 9 of them MLP; alignment not measured |
+| P6 | The pencil beats at least one weight-space baseline on worst-language refusal at equal task score | **Met on the formal metric vs RegMean only.** Not better than WiSE-FT on any test metric; behind all three baselines on dev KL drift |
+| P7 | Per-language pencils share a subspace | Not run |
+
+**The repair on test** (bounded pencil at μ* = 0.0019, versus the fine-tuned model θ1 and the aligned model θ0):
+
+| | θ0 | θ1 | Pencil μ* | RegMean (matched) | WiSE-FT α = 0.5 |
+| --- | --- | --- | --- | --- | --- |
+| Harmful compliance en / hi / Hinglish | 7 / 6 / 23% | 22 / 8 / 22% | **7 / 6 / 23%** | 6 / 5 / 24% | 5 / 5 / 21% |
+| Refusal en / hi / Hinglish | 60 / 51 / 19% | 73 / 65 / 44% | 62 / 58 / 39% | 64 / 61 / 34% | 67 / 62 / 38% |
+| Over-refusal, English | 14% | 55% | 32% | 24% | **16%** |
+| Hindi task NLL (dev) | 2.14 | 1.79 | 1.78 | 1.78 | 1.78 |
+
+What this means:
+- **The repair works.** It returns English harmful compliance exactly to θ0's level, keeps the whole task gain and
+  MMLU, and removes about half the added English over-refusal, with no retraining.
+- **It is not better than the simple baselines.** RegMean ties it on harmful compliance. Plain interpolation at
+  half strength matches it on harmful compliance and worst-language refusal, and halves its English over-refusal.
+  On dev KL drift, the quantity the repair optimises, WiSE-FT, RegMean and diagonal Fisher all leave less drift at
+  equal task cost.
+- **What holds:** the closed-form repair and its exact gauge invariance, on the real model. **What fails:** the
+  quadratic forecast (the real fine-tune is far outside the quadratic regime), and the output-side eigenbasis is
+  numerically fragile.
+
+Full tables, intervals and every caveat are in the results write-up. `jobs/report.py` regenerates
+`outputs/summary.md` from the result JSONs.
+
+## Lexsi tools and models used
+
+- **Models:** CohereLabs/tiny-aya-global (the model studied); meta-llama/Llama-Guard-3-8B and
+  CohereLabs/aya-expanse-8b as judges.
+- **Lexsi libraries:** SafeTune (LoRA fine-tunes and the `pencil` recover method), AuditKIT (evaluation) and
+  CuratorKIT (data). Our patches are in `patches/`. CircuitKIT was set up but not run.
+- **Data:** CohereLabs/aya_redteaming (harmful prompts, en and hi; Hinglish built from it), XSTest, aya_dataset /
+  aya_collection (the benign Hindi task), Global-MMLU, and 20 BeaverTails rows via SafeTune for run D.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
+| `PREREGISTRATION.md` | Predictions P1–P7, pass criteria, and the dated deviation log |
+| `EXPERIMENTS.md` | Every GPU job: code version, command, result names, outcome |
 | `CLAUDE.md` | Project memory: maths, conventions, repo facts |
 | `IMPLEMENTATION.md` | How each stage is built on SafeTune, CircuitKIT, AuditKIT and CuratorKIT |
-| `PREREGISTRATION.md` | Predictions P1–P7 and pass criteria |
 | `configs/experiment.yaml` | Models, data, runs A–D, LoRA, factor row sets, pencil settings, μ grid, evaluation tiers |
 | `src/pencil/` | The library (below) |
-| `scripts/` | One script per stage, every one with `--dry-run` |
-| `tests/` | 137 tests: numpy maths, torch equivalence, factor hooks, whole-model repair and invariance, streaming factors, data, evaluation, statistics |
+| `scripts/` | One script per stage, every one with `--dry-run` (below) |
+| `jobs/` | Hugging Face Jobs: `launch.py` (stages, hardware, cost), `stages/*.sh`, `sync.py`, `report.py` |
+| `tests/` | 238 tests: numpy maths, torch equivalence, factor hooks, whole-model repair and invariance, data, evaluation, statistics, job stages |
 | `patches/`, `scripts/setup_lexsi.sh` | Our bug fixes to the four Lexsi libraries, and the script that installs the patched versions |
 | `verification/` | The toy-transformer verification: write-up, scripts, results |
+
+`scripts/`, in pipeline order:
+
+| Script | What it does |
+| --- | --- |
+| `00_model_facts.py` | Records the model's real shapes |
+| `01_*.py` | Builds the data: harmful prompts, Hinglish, XSTest, the Hindi task, MMLU, a contamination check |
+| `02_evaluate.py`, `02_label_sample.py` | Generates and judges answers per language; samples answers for human labels |
+| `03_finetune.py` | LoRA fine-tune through SafeTune |
+| `04_factors.py`, `04_leverage.py` | K-FAC factors on harmful and task data; the leverage map (P5) |
+| `05_invariance.py` | The V/O gauge test (P1) |
+| `06_repair.py` | The repair sweep over μ, and the forecast (P2, P3) |
+| `07_baselines.py` | WiSE-FT, RegMean, diagonal Fisher and others, on dev and at matched task loss |
+| `08_localisation.py` | Targeted versus random module sets |
+| `09_pick_test_settings.py` | Picks μ* and each baseline's setting for the test split by the fixed rule |
+| `10_compare_with_baselines.py` | P6: pencil minus baseline drift per language, paired bootstrap, Holm. Its outputs keep the names `p6_run*` |
+| `11_wiseft_checkpoint.py` | Builds one WiSE-FT checkpoint for the test split |
+| `12_wiseft_drift_curve.py` | Fits how drift shrinks along WiSE-FT, (1 − α)^p, with a bootstrap interval |
 
 `src/pencil/`:
 
@@ -26,12 +164,14 @@ The method code, tests and pipeline scripts are in place. All of it runs end to 
 | `chat.py` | Chat templating with user and response offsets; masks for the four row sets |
 | `factors.py` | `KFACCollector`: hooks, sampled-label Fisher, row sets `loss`/`all`/`full`/`full_reduce` |
 | `factor_store.py` | `Factors` (in memory, saved per layer chunk), `FactorStore` (reads chunk files on demand) and `LazyFactors` (pools languages, projects out the known null vectors, applies transforms, one layer at a time) |
-| `geneig.py` | Generalised eigenproblems on the range of F_h + F_t, covariant or Euclidean damping, noise floors; a fast top-k solver for the MLP-width sides |
-| `repair.py` | Layer repair (subtraction form, truncation), forecast, frontier, `ModelRepair` over a whole model (compact cached bases, so a μ sweep is cheap), rule-11 trust region, task-gradient diagnostic |
+| `geneig.py` | Generalised eigenproblems on the range of F_h + F_t, covariant or Euclidean damping, output-side damping, noise floors; a fast top-k solver for the MLP-width sides |
+| `repair.py` | Layer repair (subtraction form, truncation), forecast, frontier, `ModelRepair` over a whole model, the scaled trust-region repair, rule 11, the task-gradient diagnostic |
+| `mu_grid.py` | The μ grid chosen from predicted regret fractions, written before anything is measured |
+| `finalists.py` | The fixed rule for μ*, its backup, and matching baselines to the same task loss |
 | `delta.py` | ΔW from a PEFT adapter in fp32, dense or low-rank (`LoRADelta`); reading, merging and writing weights; saving checkpoints |
 | `leverage.py` | Leverage map, per-head and per-KV-group bounds, refusal-direction cosine, targeted and random module sets |
 | `invariance.py` | V/O gauge for GQA on weights, deltas and factors; output KL |
-| `baselines.py` | RegMean (one eigendecomposition per μ sweep), diagonal Fisher merge, AlignMerge-style merge, Safe LoRA projection, Safe Delta Hessians |
+| `baselines.py` | WiSE-FT, RegMean, diagonal Fisher merge, AlignMerge-style merge, Safe LoRA projection, Safe Delta Hessians |
 | `safetune_plugin.py` | `PencilTrainer`, registered as SafeTune recover method `pencil` |
 | `datasets.py`, `generate.py`, `judge.py`, `evaluate.py`, `stats.py` | Data layout and splits, cached generation, Llama Guard 3 and Aya Expanse judges, per-language evaluation, statistics |
 | `config.py`, `runtime.py`, `results.py` | Config and `.env`; shared script plumbing (models, data, factors, the dev probe); one JSON per result |
@@ -39,69 +179,49 @@ The method code, tests and pipeline scripts are in place. All of it runs end to 
 
 ## Setup
 
-On the GPU machine:
-
 ```bash
-git clone <repo url> && cd safety-pencil
+git clone https://github.com/tkaunlaky10/safety-pencil && cd safety-pencil
 cp .env.example .env            # then add HF_TOKEN
 python3.12 -m venv .venv && . .venv/bin/activate && pip install -U pip uv
 uv pip install -r requirements-main.lock.txt
 bash scripts/setup_lexsi.sh main            # swaps in the patched SafeTune, AuditKIT, CuratorKIT
 uv pip install -e . --no-deps               # this package (the scripts import it)
-python -m pytest -q                         # 136 passed, 1 skipped (CPU, about 2 minutes)
-bash scripts/dry_run_all.sh                 # the whole pipeline on the tiny offline model
+python -m pytest                            # 238 passed, 8 skipped (CPU, under a minute)
+bash scripts/dry_run_all.sh                 # the whole pipeline on a tiny offline model, about a minute on CPU
 ```
 
-Style: `uv pip install ruff && ruff check . && ruff format --check .` (config in `pyproject.toml`: 120 columns; the patched Lexsi clones in `third_party/` are excluded).
+Style: `ruff check . && ruff format --check .` (config in `pyproject.toml`: 120 columns; the patched Lexsi clones in
+`third_party/` are excluded). Accept the Hugging Face licences for `CohereLabs/tiny-aya-global`,
+`meta-llama/Llama-Guard-3-8B` and `CohereLabs/aya-expanse-8b` first.
 
-For CircuitKIT, make `.venv-circuit` the same way from `requirements-circuit.lock.txt` and run `bash scripts/setup_lexsi.sh circuit`. Accept the Hugging Face licences for `CohereLabs/tiny-aya-global`, `CohereLabs/tiny-aya-base`, `meta-llama/Llama-Guard-3-8B` and `CohereLabs/aya-expanse-8b` first.
+## Reproducing the runs
 
-## Running the pipeline
-
-Each command writes one JSON per result to `outputs/results/` and figures to `outputs/figures/`. `outputs/` is gitignored, because it holds checkpoints, factors and raw generations.
+The GPU work ran as Hugging Face Jobs. Each stage is a shell script in `jobs/stages/`; `jobs/launch.py` uploads the
+code, stamps its git hash, starts the job and prints a cost estimate. Results sync to the runs repo.
 
 ```bash
-python scripts/00_model_facts.py                                   # configs/model_facts.json
-python scripts/01_build_harmful.py && python scripts/01_make_hinglish.py \
-  && python scripts/01_build_xstest.py && python scripts/01_build_task_t1.py \
-  && python scripts/01_build_mmlu.py && python scripts/01_check_contamination.py   # data/processed/
-python scripts/03_finetune.py --run A                              # outputs/ckpt/A/frac{25,50,75,100}/
-python scripts/02_evaluate.py --checkpoint CohereLabs/tiny-aya-global --tier probe --out-name probe_theta0
-python scripts/02_evaluate.py --checkpoint outputs/ckpt/A/frac100 --tier probe --out-name probe_runA_frac100
-
-# factors: first the row-set selection pass on 4 layers, then every layer with the chosen row sets
-python scripts/04_factors.py --side harm --lang en --layers selection
-python scripts/04_factors.py --side task --run A --layers selection
-python scripts/06_repair.py sweep --run A --layers selection --row-set all    # repeat per row set; pick on dev
-python scripts/04_factors.py --side harm --lang hi --row-sets full,full_reduce
-python scripts/04_leverage.py --run A
-python scripts/05_invariance.py --run A
-python scripts/06_repair.py sweep --run A --save 0.1               # then 02_evaluate on the saved checkpoint
-python scripts/06_repair.py forecast                               # needs probe_run{R}_frac{F} results
-python scripts/07_baselines.py --run A
-python scripts/08_localisation.py --run A
+python jobs/launch.py calibrate                      # access checks, then the fine-tunes A, C, D
+python jobs/launch.py evaluate theta0                # and evaluate <run>: probe and test tiers
+python jobs/launch.py invariance_forecast A          # factors, P1 and P2
+python jobs/launch.py repair_scaled A --gpu l40sx1   # bounded repair sweep, baselines, P6, test tier (~9 h)
+python jobs/launch.py wiseft_test A_0p5 --gpu l4x1   # WiSE-FT α = 0.5 on test
+python jobs/report.py                                # outputs/summary.md from the result JSONs
 ```
 
-The CircuitKIT cross-check (Prompt 8 step 5) is not scripted yet. It runs in `.venv-circuit`, following `IMPLEMENTATION.md` Stage 7.
+Each script also runs on its own; `--help` shows its options, and `--dry-run` runs it on the tiny model.
+`outputs/` is gitignored because it holds checkpoints, factors and raw generations.
 
 ## Resources at Tiny Aya scale
 
-These are estimates for an L4 (24 GB) with intermediate_size about 11008. `00_model_facts.py` records the real value.
-- **Factor files:** saved in fp32, about 52 GB on disk per side and row set for all 36 layers. Choose the row sets on the 4-layer selection pass (`--layers selection` writes to `outputs/factors_selection/`), then run every layer with one or two row sets.
-- **The repair:** reads factors one layer at a time and keeps only compact bases (top 512 pairs on MLP-width sides) in float32, about 12 GB of RAM. The MLP-width pencils use a Cholesky-plus-one-eigh solver on the GPU, about 10 s each instead of minutes. A μ sweep reuses the bases.
-- **The sweep:** holds two bf16 models on the GPU (θ0 and the working copy, 14 GB). The invariance demo holds one model in fp32 (13 GB).
-
-## What the tiny-model tests found
-
-These come from one tiny random Cohere2 model with a Tiny-Aya-style preamble, so treat them as hypotheses to check on Tiny Aya dev, not results (`tests/test_model_repair.py`).
-
-- **The preamble matters for the curvature.** Tiny Aya's fixed system preamble is most of every sequence, and k_proj and v_proj at preamble positions feed every later token. Factors that leave the preamble out (`loss`, `all`) under-forecast v_proj drift by 60–1000×. `full` (preamble included) fixes most of it, and K-FAC-reduce on v_proj (`full_reduce`) gets it right. That hybrid ranked per-module drift best (Spearman 0.97, against 0.84 for `all`).
-- **Reduce factors are for the forecast only.** As a repair basis, `full_reduce` made v_proj drift worse, because its factors have rank at most the number of sequences. The repair uses `full`.
-- **The step-ratio check is stricter than the measured drift.** The covariant repair on `full` cut measured drift to 15% while some o_proj step ratios were above 20, along directions the inputs barely visit. Rule 11 as written would switch to Euclidean damping there. The sweep logs an input-weighted step ratio and the measured S next to it, so the team can decide on dev.
-- **The known null vectors are projected out.** The shared q/k/v/gate/up input has the null vector 1/w, and o_proj and down_proj outputs have the all-ones null vector, because every path to the loss passes a mean-subtracting LayerNorm. In fp32 factors these are only null to about 1e-8. The repair projects them out exactly and sets the range threshold from their measured floor.
+- **Factor files:** fp32, about 52 GB on disk per side and row set for all 36 layers.
+- **The repair:** reads factors one layer at a time and keeps compact bases (top 512 pairs on MLP-width sides), about
+  12 GB of RAM. A μ sweep reuses the bases.
+- **The sweep:** two bf16 models on the GPU (θ0 and the working copy, 14 GB). The invariance test holds one model in
+  fp32 (13 GB).
+- **Cost:** the full bounded-repair job took about 9 h on one L40S (about $14 of HF credits).
 
 ## Licences
 
-- Our code: to be decided (for example MIT).
+- Our code: to be decided.
 - Tiny Aya derivatives: CC-BY-NC 4.0 plus Cohere Labs' acceptable-use policy.
 - The Lexsi libraries: LSAL. See `IMPLEMENTATION.md` §0.

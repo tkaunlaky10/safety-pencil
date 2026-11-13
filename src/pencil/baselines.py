@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import torch
 
+from .delta import merge_deltas
 from .geneig import gen_eig, gen_eig_topk
 
 F64 = torch.float64
@@ -166,3 +167,10 @@ def safe_delta_hessians(harm_factors, row_set: str = "all") -> dict[str, torch.T
         A_h = harm_factors.pair(module, row_set)[0]
         hessians[f"{module}.weight"] = A_h.float()
     return hessians
+
+
+def wise_ft(model_at_theta0, deltas: dict, alpha: float):
+    """WiSE-FT, natively: W = W0 + (1 − α)·ΔW for every fine-tuned module, α pulling toward θ0, through
+    delta.merge_deltas (fp32 add, cast back), the same path that builds θ1. `model_at_theta0` must hold θ0's
+    weights and is changed in place: α = 0 gives θ1 and α = 1 gives θ0, bit for bit. Returns the model."""
+    return merge_deltas(model_at_theta0, deltas, scale=1.0 - alpha)

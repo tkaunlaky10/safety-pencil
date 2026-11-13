@@ -54,6 +54,17 @@ pencil:
   # and a second set overflowed 62 GB of RAM.
   gamma_e_grid: []
   trust_region_step_ratio: max_input_step_ratio
+  # The scaled repair (13 Nov, post-freeze; PREREGISTRATION.md deviation log; explainer "Pencil Repair
+  # Stability"): output sides G'' = G_t' + nu I with nu = output_nu_rel * mean(diag G_t'), every module's step
+  # scaled by t = min(1, 1/r), r = ||delta A_t^1/2|| / ||dW A_t^1/2||; v_proj gets neither (the V/O gauge
+  # transforms its output factor). One basis solve. The mu grid is where the predicted regret with scaling is
+  # regret_fractions of its value at mu = 0, fixed before any measurement (pencil/mu_grid.py).
+  repair_method: scaled                    # 06_repair.py sweep default; "covariant" reruns the 12 Nov method
+  scaled:
+    output_nu_rel: 1.0e-2                  # gamma_e = 1e-2, the middle of rule 11's pre-registered grid
+    exempt_leaves: [v_proj]
+    # 0.01 added 13 Nov before launch: predicted R leaves out gᵀδ, which dominates for small steps
+    regret_fractions: [0.01, 0.02, 0.05, 0.1, 0.2, 0.4]
   rel_tol: 1.0e-10                         # floor; scripts raise it to 10x the measured null-vector floor
   rel_tol_floor_factor: 10.0
   project_known_nulls: true                # remove 1/w (shared input A) and 1 (o/down G) exactly first

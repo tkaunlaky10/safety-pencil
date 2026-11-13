@@ -72,6 +72,34 @@ def pencil_repair_np(dW, A_h, A_t, G_h, G_t, mu, damping="covariant", gamma=1e-3
     return dW - Y @ ((1 - M) * C) @ X.T  # subtraction form: null directions pass through
 
 
+def gen_eig_range_nu_np(F_h, F_t, gamma=1e-3, nu_rel=1e-2, rel_tol=1e-10):
+    """Output side of the scaled repair (added 13 Nov): covariant damping plus nu I on range(F_h + F_t),
+    G'' = G_t' + nu I with G_t' = G_t + gamma G_h and nu = nu_rel * mean(diag G_t').
+    Returns gamma'', Y (Y^T G'' Y = I), G'' and nu."""
+    w, U = np.linalg.eigh(F_h + F_t)
+    U = U[:, w > rel_tol * w.max()]
+    F_td = F_t + gamma * F_h
+    nu = nu_rel * np.trace(F_td) / len(F_td)
+    F_tdd = F_td + nu * np.eye(len(F_td))
+    lam, Yr = sl.eigh(U.T @ F_h @ U, U.T @ F_tdd @ U)
+    return np.clip(lam, 0, None), U @ Yr, F_tdd, nu
+
+
+def pencil_repair_scaled_np(dW, A_h, A_t, G_h, G_t, mu, gamma=1e-3, nu_rel=1e-2, scale=True):
+    """The scaled repair (13 Nov, post-freeze): covariant input side, output side G'' = G_t' + nu I, then the
+    step delta = dW' - dW is scaled by t = min(1, 1/r), r = ||delta A_t^1/2||_F / ||dW A_t^1/2||_F.
+    nu_rel = 0 and scale=False give pencil_repair_np (the exempt v_proj case uses nu_rel = 0, scale=False).
+    Returns (dW + t delta, t, r)."""
+    a, X, A_td = gen_eig_range_np(A_h, A_t, "covariant", gamma)
+    g, Y, G_tdd, _ = gen_eig_range_nu_np(G_h, G_t, gamma, nu_rel)
+    C = Y.T @ G_tdd @ dW @ A_td @ X
+    M = mu / (np.outer(g, a) + mu)
+    delta = -Y @ ((1 - M) * C) @ X.T
+    r = np.sqrt(np.trace(delta @ A_t @ delta.T) / np.trace(dW @ A_t @ dW.T))
+    t = min(1.0, 1.0 / r) if scale else 1.0
+    return dW + t * delta, t, r
+
+
 def make_problem(din=6, dout=5):
     A_h, A_t = spd(din, 3), spd(din)
     G_h, G_t = spd(dout, 2), spd(dout)
@@ -336,6 +364,72 @@ def test_per_head_leverage_is_a_lower_bound():
     top = sl.eigh(F, H, eigvals_only=True).max()
     for blk in (slice(0, 4), slice(4, 8), slice(8, 12)):
         assert sl.eigh(F[blk, blk], H[blk, blk], eigvals_only=True).max() <= top + 1e-10
+
+
+# ------------------------------------------------------------------ the scaled repair (added 13 Nov, post-freeze)
+def test_output_damping_adds_an_input_weighted_step_penalty():
+    """1/2 tr((G' + nu I) d A' d^T) = R(d) + nu/2 ||d A'^1/2||^2, with R(d) = 1/2 tr(G' d A' d^T)."""
+    A_h, A_t, G_h, G_t, _, _, _, _ = make_problem()
+    gamma, nu = 1e-3, 0.07
+    A_td, G_td = A_t + gamma * A_h, G_t + gamma * G_h
+    d = rng.standard_normal((5, 6))
+    damped = 0.5 * np.trace((G_td + nu * np.eye(5)) @ d @ A_td @ d.T)
+    R = 0.5 * np.trace(G_td @ d @ A_td @ d.T)
+    input_weighted = np.trace(d @ A_td @ d.T)  # ||d A'^1/2||_F^2
+    assert np.isclose(damped, R + 0.5 * nu * input_weighted)
+
+
+def test_scaled_repair_minimises_the_damped_objective_before_scaling():
+    """Unscaled, the closed form is the full-matrix minimiser of S + mu R + mu nu/2 ||d A'^1/2||^2."""
+    A_h, A_t, G_h, G_t, dW, _, _, D = make_problem()
+    mu, gamma, nu_rel = 0.4, 1e-3, 1e-2
+    _, _, G_tdd, _ = gen_eig_range_nu_np(G_h, G_t, gamma, nu_rel)
+    K_h, K_t = np.kron(A_h, G_h), np.kron(A_t + gamma * A_h, G_tdd)
+    full = np.linalg.solve(K_h + mu * K_t, mu * K_t @ D).reshape(dW.shape, order="F")
+    ours, t, _ = pencil_repair_scaled_np(dW, A_h, A_t, G_h, G_t, mu, gamma, nu_rel, scale=False)
+    assert t == 1.0 and np.allclose(ours, full)
+
+
+def test_scaled_repair_without_nu_or_scaling_is_the_covariant_repair():
+    A_h, A_t, G_h, G_t, dW, _, _, _ = make_problem()
+    ours, _, _ = pencil_repair_scaled_np(dW, A_h, A_t, G_h, G_t, 0.3, nu_rel=0.0, scale=False)
+    assert np.allclose(ours, pencil_repair_np(dW, A_h, A_t, G_h, G_t, 0.3))
+
+
+def test_scaled_drift_is_non_increasing_in_t_on_random_pencils():
+    """S(t) = 1/2 sum lam (1 - t(1 - M))^2 C^2 equals 1/2 tr(G_h (dW + t delta) A_h (.)^T) on a complete pencil
+    and never rises as t goes from 0 (theta1) to 1 (the full repair)."""
+    r = np.random.default_rng(5)
+    ts = np.linspace(0, 1, 21)
+    for _ in range(20):
+        A_h, A_t = spd(6, 3), spd(6)
+        G_h, G_t = spd(5, 2), spd(5)
+        dW = r.standard_normal((5, 6))
+        mu = 10 ** r.uniform(-3, 1)
+        a, X, A_td = gen_eig_range_np(A_h, A_t, "covariant", 1e-3)
+        g, Y, G_tdd, _ = gen_eig_range_nu_np(G_h, G_t, 1e-3, 1e-2)
+        C = Y.T @ G_tdd @ dW @ A_td @ X
+        lam = np.outer(g, a)
+        M = mu / (lam + mu)
+        delta = -Y @ ((1 - M) * C) @ X.T
+        S_formula = [0.5 * np.sum(lam * (1 - t * (1 - M)) ** 2 * C**2) for t in ts]
+        S_direct = [0.5 * np.trace(G_h @ (dW + t * delta) @ A_h @ (dW + t * delta).T) for t in ts]
+        assert np.allclose(S_formula, S_direct)
+        assert all(later <= earlier + 1e-12 for earlier, later in zip(S_formula, S_formula[1:]))
+
+
+def test_scaling_keeps_every_input_weighted_ratio_at_most_one():
+    r = np.random.default_rng(6)
+    for _ in range(30):
+        A_h, A_t = spd(6, 3), spd(6, 2)  # a low-rank task input factor: steps can be large on task inputs
+        G_h, G_t = spd(5, 2), spd(5, 1)
+        dW = r.standard_normal((5, 6))
+        mu = 10 ** r.uniform(-3, 1)
+        repaired, t, ratio = pencil_repair_scaled_np(dW, A_h, A_t, G_h, G_t, mu)
+        delta = repaired - dW
+        after = np.sqrt(np.trace(delta @ A_t @ delta.T) / np.trace(dW @ A_t @ dW.T))
+        assert after <= 1 + 1e-10
+        assert np.isclose(t, min(1.0, 1.0 / ratio)) and np.isclose(after, min(ratio, 1.0))
 
 
 if __name__ == "__main__":

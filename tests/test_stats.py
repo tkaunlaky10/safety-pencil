@@ -321,3 +321,28 @@ def test_kappa_ci_degenerate():
     assert 0 < result["n_boot_used"] < N_BOOT
     result = cohen_kappa_ci(["a"] * 6, ["a"] * 6, n_boot=N_BOOT)
     assert math.isnan(result["kappa"]) and math.isnan(result["lo"]) and result["n_boot_used"] == 0
+
+
+# ---------------------------------------------------------------- token-weighted paired bootstrap (P6, 13 Nov)
+def test_token_mean_diff_is_the_difference_of_the_measured_S():
+    from pencil.stats import paired_bootstrap_token_mean_diff
+
+    r = np.random.default_rng(0)
+    counts = r.integers(20, 200, 100)
+    b_sums = r.exponential(0.2, 100) * counts
+    a_sums = b_sums - 0.05 * counts + r.normal(0, 0.5, 100)  # a is lower by ~0.05 per token
+    result = paired_bootstrap_token_mean_diff(a_sums, b_sums, counts)
+    assert result["diff"] == pytest.approx(a_sums.sum() / counts.sum() - b_sums.sum() / counts.sum())
+    assert result["lo"] < result["diff"] < result["hi"] < 0 and result["p_two_sided"] < 0.01
+
+    same = paired_bootstrap_token_mean_diff(b_sums, b_sums, counts)
+    assert same["diff"] == same["lo"] == same["hi"] == 0.0 and same["p_two_sided"] == 1.0
+
+
+def test_token_mean_diff_rejects_mismatched_or_empty_items():
+    from pencil.stats import paired_bootstrap_token_mean_diff
+
+    with pytest.raises(ValueError):
+        paired_bootstrap_token_mean_diff([1.0, 2.0], [1.0], [3, 4])
+    with pytest.raises(ValueError):
+        paired_bootstrap_token_mean_diff([1.0], [1.0], [0])

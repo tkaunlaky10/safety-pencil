@@ -4,6 +4,7 @@
     python scripts/09_finalists.py --run A --sweep repair_sweep_compare_runA --baselines baselines_runA_must
     python scripts/09_finalists.py ... --print mu           # μ*, as in 06_repair.py's checkpoint names
     python scripts/09_finalists.py ... --print baselines    # method=value pairs, for 07_baselines.py --finalists
+    python scripts/09_finalists.py ... --print target_nll   # NLL(μ*), for 07_baselines.py --match-nll
     python scripts/09_finalists.py --sweep repair_sweep_compare_runA --any-passing   # exit 0 if a μ passed rule 11
 
 Writes outputs/results/finalists_run<run>.json: the rule's numbers, μ*, and every compared baseline's pick.
@@ -17,7 +18,7 @@ import json
 import sys
 
 from pencil.config import outputs_dir
-from pencil.finalists import KEEP_TASK_GAIN, accepted, closest_setting, pencil_mu_star
+from pencil.finalists import KEEP_TASK_GAIN, accepted, baseline_rows, closest_setting, pencil_mu_star
 from pencil.results import write_result
 
 COMPARED = ("regmean", "diag_fisher", "wiseft")
@@ -45,7 +46,7 @@ def pick(sweep: dict, baselines: dict) -> dict:
     mu_star = pencil_mu_star(sweep["points"], nll_theta0, nll_theta1)
     picks = {}
     for method in COMPARED:
-        picks[method] = pick_baseline(baselines.get(method, []), mu_star["task_nll"])
+        picks[method] = pick_baseline(baseline_rows(baselines.get(method, [])), mu_star["task_nll"])
     return {
         "keep_task_gain": KEEP_TASK_GAIN,
         "task_nll": {"theta0": nll_theta0, "theta1": nll_theta1},
@@ -70,7 +71,10 @@ def main(argv=None) -> int:
     parser.add_argument("--baselines", help="the must-run baselines' result name (needed unless --any-passing)")
     parser.add_argument("--any-passing", action="store_true", help="only check: exit 0 if any μ passed rule 11")
     parser.add_argument("--test-tier", nargs="+", default=list(COMPARED), choices=COMPARED)
-    parser.add_argument("--print", dest="show", choices=["mu", "baselines"], help="print one pick for the shell")
+    parser.add_argument(
+        "--print", dest="show", choices=["mu", "baselines", "target_nll"], help="print one pick for the shell"
+    )
+    parser.add_argument("--out-name", default=None, help="result name (default finalists_run<run>)")
     args = parser.parse_args(argv)
     if args.any_passing:
         return 0 if any_mu_passed(args.sweep) else 1
@@ -82,13 +86,16 @@ def main(argv=None) -> int:
     if args.show == "mu":
         print(f"{finalists['mu_star']['mu']:g}")  # as 06_repair.py names its checkpoint folders
         return 0
+    if args.show == "target_nll":
+        print(repr(finalists["mu_star"]["task_nll"]))
+        return 0
     if args.show == "baselines":
         available = [method for method in args.test_tier if "setting" in finalists["baselines"][method]]
         pairs = [f"{method}={finalists['baselines'][method]['setting']!r}" for method in available]
         print(" ".join(pairs))
         return 0
     config = {"sweep": args.sweep, "baselines": args.baselines}
-    write_result(f"finalists_run{args.run}", finalists, config=config, out_dir=outputs_dir("results"))
+    write_result(args.out_name or f"finalists_run{args.run}", finalists, config=config, out_dir=outputs_dir("results"))
     print(json.dumps(finalists, indent=1))
     return 0
 

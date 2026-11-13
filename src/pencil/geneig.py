@@ -7,6 +7,9 @@ F stands for either side of a layer: the input factors (A_h, A_t, eigenvalues α
     euclidean  F_t′ = F_t + γ_e mean(diag) I   a trust region; breaks invariance, so only the rule-11 fallback
     none       F_t′ = F_t                      valid only when null(F_t) ⊆ null(F_h); tests only
 
+nu_rel > 0 adds ν·I on top of the damped factor, ν = nu_rel · mean(diag F_t′): the scaled repair's output side
+(13 Nov), G″ = G_t′ + νI. On range(F_h + F_t) this is Uᵀ G_t′ U + ν I, and the pencil's FX is G″X.
+
 `gen_eig` works on range(F_h + F_t): directions null in both factors (e.g. 1/w for a LayerNorm-fed input)
 carry no information and would make Cholesky fail. Factors summed in fp32 are only null to ~1e-8 of the top
 eigenvalue, so set rel_tol above that floor (`auto_rel_tol`). Mirrors tests/test_math.py::gen_eig_range_np.
@@ -36,6 +39,7 @@ class Pencil:
     range_dim: int  # dimension of range(F_h + F_t)
     dropped: int = 0  # range directions where the damped task factor was not numerically positive
     jitter: float = 0.0  # ε × mean diagonal added to F_t′ before its Cholesky (gen_eig_topk only)
+    nu: float = 0.0  # the absolute ν added to F_t′ (nu_rel × its mean diagonal); FX = (F_t′ + νI) X
 
     def to(self, dtype=None, device=None) -> Pencil:
         """A copy with the tensors moved to `dtype` and `device`."""
@@ -46,6 +50,7 @@ class Pencil:
             range_dim=self.range_dim,
             dropped=self.dropped,
             jitter=self.jitter,
+            nu=self.nu,
         )
 
 
@@ -62,6 +67,15 @@ def damp(F_h: torch.Tensor, F_t: torch.Tensor, damping: str, gamma: float) -> to
     raise ValueError(f"damping must be one of {DAMPINGS}, got {damping!r}")
 
 
+def add_identity(F: torch.Tensor, nu_rel: float) -> tuple[torch.Tensor, float]:
+    """(F + ν I, ν) with ν = nu_rel · mean(diag F); (F, 0.0) when nu_rel is 0."""
+    if not nu_rel:
+        return F, 0.0
+    nu = nu_rel * float(F.diagonal().mean())
+    identity = torch.eye(F.shape[0], dtype=F.dtype, device=F.device)
+    return F + nu * identity, nu
+
+
 def gen_eig(
     F_h: torch.Tensor,
     F_t: torch.Tensor,
@@ -69,8 +83,9 @@ def gen_eig(
     gamma: float = 1e-3,
     top_k: int | None = None,
     rel_tol: float = 1e-10,
+    nu_rel: float = 0.0,
 ) -> Pencil:
-    """Solve F_h x = λ F_t′ x on range(F_h + F_t), in float64 on F_h's device.
+    """Solve F_h x = λ F_t′ x on range(F_h + F_t), in float64 on F_h's device (F_t′ + νI with nu_rel > 0).
 
     Returns ascending eigenpairs (only the top_k largest if top_k is set) with Xᵀ F_t′ X = I. Steps: restrict
     both factors to U = the eigenvectors of F_h + F_t above rel_tol × max; whiten the restricted F_t′ with
@@ -82,7 +97,7 @@ def gen_eig(
         raise ValueError("covariant damping needs gamma > 0 (undamped factor pencils can be singular)")
 
     U, top_eigenvalue = _range_basis(F_h + F_t, rel_tol)
-    F_t_damped = damp(F_h, F_t, damping, gamma)
+    F_t_damped, nu = add_identity(damp(F_h, F_t, damping, gamma), nu_rel)
     F_h_on_range = U.T @ F_h @ U
     F_t_damped_on_range = _symmetrize(U.T @ F_t_damped @ U)
 
@@ -96,7 +111,7 @@ def gen_eig(
         # eigh is ascending, so the top k are the last columns. Clone: a view would keep the full n × n alive.
         lam = lam[-top_k:].clone()
         X = X[:, -top_k:].clone()
-    return Pencil(lam=lam, X=X, FX=F_t_damped @ X, range_dim=U.shape[1], dropped=dropped)
+    return Pencil(lam=lam, X=X, FX=F_t_damped @ X, range_dim=U.shape[1], dropped=dropped, nu=nu)
 
 
 def gen_eig_topk(
@@ -108,6 +123,7 @@ def gen_eig_topk(
     jitter: float = 1e-10,
     eig_dtype: torch.dtype = torch.float32,
     device: str | torch.device | None = None,
+    nu_rel: float = 0.0,
 ) -> Pencil:
     """Top-k pairs of F_h x = λ F_t′ x for a large factor with no exact null space.
 
@@ -130,7 +146,7 @@ def gen_eig_topk(
     if damping == "covariant" and gamma <= 0:
         raise ValueError("covariant damping needs gamma > 0")
 
-    F_t_damped = damp(F_h, F_t, damping, gamma)
+    F_t_damped, nu = add_identity(damp(F_h, F_t, damping, gamma), nu_rel)
     size = F_t_damped.shape[0]
     L, epsilon = _jittered_cholesky(F_t_damped, jitter)
 
@@ -143,7 +159,7 @@ def gen_eig_topk(
     lam = lam[-k:].to(torch.float64).clamp_min(0)
     V = V[:, -k:].to(torch.float64)
     X = torch.linalg.solve_triangular(L.T.contiguous(), V, upper=True)  # L⁻ᵀ V
-    return Pencil(lam=lam.clone(), X=X, FX=F_t_damped @ X, range_dim=size, dropped=0, jitter=epsilon)
+    return Pencil(lam=lam.clone(), X=X, FX=F_t_damped @ X, range_dim=size, dropped=0, jitter=epsilon, nu=nu)
 
 
 def _jittered_cholesky(F: torch.Tensor, jitter: float) -> tuple[torch.Tensor, float]:

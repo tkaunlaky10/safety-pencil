@@ -11,6 +11,15 @@ damped task factors A_t′ = A_t + γ_c A_h, G_t′ = G_t + γ_c G_h:
 
 and the forecast of the safety drift is ½ tr(G_h ΔW A_h ΔWᵀ) = ½ Σ λ C². tests/test_math.py::pencil_repair_np
 is the reference; tests/test_torch_equivalence.py checks this file against it.
+
+The scaled repair (13 Nov, post-freeze; tests/test_math.py::pencil_repair_scaled_np) adds two options to
+ModelRepair, both off by default:
+  output_nu_rel  output side G″ = G_t′ + νI, ν = output_nu_rel · mean(diag G_t′): a penalty on the input-weighted
+                 step (μν/2)‖δ A_t′^½‖², with the same closed form
+  scale_steps    per module δ ← t δ, t = min(1, 1/r), r = ‖δ A_t^½‖_F / ‖ΔW A_t^½‖_F (rule 11's input-weighted
+                 ratio, so every scaled module passes it by construction)
+Modules in exempt_leaves (v_proj: the V/O gauge transforms its output factor) get neither. Their trust-region
+ratio is the curvature-norm ratio ‖δ‖ / ‖ΔW‖ in tr(G_t′ · A_t′ ·ᵀ), gauge-invariant and at most 1.
 """
 
 from __future__ import annotations
@@ -20,11 +29,13 @@ from dataclasses import dataclass
 import torch
 
 from .delta import LoRADelta, as_dense
-from .geneig import Pencil, damp, gen_eig, gen_eig_topk
+from .geneig import DAMPINGS, Pencil, gen_eig, gen_eig_topk
 from .modules import MLP_WIDE_INPUT, MLP_WIDE_OUTPUT, RESIDUAL_WRITERS, layer_order, leaf
 
 F64 = torch.float64
 SUMMED_REPORT_KEYS = ("S_before_pred", "S_after_pred", "R_pred")  # per-module report values summed over modules
+GAUGE_TOUCHED_OUTPUT = ("v_proj",)  # leaves whose output factor the V/O gauge transforms
+TRUST_RATIO_TOLERANCE = 1e-9  # a scaled ratio of exactly 1 can come out a rounding error above it
 
 
 def row_set_for(row_set: str | dict, module: str) -> str:
@@ -149,13 +160,21 @@ def frontier(C: torch.Tensor, alpha: torch.Tensor, gamma: torch.Tensor, mus) -> 
 class _ModuleCache:
     """What every μ needs for one module, computed once per deltas dict by ModelRepair.prepare."""
 
-    C: torch.Tensor  # Yᵀ G_t′ ΔW A_t′ X, the update in pencil coordinates (kept pairs only)
+    C: torch.Tensor  # Yᵀ G″ ΔW A_t′ X, the update in pencil coordinates (kept pairs only)
     lam: torch.Tensor  # λ_ji = γ_j α_i, same shape as C
-    YtY: torch.Tensor  # Yᵀ Y, for the input-weighted step norm
+    YtY: torch.Tensor  # Yᵀ Y (basis dtype), for the Euclidean and input-weighted step norms
+    YtGY: torch.Tensor  # Yᵀ G_t′ Y (basis dtype; I without ν or jitter), for the task regret
+    input_gram: torch.Tensor  # Xᵀ A_t′ X (basis dtype, shared per input pencil; I without jitter)
+    task_input_gram: torch.Tensor  # Xᵀ A_t X (basis dtype, shared per input pencil)
     dW_norm: float  # ‖ΔW‖_F
     S_before: float  # ½ tr(G_h ΔW A_h ΔWᵀ): the forecast drift of the unrepaired update
     S_kept: float  # ½ Σ λ C²: the part of S_before that lives on the kept pairs
     input_norm: float  # tr(ΔW A_t′ ΔWᵀ) = ‖ΔW A_t′^½‖²
+    task_input_norm: float  # tr(ΔW A_t ΔWᵀ) = ‖ΔW A_t^½‖²: the denominator of the trust-region ratio
+    harm_input_norm: float  # tr(ΔW A_h ΔWᵀ) = ‖ΔW A_h^½‖²: the denominator of the harmful-input ratio
+    alpha: torch.Tensor  # the input side's α: Xᵀ A_h X = diag(α), for the harmful-input step norm
+    curvature_norm: float  # tr(G_t′ ΔW A_t′ ΔWᵀ): the denominator of the exempt modules' trust-region ratio
+    exempt: bool  # in exempt_leaves: no ν, no scaling
 
 
 class ModelRepair:
@@ -179,6 +198,7 @@ class ModelRepair:
     row_set: one row set for all modules, or {leaf: row_set, "default": row_set}.
     rel_tol: the range threshold for factors that had a known null vector (the shared input A, o/down G), set
         from their measured floor.
+    output_nu_rel, scale_steps, exempt_leaves: the scaled repair (module docstring).
     rel_tol_other (default rel_tol): the threshold for every other factor, including the two that the V/O
         gauge transforms (o_proj input, v_proj output). Keep it small (1e-10) so the gauge can't move
         eigenvalues across it."""
@@ -199,6 +219,9 @@ class ModelRepair:
         basis_dtype: torch.dtype = F64,
         eig_dtype: torch.dtype = torch.float32,
         fast_topk_min: int = 4096,
+        output_nu_rel: float = 0.0,
+        scale_steps: bool = False,
+        exempt_leaves: tuple[str, ...] = GAUGE_TOUCHED_OUTPUT,
     ):
         self.harm_factors = harm_factors
         self.task_factors = task_factors
@@ -213,9 +236,19 @@ class ModelRepair:
         self.basis_dtype = basis_dtype
         self.eig_dtype = eig_dtype
         self.fast_topk_min = fast_topk_min
+        self.output_nu_rel = output_nu_rel
+        self.scale_steps = scale_steps
+        self.exempt_leaves = tuple(exempt_leaves)
+        if damping not in DAMPINGS:
+            raise ValueError(f"damping must be one of {DAMPINGS}, got {damping!r}")
+        if scale_steps and damping != "covariant":
+            raise ValueError("scale_steps needs covariant damping (the scaled repair's input side)")
 
         self._input_pencils: dict[tuple[str, str], Pencil] = {}  # (input factor key, row set) -> pencil
         self._output_pencils: dict[str, Pencil] = {}  # module -> pencil
+        # (input factor key, row set) -> (Xᵀ A_t′ X, Xᵀ A_t X)
+        self._input_grams: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._covariant_bounds: dict[str, float] = {}  # module -> ceiling diagnostic of a ν-damped output side
         self._prepared: dict[str, _ModuleCache] = {}  # module -> cache for the deltas in _prepared_for
         self._prepared_for = None  # the deltas dict _prepared was built from
 
@@ -240,14 +273,23 @@ class ModelRepair:
             raise KeyError(f"no factors for {len(missing)} modules, e.g. {missing[:3]}")
         return layer_order(deltas)
 
-    def _solve_side(self, F_h: torch.Tensor, F_t: torch.Tensor, top_k: int | None, rel_tol: float) -> Pencil:
+    def _solve_side(
+        self, F_h: torch.Tensor, F_t: torch.Tensor, top_k: int | None, rel_tol: float, nu_rel: float = 0.0
+    ) -> Pencil:
         """One side's pencil, stored as basis_dtype on self.device. A wide side with top_k set uses the fast
         top-k solver (no range restriction: MLP-wide factors have no known null vector)."""
         size = F_h.shape[0]
         use_fast_topk = top_k is not None and top_k < size and size >= self.fast_topk_min
         if use_fast_topk:
             pencil = gen_eig_topk(
-                F_h, F_t, top_k, self.damping, self.gamma, eig_dtype=self.eig_dtype, device=self.eig_device
+                F_h,
+                F_t,
+                top_k,
+                self.damping,
+                self.gamma,
+                eig_dtype=self.eig_dtype,
+                device=self.eig_device,
+                nu_rel=nu_rel,
             )
         else:
             pencil = gen_eig(
@@ -257,6 +299,7 @@ class ModelRepair:
                 gamma=self.gamma,
                 top_k=top_k,
                 rel_tol=rel_tol,
+                nu_rel=nu_rel,
             )
         return pencil.to(dtype=self.basis_dtype, device=self.device)
 
@@ -294,7 +337,48 @@ class ModelRepair:
             has_known_null = module_leaf in RESIDUAL_WRITERS
             top_k = self.top_k_mlp if module_leaf in MLP_WIDE_OUTPUT else None
             rel_tol = self.rel_tol if has_known_null else self.rel_tol_other
-            self._output_pencils[module] = self._solve_side(G_h, G_t, top_k, rel_tol)
+            nu_rel = 0.0 if self._exempt(module) else self.output_nu_rel
+            pencil = self._solve_side(G_h, G_t, top_k, rel_tol, nu_rel)
+            self._output_pencils[module] = pencil
+            if pencil.nu > 0:
+                self._covariant_bounds[module] = _covariant_ceiling_bound(pencil)
+
+    def _exempt(self, module: str) -> bool:
+        """True for the modules that get neither ν nor scaling (exempt_leaves)."""
+        return leaf(module) in self.exempt_leaves
+
+    def _input_grams_of(self, module: str, A_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(Xᵀ A_t′ X, Xᵀ A_t X) for the module's input pencil, cached per input pencil.
+
+        Xᵀ A_t′ X = Xᵀ (A_t′X) is I up to jitter. Since Xᵀ A_h X = diag(α), Xᵀ A_t X is Xᵀ A_t′ X − γ_c diag(α)
+        under covariant damping and Xᵀ A_t′ X without damping; Euclidean damping computes it from A_t."""
+        input_key = (self.harm_factors.a_key[module], self._row_set_of(module))
+        if input_key not in self._input_grams:
+            pencil = self._input_pencils[input_key]
+            X = pencil.X.to(F64)
+            damped = _symmetric(X.T @ pencil.FX.to(F64))
+            if self.damping == "covariant":
+                task = damped - self.gamma * torch.diag(pencil.lam.to(F64))
+            elif self.damping == "none":
+                task = damped
+            else:
+                task = _symmetric(X.T @ (A_t @ X))
+            self._input_grams[input_key] = (damped.to(self.basis_dtype), task.to(self.basis_dtype))
+        return self._input_grams[input_key]
+
+    def ceiling_report(self) -> dict:
+        """Diagnostic, never used to choose anything: under covariant damping every eigenvalue is at most 1/γ_c
+        when the task factor is positive semidefinite. Lists each side's largest covariant eigenvalue (α for an
+        input side, γ for a ν-free output side, and for a ν-damped output side the largest covariant Rayleigh
+        quotient along its solved directions, a lower bound) and flags those above (1/γ_c)(1 + 1e-3)."""
+        ceiling = (1.0 / self.gamma) * (1.0 + 1e-3)
+        largest = {}
+        for (factor_key, row_set), pencil in self._input_pencils.items():
+            largest[f"{factor_key}|{row_set}|input"] = float(pencil.lam.max())
+        for module, pencil in self._output_pencils.items():
+            largest[f"{module}|output"] = self._covariant_bounds.get(module, float(pencil.lam.max()))
+        flagged = sorted(side for side, value in largest.items() if value > ceiling)
+        return {"ceiling": ceiling, "largest": largest, "flagged": flagged}
 
     # -- per-delta cache
     def prepare(self, deltas: dict) -> None:
@@ -315,65 +399,141 @@ class ModelRepair:
         """One module's _ModuleCache entry."""
         basis = self.basis(module)
         dW = as_dense(delta, F64, self.device)
-        A_h, A_t, G_h, _ = self.factors(module)
+        A_h, A_t, G_h, G_t = self.factors(module)
         C = coords(dW, basis)
         lam = torch.outer(basis.gamma, basis.alpha).to(F64)
         Y = basis.out.X.to(F64)
-        A_t_damped = damp(A_h, A_t, self.damping, self.gamma)
+        YtY = Y.T @ Y
+        YtGY = Y.T @ basis.out.FX.to(F64) - basis.out.nu * YtY  # Yᵀ G″ Y − ν YᵀY
+        dW_A_h, dW_A_t = dW @ A_h, dW @ A_t
+        G_h_dW = G_h @ dW
+        dW_A_damped = self._damped_product(dW_A_t, dW_A_h, dW, A_t)  # ΔW A_t′
+        G_damped_dW = self._damped_product(G_t @ dW, G_h_dW, dW, G_t)  # G_t′ ΔW
+        input_gram, task_input_gram = self._input_grams_of(module, A_t)
         return _ModuleCache(
             C=C,
             lam=lam,
-            YtY=Y.T @ Y,
+            YtY=YtY.to(self.basis_dtype),
+            YtGY=_symmetric(YtGY).to(self.basis_dtype),
+            input_gram=input_gram,
+            task_input_gram=task_input_gram,
             dW_norm=float(dW.norm()),
-            S_before=forecast(dW, A_h, G_h),
+            S_before=0.5 * float((G_h_dW * dW_A_h).sum()),
             S_kept=0.5 * float((lam * C**2).sum()),
-            input_norm=float(torch.trace(dW @ A_t_damped @ dW.T)),
+            input_norm=float((dW_A_damped * dW).sum()),
+            task_input_norm=float((dW_A_t * dW).sum()),
+            harm_input_norm=float((dW_A_h * dW).sum()),
+            alpha=basis.alpha.to(F64),
+            curvature_norm=float((G_damped_dW * dW_A_damped).sum()),
+            exempt=self._exempt(module),
         )
 
-    def _repair_module(self, module: str, mu: float) -> tuple[torch.Tensor, dict]:
-        """(δ = ΔW′ − ΔW, per-module report) for one prepared module, from the caches only."""
+    def _damped_product(self, with_task, with_harm, dW, F_t) -> torch.Tensor:
+        """ΔW F_t′ (or F_t′ ΔW) from the products with F_t and F_h, for this repair's damping."""
+        if self.damping == "covariant":
+            return with_task + self.gamma * with_harm
+        if self.damping == "euclidean":
+            return with_task + self.gamma * float(F_t.diagonal().mean()) * dW
+        return with_task
+
+    def _module_terms(self, module: str, mu: float) -> tuple[torch.Tensor, float, dict]:
+        """(removed = (1 − M) ∘ C, the scale t, the module's report without its Euclidean ratio), from the caches.
+
+        With δ = −t Y removed Xᵀ every norm is a trace over pencil coordinates:
+            ‖δ A_t′^½‖² = t² Σ (YᵀY R) ∘ (R Xᵀ A_t′ X)          ‖δ A_t^½‖² the same with Xᵀ A_t X
+            ‖δ A_h^½‖² = t² Σ (YᵀY R) ∘ R ∘ α                    (Xᵀ A_h X = diag(α))
+            2 R(δ) = tr(G_t′ δ A_t′ δᵀ) = t² Σ (Yᵀ G_t′ Y R) ∘ (R Xᵀ A_t′ X)
+        and the drift on the kept pairs is ½ Σ λ ((1 − t(1 − M)) C)²."""
         cache = self._prepared[module]
+        M = _shrink(cache.lam, mu)
+        removed = (1.0 - M) * cache.C
+        R_input_gram = removed @ cache.input_gram.to(F64)
+        YtY_R = cache.YtY.to(F64) @ removed
+        input_step = max(float((YtY_R * R_input_gram).sum()), 0.0)
+        task_input_step = max(float((YtY_R * (removed @ cache.task_input_gram.to(F64))).sum()), 0.0)
+        curvature_step = max(float((cache.YtGY.to(F64) @ removed * R_input_gram).sum()), 0.0)
+        harm_input_step = max(float((YtY_R * removed * cache.alpha).sum()), 0.0)  # Xᵀ A_h X = diag(α)
+
+        task_ratio = _ratio_or_inf(task_input_step, cache.task_input_norm) ** 0.5
+        scale = 1.0
+        if self.scale_steps and not cache.exempt and task_ratio > 1.0:
+            scale = 1.0 / task_ratio
+        curvature_ratio = scale * _ratio(curvature_step, cache.curvature_norm) ** 0.5
+        S_kept_after = 0.5 * float((cache.lam * ((1.0 - scale * (1.0 - M)) * cache.C) ** 2).sum())
+        report = {
+            "scale": scale,
+            # rule 11's input-weighted ratio ‖δ A_t^½‖ / ‖ΔW A_t^½‖, before and after scaling
+            "task_input_step_ratio_unscaled": task_ratio,
+            "task_input_step_ratio": scale * task_ratio,
+            # the same with A_t′ = A_t + γ_c A_h, as logged on 12 Nov
+            "input_step_ratio": scale * _ratio(input_step, cache.input_norm) ** 0.5,
+            "curvature_step_ratio": curvature_ratio,
+            # diagnostic only, never used to accept a μ: the step on inputs from harmful prompts
+            "harm_input_step_ratio": scale * _ratio(harm_input_step, cache.harm_input_norm) ** 0.5,
+            "trust_ratio": curvature_ratio if cache.exempt else scale * task_ratio,
+            "S_before_pred": cache.S_before,
+            "S_after_pred": cache.S_before - cache.S_kept + S_kept_after,
+            "R_pred": 0.5 * scale**2 * curvature_step,
+        }
+        return removed, scale, report
+
+    def _repair_module(self, module: str, mu: float) -> tuple[torch.Tensor, dict]:
+        """(δ = ΔW′ − ΔW after scaling, per-module report) for one prepared module, from the caches only."""
+        removed, scale, report = self._module_terms(module, mu)
         basis = self.basis(module)
-        M = mu / (cache.lam + mu)
-        removed = (1.0 - M) * cache.C  # (1 − M) ∘ C: the part of each coordinate the repair takes out
         Y = basis.out.X.to(F64)
         X = basis.inp.X.to(F64)
         step = -(Y @ removed @ X.T)
+        unscaled_ratio = _ratio(float(step.norm()), self._prepared[module].dW_norm)
+        report["step_ratio_unscaled"] = unscaled_ratio
+        report["step_ratio"] = scale * unscaled_ratio  # Euclidean, the pre-registered metric
+        report["range_in"] = basis.inp.range_dim
+        report["range_out"] = basis.out.range_dim
+        report["dropped"] = basis.inp.dropped + basis.out.dropped
+        return scale * step, report
 
-        # ‖δ A_t′^½‖² = tr(removedᵀ YᵀY removed), because Xᵀ A_t′ X = I
-        input_step = max(float(torch.trace(removed.T @ cache.YtY @ removed)), 0.0)
-        S_kept_after = 0.5 * float((cache.lam * (M * cache.C) ** 2).sum())
-        report = {
-            "step_ratio": _ratio(float(step.norm()), cache.dW_norm),
-            # The same ratio measured on task inputs. Big Euclidean steps along directions the inputs never
-            # visit are harmless and show up only in step_ratio.
-            "input_step_ratio": _ratio(input_step, cache.input_norm) ** 0.5,
-            "S_before_pred": cache.S_before,
-            "S_after_pred": cache.S_before - cache.S_kept + S_kept_after,
-            "R_pred": 0.5 * float((removed**2).sum()),
-            "range_in": basis.inp.range_dim,
-            "range_out": basis.out.range_dim,
-            "dropped": basis.inp.dropped + basis.out.dropped,
-        }
-        return step, report
+    def predicted(self, deltas: dict, mu: float) -> dict[str, float]:
+        """Predicted S and R at μ summed over modules, with scaling, without forming any step (cheap)."""
+        self.prepare(deltas)
+        S, R = 0.0, 0.0
+        for module in self._prepared:
+            report = self._module_terms(module, mu)[2]
+            S += report["S_after_pred"]
+            R += report["R_pred"]
+        return {"S_pred": S, "R_pred": R}
 
-    def repair(self, W0: dict, deltas: dict, mu: float, modules: list[str] | None = None) -> tuple[dict, dict]:
+    def repair(
+        self,
+        W0: dict,
+        deltas: dict,
+        mu: float,
+        modules: list[str] | None = None,
+        task_gradient: TaskGradient | None = None,
+    ) -> tuple[dict, dict]:
         """Repair at one μ. Returns ({module: W0 + ΔW′ in W0's dtype and device}, report).
 
-        Modules outside `modules` (default: all) get the unrepaired W0 + ΔW: the targeted-repair control."""
+        Modules outside `modules` (default: all) get the unrepaired W0 + ΔW: the targeted-repair control. With
+        `task_gradient` (the task gradient g at θ1) the report adds the diagnostic |gᵀδ| / (½ δᵀĤδ), gᵀδ summed
+        module by module as each step is made, so no more than one dense step is held at a time."""
         self.prepare(deltas)
         all_modules = self.modules(deltas)
         chosen = set(all_modules) if modules is None else set(modules)
 
         new_weights, per_module = {}, {}
+        g_dot_delta = 0.0
         for module in all_modules:
             dW = as_dense(deltas[module], F64, self.device)
             if module in chosen:
                 step, per_module[module] = self._repair_module(module, mu)
+                if task_gradient is not None:
+                    g_dot_delta += task_gradient.dot(module, step)
                 dW = dW + step
             W = W0[module]
             new_weights[module] = (W.to(self.device, F64) + dW).to(dtype=W.dtype, device=W.device)
-        return new_weights, _summarise(mu, per_module)
+        report = _summarise(mu, per_module)
+        if task_gradient is not None:
+            report["task_grad_diagnostic"] = _grad_diagnostic(g_dot_delta, report["R_pred"])
+        return new_weights, report
 
     def steps(self, deltas: dict, mu: float, modules: list[str] | None = None) -> dict[str, torch.Tensor]:
         """δ = ΔW′ − ΔW (float64) for the repaired modules only (all by default)."""
@@ -386,12 +546,11 @@ class ModelRepair:
 
     def frontier(self, deltas: dict, mus) -> dict[str, list[float]]:
         """Predicted S(μ) and R(μ) summed over modules. R is "predicted (assumes a task minimum)"."""
-        self.prepare(deltas)
         S, R = [], []
         for mu in mus:
-            reports = [self._repair_module(module, mu)[1] for module in self._prepared]
-            S.append(sum(report["S_after_pred"] for report in reports))
-            R.append(sum(report["R_pred"] for report in reports))
+            totals = self.predicted(deltas, mu)
+            S.append(totals["S_pred"])
+            R.append(totals["R_pred"])
         return {"mu": list(mus), "S_pred": S, "R_pred_assumes_task_minimum": R}
 
 
@@ -402,15 +561,82 @@ def _ratio(numerator: float, denominator: float) -> float:
     return 0.0
 
 
+def _ratio_or_inf(numerator: float, denominator: float) -> float:
+    """numerator / denominator; a non-zero step against a zero denominator is infinitely large (t = 0)."""
+    if denominator > 0:
+        return numerator / denominator
+    if numerator > 0:
+        return float("inf")
+    return 0.0
+
+
+def _symmetric(M: torch.Tensor) -> torch.Tensor:
+    """½ (M + Mᵀ)."""
+    return 0.5 * (M + M.T)
+
+
+def _shrink(lam: torch.Tensor, mu: float) -> torch.Tensor:
+    """M = μ / (λ + μ), with its limit 1 where λ = μ = 0 (nothing to remove), so μ = 0 is allowed."""
+    if mu == 0:
+        return (lam == 0).to(F64)
+    return mu / (lam + mu)
+
+
+def _covariant_ceiling_bound(pencil: Pencil) -> float:
+    """For a ν-damped output pencil (Yᵀ G″ Y = I, Yᵀ G_h Y = diag γ″): the largest covariant Rayleigh quotient
+    yᵀG_h y / yᵀG_t′y over its solved directions, γ″_j / (Yᵀ G_t′ Y)_jj, a lower bound on the covariant top
+    eigenvalue. A non-positive denominator means G_t′ is indefinite there (infinite)."""
+    Y = pencil.X.to(F64)
+    task_part = (Y * (pencil.FX.to(F64) - pencil.nu * Y)).sum(0)  # diag(Yᵀ G_t′ Y)
+    gamma = pencil.lam.to(F64)
+    bounds = torch.where(task_part > 0, gamma / task_part.clamp_min(1e-300), torch.full_like(gamma, float("inf")))
+    bounds = torch.where(gamma > 0, bounds, torch.zeros_like(gamma))
+    return float(bounds.max())
+
+
 def _summarise(mu: float, per_module: dict[str, dict]) -> dict:
     """The whole-model report: per-module reports, their summed predictions and the largest step ratios."""
     rows = per_module.values()
     report = {"mu": mu, "modules": per_module}
     for key in SUMMED_REPORT_KEYS:
         report[key] = sum(row[key] for row in rows)
-    report["max_step_ratio"] = max((row["step_ratio"] for row in rows), default=0.0)
-    report["max_input_step_ratio"] = max((row["input_step_ratio"] for row in rows), default=0.0)
+    for key in ("step_ratio", "input_step_ratio", "task_input_step_ratio", "trust_ratio", "harm_input_step_ratio"):
+        report[f"max_{key}"] = max((row[key] for row in rows), default=0.0)
+    report["n_scaled"] = sum(row["scale"] < 1.0 for row in rows)
     return report
+
+
+def scaled_trust_region_repair(
+    repairer: ModelRepair, W0: dict, deltas: dict, mu: float, actual_S=None, task_gradient: TaskGradient | None = None
+):
+    """Rule 11 for the scaled repair: one attempt, which passes when every module's trust ratio is at most 1
+    (input-weighted after scaling; curvature norm for the exempt modules) and, if `actual_S` is given, the
+    measured dev drift falls. Returns (new_weights, report, setting) like trust_region_repair."""
+    S_before = None
+    if actual_S is not None:
+        S_before = actual_S(None)
+    new_weights, report = repairer.repair(W0, deltas, mu, task_gradient=task_gradient)
+    S_after = None
+    if actual_S is not None:
+        S_after = actual_S(new_weights)
+    steps_ok = report["max_trust_ratio"] <= 1.0 + TRUST_RATIO_TOLERANCE
+    drift_fell = S_after is None or S_after < S_before
+    attempt = {
+        "damping": "scaled",
+        "gamma": repairer.gamma,
+        "output_nu_rel": repairer.output_nu_rel,
+        "max_step_ratio": report["max_step_ratio"],
+        "max_input_step_ratio": report["max_input_step_ratio"],
+        "max_task_input_step_ratio": report["max_task_input_step_ratio"],
+        "max_trust_ratio": report["max_trust_ratio"],
+        "S_actual": S_after,
+        "S_before": S_before,
+        "passed": steps_ok and drift_fell,
+    }
+    setting = {"damping": "scaled", "gamma": repairer.gamma, "attempts": [attempt]}
+    if not attempt["passed"]:
+        setting["failed"] = True
+    return new_weights, report, setting
 
 
 def trust_region_repair(
@@ -511,6 +737,47 @@ def _forecast_delta(delta, A_h: torch.Tensor, G_h: torch.Tensor, device) -> floa
     return 0.5 * float(torch.trace(output_side @ input_side))
 
 
+@dataclass
+class TaskGradient:
+    """The mean token cross-entropy gradient g at θ1, per module weight: sums[module] / n_tokens."""
+
+    sums: dict[str, torch.Tensor]  # Σ over batches of the summed-token NLL gradient (float32, model's device)
+    n_tokens: int
+
+    def dot(self, module: str, step: torch.Tensor) -> float:
+        """gᵀδ for one module's step δ (float64)."""
+        grad_sum = self.sums[module]
+        return float((grad_sum.to(F64) * step.to(grad_sum.device, F64)).sum()) / max(self.n_tokens, 1)
+
+
+def task_gradient(model, batches, modules) -> TaskGradient:
+    """g at the model's current weights over `batches`, for the weights of `modules`. Each batch's bf16 gradient
+    is added into a float32 sum on the model's device, so bf16 never accumulates across batches. Leaves every
+    parameter with requires_grad False."""
+    weights = _enable_weight_grads(model, modules)
+    sums = {module: torch.zeros_like(W, dtype=torch.float32) for module, W in weights.items()}
+    device = next(iter(weights.values())).device
+    n_tokens = 0
+    for batch in batches:
+        nll, batch_tokens = _summed_token_nll(model, batch, device)
+        nll.backward()
+        for module, W in weights.items():
+            sums[module] += W.grad.float()
+            W.grad = None
+        n_tokens += batch_tokens
+    for W in weights.values():
+        W.requires_grad_(False)
+    return TaskGradient(sums=sums, n_tokens=n_tokens)
+
+
+def _grad_diagnostic(g_dot_delta: float, R_pred: float) -> dict[str, float]:
+    """{"g_dot_delta", "half_dHd", "ratio" = |gᵀδ| / (½ δᵀĤδ)}; above 0.1 the predicted R is not trustworthy."""
+    ratio = float("inf")
+    if R_pred > 0:
+        ratio = abs(g_dot_delta) / R_pred
+    return {"g_dot_delta": g_dot_delta, "half_dHd": R_pred, "ratio": ratio}
+
+
 def task_grad_diagnostic(model, batches, steps: dict[str, torch.Tensor], R_pred: float) -> dict[str, float]:
     """The trust diagnostic for the predicted regret: |gᵀδ| / (½ δᵀĤδ), over the modules in `steps`.
 
@@ -532,10 +799,7 @@ def task_grad_diagnostic(model, batches, steps: dict[str, torch.Tensor], R_pred:
         W.requires_grad_(False)
 
     g_dot_delta /= max(n_tokens, 1)
-    ratio = float("inf")
-    if R_pred > 0:
-        ratio = abs(g_dot_delta) / R_pred
-    return {"g_dot_delta": g_dot_delta, "half_dHd": R_pred, "ratio": ratio}
+    return _grad_diagnostic(g_dot_delta, R_pred)
 
 
 def _enable_weight_grads(model, modules) -> dict[str, torch.Tensor]:

@@ -237,6 +237,39 @@ def paired_bootstrap_diff(
     return {"diff": diff, "lo": lo, "hi": hi, "p_two_sided": float(min(1.0, p_two_sided))}
 
 
+def paired_bootstrap_token_mean_diff(
+    a_sums: Any, b_sums: Any, counts: Any, n_boot: int = 2000, alpha: float = 0.05, seed: int = 0
+) -> dict[str, float]:
+    """How much a token-weighted mean Σa/Σn exceeds Σb/Σn on the same items, with a paired percentile bootstrap.
+
+    Item i has per-token sums a_sums[i] and b_sums[i] over the same counts[i] tokens (e.g. one prompt's summed KL
+    under two models: the measured S is Σ kl_sum / Σ n). Each replicate resamples item indices, shared by a and
+    b, and computes d* = (Σa* − Σb*) / Σn*. Returns {"diff", "lo", "hi", "p_two_sided"} (bootstrap sign test)."""
+    alpha = _check_alpha(alpha)
+    n_boot = _check_n_boot(n_boot)
+    a_values = np.asarray(a_sums, dtype=float)
+    b_values = np.asarray(b_sums, dtype=float)
+    n_values = np.asarray(counts, dtype=float)
+    if not (a_values.ndim == b_values.ndim == n_values.ndim == 1):
+        raise ValueError("a_sums, b_sums and counts must be 1-D")
+    if not (len(a_values) == len(b_values) == len(n_values)) or len(a_values) == 0:
+        raise ValueError("a_sums, b_sums and counts need the same, non-zero number of items")
+    if np.any(n_values <= 0):
+        raise ValueError("every item needs a positive token count")
+
+    differences = a_values - b_values
+    diff = float(differences.sum() / n_values.sum())
+    rng = np.random.default_rng(seed)
+    replicate_diffs = []
+    for chunk in _boot_indices(rng, len(differences), n_boot):
+        replicate_diffs.extend(differences[chunk].sum(axis=1) / n_values[chunk].sum(axis=1))
+    replicate_diffs = np.array(replicate_diffs)
+
+    lo, hi = _percentile_ci(replicate_diffs, alpha)
+    p_two_sided = 2.0 * min(np.mean(replicate_diffs <= 0.0), np.mean(replicate_diffs >= 0.0))
+    return {"diff": diff, "lo": lo, "hi": hi, "p_two_sided": float(min(1.0, p_two_sided))}
+
+
 # --------------------------------------------------------------------------------------- frontier
 
 

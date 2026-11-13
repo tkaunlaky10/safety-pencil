@@ -171,8 +171,10 @@ def _masked_logprobs(model: nn.Module, batch: dict, mask_key: str) -> torch.Tens
     return lm_logits(model, hidden[mask]).double().log_softmax(-1)  # float64: the KL can be ~1e-7
 
 
-def _kl_summary(logprob_pairs) -> dict[str, float]:
+def _kl_summary(logprob_pairs, per_batch: bool = False) -> dict:
     """Mean and max per-position KL(a ‖ b) and the max |log p_a − log p_b| over (log p_a, log p_b) pairs.
+    per_batch adds each batch's summed KL and position count ("kl_sum_per_batch", "n_per_batch"): with one
+    sequence per batch, what a paired bootstrap over prompts needs.
 
     The pairs are consumed one at a time, so a generator keeps only one batch of vocab-sized tensors."""
     kls = []
@@ -181,12 +183,16 @@ def _kl_summary(logprob_pairs) -> dict[str, float]:
         kls.append((logprobs_a.exp() * (logprobs_a - logprobs_b)).sum(-1))
         max_diff = max(max_diff, float((logprobs_a - logprobs_b).abs().max()))
     all_kls = torch.cat(kls)
-    return {
+    summary = {
         "kl_mean": float(all_kls.mean()),
         "kl_max": float(all_kls.max()),
         "max_abs_logprob_diff": max_diff,
         "n_positions": int(all_kls.numel()),
     }
+    if per_batch:
+        summary["kl_sum_per_batch"] = [float(batch_kls.sum()) for batch_kls in kls]
+        summary["n_per_batch"] = [int(batch_kls.numel()) for batch_kls in kls]
+    return summary
 
 
 def _paired_logprobs(model_a: nn.Module, model_b: nn.Module, batches, mask_key: str):
@@ -202,10 +208,12 @@ def _table_and_model_logprobs(table: list[torch.Tensor], model: nn.Module, batch
 
 
 @torch.no_grad()
-def output_kl(model_a: nn.Module, model_b: nn.Module, batches, mask_key: str = "rows_all") -> dict[str, float]:
+def output_kl(
+    model_a: nn.Module, model_b: nn.Module, batches, mask_key: str = "rows_all", per_batch: bool = False
+) -> dict:
     """Per-position KL(a ‖ b) of next-token distributions (mean and max) and the max |Δ log-prob|, over the
-    positions in batch[mask_key]. Both models must fit on the device together."""
-    return _kl_summary(_paired_logprobs(model_a, model_b, batches, mask_key))
+    positions in batch[mask_key] (per batch too with per_batch). Both models must fit on the device together."""
+    return _kl_summary(_paired_logprobs(model_a, model_b, batches, mask_key), per_batch)
 
 
 @torch.no_grad()

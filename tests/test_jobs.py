@@ -724,3 +724,141 @@ def test_test_tier_change_section_compares_theta0_and_run_a(report):
     section = "\n".join(report.test_tier_change_section(results))
     assert "| en | 20 | 0% → 0% | +0 | 1 | 1 | 0% → 50% | +50 | 0.00195 | 0.00195 |" in section
     assert report.test_tier_change_section({"test_theta0": {"result": theta0}}) == []  # needs both
+
+
+# ---------------------------------------------------------------- the scaled repair stage (13 Nov)
+def _scaled_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
+    """What the scaled sweep (two μ) and the matching step would leave on disk."""
+    repaired = tmp_path / "outputs" / "ckpt" / "repaired"
+    for mu in ("0.1", "0.5"):
+        (repaired / f"runA_frac100_full_mu{mu}").mkdir(parents=True)
+    saved_baselines = tmp_path / "outputs" / "ckpt" / "baselines"
+    for method in ("regmean", "wiseft", "diag_fisher"):
+        (saved_baselines / f"runA_matched_{method}").mkdir(parents=True)
+    return repaired, saved_baselines
+
+
+def test_scaled_stage_runs_sweep_invariance_baselines_matching_p6_then_the_test_tier(tmp_path):
+    repaired, saved_baselines = _scaled_checkpoints(tmp_path)
+    calls = run_stage(tmp_path, "repair_scaled", stage_arg="A", stdout="0.1")  # the fake 09_finalists: μ* = 0.1
+
+    assert scripts_run(calls) == [
+        "04_factors",
+        "04_factors",
+        "04_factors",
+        "06_repair sweep",
+        "05_invariance",
+        "09_finalists",  # --any-passing
+        "07_baselines",
+        "09_finalists",
+        "09_finalists",  # --print target_nll
+        "07_baselines",  # --match-nll
+        "09_finalists",  # μ* for free_other_mus
+        "10_p6",
+        "09_finalists",  # μ* for the test tier
+        "02_evaluate",
+        "02_evaluate",
+        "02_evaluate",
+    ]
+    sweep = next(call for call in calls if call.startswith("scripts/06_repair.py sweep"))
+    assert "--method scaled --save-all" in sweep and "--mu" not in sweep  # the predicted grid, not a fixed one
+    invariance = next(call for call in calls if call.startswith("scripts/05_invariance.py"))
+    assert "--methods pencil_scaled pencil_covariant" in invariance and "--conds" not in invariance  # same gauge
+    matching = next(call for call in calls if "--match-nll" in call)
+    assert "--match-nll 0.1" in matching and "--match-from baselines_runA_scaled" in matching
+    assert out_names(calls) == [
+        "repair_sweep_scaled_runA",
+        "invariance_scaled_runA",
+        "baselines_runA_scaled",
+        "finalists_scaled_runA",
+        "baselines_runA_matched",
+        "test_scaled_runA_mu0.1",
+        "test_matched_regmean_runA",
+        "test_matched_wiseft_runA",  # last: a timeout costs only WiSE-FT
+    ]
+    assert all("--tier full" in call for call in calls if call.startswith("scripts/02_evaluate.py"))
+    assert [path.name for path in repaired.iterdir()] == ["runA_frac100_full_mu0.1"]  # only μ* kept
+    assert [path.name for path in saved_baselines.iterdir()] == ["runA_matched_diag_fisher"]  # not test-tier
+
+
+def test_scaled_stage_keeps_the_sweep_and_invariance_when_no_mu_passes_rule_11(tmp_path):
+    _scaled_checkpoints(tmp_path)
+    calls = run_stage(tmp_path, "repair_scaled", stage_arg="A", stdout="0.1", fail="--any-passing")
+    assert scripts_run(calls)[3:] == ["06_repair sweep", "05_invariance", "09_finalists"]
+
+
+def test_scaled_stage_needs_the_factor_disk(launch):
+    launch.check_disk("repair_scaled", "l40sx1")
+    with pytest.raises(SystemExit, match="repair_scaled needs about 300 GB"):
+        launch.check_disk("repair_scaled", "a10g-small")
+
+
+def test_summary_keeps_every_repair_sweep_and_shows_p6(report):
+    def point(mu, S, failed, **extra):
+        return {
+            "mu": mu,
+            "S_actual": {"en": S},
+            "S_actual_mean": S,
+            "task_nll": 1.8,
+            "max_step_ratio": 94.0,
+            "max_input_step_ratio": 62.0,
+            "trust_region_failed": failed,
+            **extra,
+        }
+
+    sweep_common = {"S_drift": {"en": 0.26}, "task_nll": {"theta0": 2.138, "theta1": 1.786}}
+    covariant = {"result": {**sweep_common, "points": [point(1.0, 31.3, True)]}}
+    scaled = {
+        "result": {
+            **sweep_common,
+            "method": "scaled",
+            "points": [point(0.05, 0.1, False, max_trust_ratio=1.0, n_scaled=40)],
+        }
+    }
+    lang_row = {"diff": -0.05, "lo": -0.08, "hi": -0.02, "p_holm": 0.003, "pencil_lower": True, "pencil_higher": False}
+    p6 = {
+        "result": {
+            "mu_star": 0.05,
+            "baselines": {
+                "wiseft": {
+                    "setting": 0.3,
+                    "task_nll_baseline": 1.822,
+                    "task_nll_pencil": 1.82,
+                    "langs": {"en": lang_row},
+                },
+                "regmean": {"unavailable": "no matched row"},
+            },
+        }
+    }
+    results = {"repair_sweep_compare_runA": covariant, "repair_sweep_scaled_runA": scaled, "p6_runA": p6}
+    page = report.summary([], results, now=0.0)
+    assert (
+        "**repair_sweep_compare_runA** (covariant)" in page
+        and "| 1 | 31.3 (en 31.3) | 1.800 | 94 | 62 | — | fail |" in page
+    )
+    assert "**repair_sweep_scaled_runA** (scaled)" in page and "| 1 | 40 | pass |" in page
+    assert "| wiseft | 0.3 | +0.0020 | en | -0.05 [-0.08, -0.02] | 0.003 | pencil lower |" in page
+    assert "| regmean | — | — | — | unavailable | — | — |" in page
+    assert "pencil μ* = 0.05" in page and "backup" not in page
+    p6["result"]["mu_star_backup"] = True
+    assert "pencil backup μ* = 0.05" in report.summary([], results, now=0.0)
+
+
+def test_scaled_stage_carries_on_when_the_dev_baselines_step_fails(tmp_path):
+    """The whole dev baselines step fails: matching, P6 and the test tier still run, and the stage exits 1."""
+    _scaled_checkpoints(tmp_path)
+    failing = "--out-name baselines_runA_scaled"
+    calls = run_stage(tmp_path, "repair_scaled", stage_arg="A", stdout="0.1", fail=failing, expect_exit=1)
+    after_baselines = scripts_run(calls)[6:]  # factors ×3, sweep, invariance, --any-passing come first
+    assert after_baselines[0] == "07_baselines"  # the failing dev grid
+    assert after_baselines[1:] == [
+        "09_finalists",
+        "09_finalists",
+        "07_baselines",  # matching
+        "09_finalists",
+        "10_p6",
+        "09_finalists",
+        "02_evaluate",
+        "02_evaluate",
+        "02_evaluate",
+    ]

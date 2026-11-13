@@ -3,10 +3,10 @@
 import numpy as np
 import pytest
 import torch
-from test_math import pencil_repair_np, psd_with_null, spd
+from test_math import pencil_repair_np, pencil_repair_scaled_np, psd_with_null, spd
 
 from pencil.geneig import gen_eig, gen_eig_topk
-from pencil.repair import coords, forecast, frontier, layer_basis, repair_delta, repair_layer
+from pencil.repair import ModelRepair, coords, forecast, frontier, layer_basis, repair_delta, repair_layer
 
 
 def to_torch(array):
@@ -154,3 +154,101 @@ def test_gen_eig_topk_raises_its_jitter_when_fp32_noise_makes_the_task_factor_in
     hopeless = A_t - 1.0 * np.trace(A_t) / n * null_projector  # far beyond any jitter: still an error
     with pytest.raises(RuntimeError, match="not positive definite"):
         gen_eig_topk(to_torch(A_h), to_torch(hopeless), k, "covariant", 1e-3)
+
+
+# ---------------------------------------------------------------- the scaled repair (13 Nov)
+class _OneModuleFactors:
+    """The factor-store interface ModelRepair reads (a_key, pair), for hand-made factors."""
+
+    def __init__(self, factors_by_module: dict):
+        self.factors_by_module = factors_by_module
+        self.a_key = {module: module for module in factors_by_module}
+
+    def pair(self, module, row_set):
+        return self.factors_by_module[module]
+
+
+UP = "model.layers.0.mlp.up_proj"  # scaled, ν on its output side
+V = "model.layers.0.self_attn.v_proj"  # exempt: the V/O gauge transforms its output factor
+
+
+def _scaled_repairer(module, A_h, A_t, G_h, G_t):
+    harm = _OneModuleFactors({module: (to_torch(A_h), to_torch(G_h))})
+    task = _OneModuleFactors({module: (to_torch(A_t), to_torch(G_t))})
+    return ModelRepair(harm, task, gamma=1e-3, output_nu_rel=1e-2, scale_steps=True, basis_dtype=torch.float64)
+
+
+def _low_rank_task_problem(seed):
+    """Low-rank task factors, so the unscaled step is often large on task inputs and scaling acts."""
+    r = np.random.default_rng(seed)
+    A_h, A_t = spd(7, 3), spd(7, 2)
+    G_h, G_t = spd(5, 2), spd(5, 1)
+    return A_h, A_t, G_h, G_t, r.standard_normal((5, 7))
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_scaled_repair_matches_numpy(seed):
+    A_h, A_t, G_h, G_t, dW = _low_rank_task_problem(seed)
+    repairer = _scaled_repairer(UP, A_h, A_t, G_h, G_t)
+    W0 = np.zeros_like(dW)
+    for mu in (0.01, 0.3, 3.0):
+        ref, t, ratio = pencil_repair_scaled_np(dW, A_h, A_t, G_h, G_t, mu)
+        new_weights, report = repairer.repair({UP: to_torch(W0)}, {UP: to_torch(dW)}, mu)
+        np.testing.assert_allclose(new_weights[UP].numpy(), ref, rtol=1e-7, atol=1e-10)
+        row = report["modules"][UP]
+        assert row["scale"] == pytest.approx(t, rel=1e-8)
+        assert row["task_input_step_ratio_unscaled"] == pytest.approx(ratio, rel=1e-8)
+        assert row["task_input_step_ratio"] <= 1 + 1e-9 and row["trust_ratio"] == row["task_input_step_ratio"]
+
+
+def test_exempt_v_proj_gets_the_plain_covariant_repair_and_a_contraction_ratio():
+    A_h, A_t, G_h, G_t, dW = _low_rank_task_problem(10)
+    repairer = _scaled_repairer(V, A_h, A_t, G_h, G_t)
+    new_weights, report = repairer.repair({V: torch.zeros(5, 7, dtype=torch.float64)}, {V: to_torch(dW)}, 0.1)
+    ref = pencil_repair_np(dW, A_h, A_t, G_h, G_t, 0.1)
+    np.testing.assert_allclose(new_weights[V].numpy(), ref, rtol=1e-7, atol=1e-10)
+    row = report["modules"][V]
+    assert row["scale"] == 1.0 and row["trust_ratio"] == row["curvature_step_ratio"] <= 1 + 1e-9
+
+
+def test_scaled_predictions_equal_the_quadratic_costs_of_the_repaired_step():
+    """S_after_pred = ½ tr(G_h ΔW′ A_h ΔW′ᵀ) and R_pred = ½ tr(G_t′ δ A_t′ δᵀ) on a complete pencil."""
+    A_h, A_t, G_h, G_t, dW = _low_rank_task_problem(3)
+    repairer = _scaled_repairer(UP, A_h, A_t, G_h, G_t)
+    deltas = {UP: to_torch(dW)}
+    for mu in (0.0, 0.05, 1.0):
+        new_weights, report = repairer.repair({UP: torch.zeros(5, 7, dtype=torch.float64)}, deltas, mu)
+        repaired = new_weights[UP].numpy()
+        delta = repaired - dW
+        A_td, G_td = A_t + 1e-3 * A_h, G_t + 1e-3 * G_h
+        S_direct = 0.5 * np.trace(G_h @ repaired @ A_h @ repaired.T)
+        # S_before − S_kept + ... cancels to rounding when μ = 0 removes everything
+        assert report["S_after_pred"] == pytest.approx(S_direct, rel=1e-6, abs=1e-9 * report["S_before_pred"])
+        assert report["R_pred"] == pytest.approx(0.5 * np.trace(G_td @ delta @ A_td @ delta.T), rel=1e-6)
+        assert repairer.predicted(deltas, mu) == pytest.approx(
+            {"S_pred": report["S_after_pred"], "R_pred": report["R_pred"]}
+        )
+
+
+def test_ceiling_diagnostic_flags_an_indefinite_task_factor():
+    A_h, A_t, G_h, G_t, dW = _low_rank_task_problem(4)
+    w, Q = np.linalg.eigh(G_t)
+    G_t_indefinite = Q @ np.diag(w - 0.5 * w.max() * (np.arange(5) == 0) - 1e-3 * w.max()) @ Q.T
+    healthy = _scaled_repairer(UP, A_h, A_t, G_h, G_t)
+    broken = _scaled_repairer(UP, A_h, A_t, G_h, G_t_indefinite)
+    for repairer in (healthy, broken):
+        repairer.prepare({UP: to_torch(dW)})
+    assert healthy.ceiling_report()["flagged"] == []
+    assert broken.ceiling_report()["flagged"] == [f"{UP}|output"]
+
+
+def test_harmful_input_ratio_matches_its_direct_computation():
+    """‖δ A_h^½‖ / ‖ΔW A_h^½‖ from pencil coordinates equals the direct traces (after scaling)."""
+    A_h, A_t, G_h, G_t, dW = _low_rank_task_problem(7)
+    repairer = _scaled_repairer(UP, A_h, A_t, G_h, G_t)
+    for mu in (0.01, 1.0):
+        new_weights, report = repairer.repair({UP: torch.zeros(5, 7, dtype=torch.float64)}, {UP: to_torch(dW)}, mu)
+        delta = new_weights[UP].numpy() - dW
+        direct = np.sqrt(np.trace(delta @ A_h @ delta.T) / np.trace(dW @ A_h @ dW.T))
+        assert report["modules"][UP]["harm_input_step_ratio"] == pytest.approx(direct, rel=1e-7)
+        assert report["max_harm_input_step_ratio"] == report["modules"][UP]["harm_input_step_ratio"]

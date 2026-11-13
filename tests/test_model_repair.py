@@ -161,6 +161,28 @@ def test_pencil_repair_is_gauge_invariant_only_with_covariant_damping(setup, dam
         assert r["max_abs_logprob_diff"] > 1e-5, r
 
 
+def test_scaled_repair_is_gauge_invariant(setup):
+    """The scaled repair (output ν on every module but v_proj, per-module step scaling) gives the same function in
+    both V/O coordinates, as closely as the covariant pencil, and its scaling actually acted on some module."""
+    m0, d, fh, ft = setup["m0"], setup["deltas"], setup["fh"], setup["ft"]
+    shape = AttnShape.from_config(m0.config)
+    gauges = random_gauges(shape, cond=10.0, seed=2)
+    m0r = reparam_copy(m0, gauges)
+    dr = gauge_weights(d, gauges, shape)
+    scaled = dict(gamma=1e-3, output_nu_rel=1e-2, scale_steps=True)
+    repairer = ModelRepair(fh, ft, **scaled)
+    repairer_r = ModelRepair(_gauged(fh, gauges, shape), _gauged(ft, gauges, shape), **scaled)
+    weights, report = repairer.repair(model_weights(m0, d), d, 0.3)
+    weights_r, report_r = repairer_r.repair(model_weights(m0r, dr), dr, 0.3)
+    r = output_kl(_apply(m0, weights), _apply(m0r, weights_r), setup["H"] + setup["T"])
+    assert r["max_abs_logprob_diff"] < 1e-7 and r["kl_mean"] < 1e-12, r
+    assert report["max_trust_ratio"] <= 1 + 1e-9
+    assert report["n_scaled"] >= 1 and report_r["n_scaled"] == report["n_scaled"]
+    for module, row in report["modules"].items():  # the ratios and scales are gauge-invariant too
+        assert row["scale"] == pytest.approx(report_r["modules"][module]["scale"], rel=1e-6)
+        assert row["trust_ratio"] == pytest.approx(report_r["modules"][module]["trust_ratio"], rel=1e-6, abs=1e-12)
+
+
 def test_baselines_gauge_behaviour(setup):
     """RegMean is invariant (covariant products); diagonal Fisher, AlignMerge-style and Safe LoRA are not."""
     m0, d, fh, ft = setup["m0"], setup["deltas"], setup["fh"], setup["ft"]
@@ -412,3 +434,53 @@ def test_regmean_sweep_class_matches_direct_formula(setup):
         for mu in (0.3, 3.0, 100.0):
             ref = regmean_delta(d[n], fh.pair(n, "all")[0], ft.pair(n, "all")[0], mu, rcond=1e-13)
             torch.testing.assert_close(rm.delta(n, d[n], mu), ref, rtol=1e-4, atol=1e-7 * float(ref.abs().max()))
+
+
+def test_per_prompt_drift_adds_up_to_the_measured_S(setup):
+    """runtime.measure_S's per-prompt KL sums and counts (one prompt per batch) give back S = Σ kl_sum / Σ n."""
+    from pencil.runtime import measure_S
+
+    one_per_batch = {"en": _batches(setup["tokenizer"], HARM, size=1)}
+    S, per_prompt = measure_S(setup["m0"], setup["m1"], one_per_batch)
+    sums, counts = per_prompt["en"]["kl_sum"], per_prompt["en"]["n"]
+    assert len(sums) == len(HARM) and all(n > 0 for n in counts)
+    assert sum(sums) / sum(counts) == pytest.approx(S["en"], rel=1e-10)
+
+
+def test_streamed_task_gradient_diagnostic_matches_the_per_step_one(setup):
+    """repair(..., task_gradient=g) sums gᵀδ module by module; it equals task_grad_diagnostic on the full steps."""
+    from pencil.repair import task_grad_diagnostic, task_gradient
+
+    m0, d, fh, ft = setup["m0"], setup["deltas"], setup["fh"], setup["ft"]
+    repairer = ModelRepair(fh, ft, gamma=1e-3, output_nu_rel=1e-2, scale_steps=True)
+    theta1 = copy.deepcopy(setup["m1"])
+    g = task_gradient(theta1, setup["T"], list(d))
+    assert not any(parameter.requires_grad for parameter in theta1.parameters())
+    _, report = repairer.repair(model_weights(m0, d), d, 0.3, task_gradient=g)
+    reference = task_grad_diagnostic(copy.deepcopy(setup["m1"]), setup["T"], repairer.steps(d, 0.3), report["R_pred"])
+    streamed = report["task_grad_diagnostic"]
+    assert streamed["g_dot_delta"] == pytest.approx(reference["g_dot_delta"], rel=1e-6)
+    assert streamed["ratio"] == pytest.approx(reference["ratio"], rel=1e-6)
+
+
+def test_native_wise_ft_endpoints_are_bit_for_bit_theta1_and_theta0():
+    """α = 0 gives exactly θ1 as merge_deltas builds it, α = 1 exactly θ0, in bf16; α in between is between."""
+    from pencil.baselines import wise_ft
+
+    m0 = tiny_cohere2(dtype=torch.bfloat16)
+    deltas = {name: delta.float() for name, delta in _random_deltas(m0, scale=0.5).items()}
+    theta1 = merge_deltas(copy.deepcopy(m0), deltas)
+    at_zero = wise_ft(copy.deepcopy(m0), deltas, 0.0)
+    at_one = wise_ft(copy.deepcopy(m0), deltas, 1.0)
+    halfway = wise_ft(copy.deepcopy(m0), deltas, 0.5)
+    changed = 0
+    for (name, p0), p1, pa0, pa1, ph in zip(
+        m0.named_parameters(), theta1.parameters(), at_zero.parameters(), at_one.parameters(), halfway.parameters()
+    ):
+        assert torch.equal(pa0, p1), name
+        assert torch.equal(pa1, p0), name
+        if not torch.equal(p0, p1):
+            changed += 1
+            distance_to_theta0 = (ph.float() - p0.float()).norm()
+            assert 0 < distance_to_theta0 < (p1.float() - p0.float()).norm(), name
+    assert changed == len(deltas)  # the test is not vacuous: every fine-tuned weight moved in bf16

@@ -247,14 +247,17 @@ def dev_harm_batches(ctx: Ctx, model0, tokenizer, langs) -> dict[str, list[dict]
     return batches_by_lang
 
 
-def measure_S(model0, model, batches_by_lang) -> dict[str, float]:
-    """The measured safety drift per language: mean per-token KL(θ0 ‖ θ) on θ0's own dev answers."""
+def measure_S(model0, model, batches_by_lang) -> tuple[dict[str, float], dict[str, dict]]:
+    """The measured safety drift per language, mean per-token KL(θ0 ‖ θ) on θ0's own dev answers, and per prompt
+    (one prompt per batch): ({lang: S}, {lang: {"kl_sum": [...], "n": [...]}}), so S = Σ kl_sum / Σ n."""
     from .invariance import output_kl
 
-    drift = {}
+    drift, per_prompt = {}, {}
     for lang, batches in batches_by_lang.items():
-        drift[lang] = output_kl(model0, model, batches, mask_key="loss_mask")["kl_mean"]
-    return drift
+        summary = output_kl(model0, model, batches, mask_key="loss_mask", per_batch=True)
+        drift[lang] = summary["kl_mean"]
+        per_prompt[lang] = {"kl_sum": summary["kl_sum_per_batch"], "n": summary["n_per_batch"]}
+    return drift, per_prompt
 
 
 PROBE_TASK_BATCH = 1  # DevProbe.task_nll: sequences scored at once
@@ -279,10 +282,11 @@ class DevProbe:
         return task_nll(model, self.tokenizer, self.task, batch_size=PROBE_TASK_BATCH)["nll_per_token"]
 
     def measure(self, model) -> dict:
-        """Drift S per language, its mean over languages, and the task dev NLL."""
-        S = measure_S(self.model0, model, self.harm)
+        """Drift S per language, its mean over languages, the task dev NLL, and the per-prompt KL sums and token
+        counts behind S ("S_prompts", for P6's paired bootstrap; KL values only, no text)."""
+        S, per_prompt = measure_S(self.model0, model, self.harm)
         S_mean = sum(S.values()) / len(S)
-        return {"S": S, "S_mean": S_mean, "task_nll": self.task_nll(model)}
+        return {"S": S, "S_mean": S_mean, "task_nll": self.task_nll(model), "S_prompts": per_prompt}
 
 
 # ---------------------------------------------------------------- factors
@@ -369,6 +373,18 @@ def repair_kwargs(pencil_cfg: dict, rel_tol: float, **overrides) -> dict:
         "eig_device": eig_device,
         "basis_dtype": getattr(torch, pencil_cfg.get("basis_dtype", "float32")),
     }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def scaled_repair_kwargs(pencil_cfg: dict, rel_tol: float, **overrides) -> dict:
+    """ModelRepair keyword arguments for the scaled repair (pencil.scaled in the config, 13 Nov): covariant input
+    side, output ν = output_nu_rel × mean diagonal, per-module step scaling, exempt_leaves without either."""
+    scaled_cfg = pencil_cfg["scaled"]
+    kwargs = repair_kwargs(pencil_cfg, rel_tol, damping="covariant")
+    kwargs["output_nu_rel"] = scaled_cfg["output_nu_rel"]
+    kwargs["scale_steps"] = True
+    kwargs["exempt_leaves"] = tuple(scaled_cfg["exempt_leaves"])
     kwargs.update(overrides)
     return kwargs
 

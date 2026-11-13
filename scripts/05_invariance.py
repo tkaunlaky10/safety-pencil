@@ -4,7 +4,8 @@ Reparameterise with a random V/O gauge (one head_dim × head_dim matrix per KV h
 number 10 and 30), transform the fine-tune's update and the factors consistently, repair in both
 coordinates, and compare the two repaired models' outputs (KL and max |Δ log-prob|, never raw weights).
 
-Expected: the covariant pencil and the linear ReSta (no DARE; the positive control) are invariant, RegMean
+Expected: the covariant pencil, the scaled pencil (13 Nov; ν damping on output sides except v_proj, per-module step
+scaling) and the linear ReSta (no DARE; the positive control) are invariant, RegMean
 too up to its pseudo-inverse cutoff; Euclidean damping, the diagonal Fisher merge, AlignMerge-style and
 Safe LoRA (the negative control) are not.
 
@@ -17,6 +18,7 @@ Also checks the analytic factor transform against factors re-estimated on the re
 reports how well-conditioned the gauge-touched factors are (numerical invariance degrades with it).
 
     python scripts/05_invariance.py --run A
+    python scripts/05_invariance.py --run A --methods pencil_scaled pencil_covariant --out-name invariance_scaled_runA
     python scripts/05_invariance.py --run A --dry-run
 """
 
@@ -45,6 +47,7 @@ from pencil.runtime import (
     load_model,
     load_repair_inputs,
     repair_kwargs,
+    scaled_repair_kwargs,
     setup,
     single_row_set,
     theta0_answers,
@@ -75,16 +78,18 @@ class RepairMethods:
     """The repairs compared in both coordinate systems. Each method takes a Coords and returns the repaired
     weights {module: W0 + ΔW′} in W0's dtype."""
 
-    def __init__(self, args, pencil_cfg: dict, repair_kw: dict, row_set: str):
+    def __init__(self, args, pencil_cfg: dict, repair_kw: dict, row_set: str, scaled_kw: dict):
         self.args = args
         self.pencil_cfg = pencil_cfg
         self.repair_kw = repair_kw  # ModelRepair arguments other than damping and γ
         self.row_set = row_set
+        self.scaled_kw = scaled_kw  # ModelRepair arguments of the scaled repair
 
     def by_name(self) -> dict:
         """{name: method}, in the order the results and the figure list them."""
         return {
             "pencil_covariant": self.pencil_covariant,
+            "pencil_scaled": self.pencil_scaled,
             "pencil_euclidean": self.pencil_euclidean,
             "alignmerge_style": self.alignmerge_style,
             "regmean": self.regmean,
@@ -101,6 +106,11 @@ class RepairMethods:
 
     def pencil_covariant(self, coords: Coords) -> dict:
         return self._pencil(coords, coords.harm, "covariant", self.pencil_cfg["gamma_c"])
+
+    def pencil_scaled(self, coords: Coords) -> dict:
+        repairer = ModelRepair(coords.harm, coords.task, **self.scaled_kw)
+        repaired, _ = repairer.repair(coords.W0, coords.deltas, self.args.mu)
+        return repaired
 
     def pencil_euclidean(self, coords: Coords) -> dict:
         return self._pencil(coords, coords.harm, "euclidean", self.args.gamma_e)
@@ -245,9 +255,21 @@ def prepare_experiment(ctx, args) -> Experiment:
         row_set=row_set,
         batches=batches,
         reestimate_layers=layers_to_reestimate(ctx, args.reestimate_layers, shape.n_layers),
-        methods=RepairMethods(args, pencil_cfg, repair_kw, row_set).by_name(),
+        methods=chosen_methods(args, pencil_cfg, repair_kw, row_set, inputs.rel_tol),
         original=Coords(inputs.harm_factors, inputs.task_factors, W0_repaired, deltas, W_base),
     )
+
+
+def chosen_methods(args, pencil_cfg: dict, repair_kw: dict, row_set: str, rel_tol: float) -> dict:
+    """{name: method} for --methods (default: all), in the order RepairMethods lists them."""
+    scaled_kw = scaled_repair_kwargs(pencil_cfg, rel_tol, row_set=row_set)
+    every_method = RepairMethods(args, pencil_cfg, repair_kw, row_set, scaled_kw).by_name()
+    if not args.methods:
+        return every_method
+    unknown = set(args.methods) - set(every_method)
+    if unknown:
+        raise SystemExit(f"unknown --methods {sorted(unknown)}; choose from {list(every_method)}")
+    return {name: method for name, method in every_method.items() if name in args.methods}
 
 
 # ---------------------------------------------------------------- one condition number
@@ -420,7 +442,7 @@ def compare_at_condition(ctx, args, experiment: Experiment, cond: float) -> dict
 
 def write_invariance_result(ctx, args, experiment: Experiment, results: dict) -> None:
     write_result(
-        f"invariance_run{args.run}",
+        args.out_name or f"invariance_run{args.run}",
         {
             "results": results,
             "mu": args.mu,
@@ -472,6 +494,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="float32", choices=["float32", "float64", "bfloat16"])
     parser.add_argument("--reestimate-layers", default=None, help="comma list (default: first two selection layers)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--methods", nargs="+", default=None, help="default: every method")
+    parser.add_argument("--out-name", default=None, help="result name (default invariance_run<run>)")
     return parser
 
 
@@ -484,7 +508,7 @@ def main(argv=None):
         results[str(cond)] = compare_at_condition(ctx, args, experiment, cond)
     write_invariance_result(ctx, args, experiment, results)
     # the run is in the file name so a run on another setting doesn't overwrite the figure
-    plot(ctx.out("figures") / f"invariance_run{args.run}.png", results, list(experiment.methods))
+    plot(ctx.out("figures") / f"{args.out_name or f'invariance_run{args.run}'}.png", results, list(experiment.methods))
 
 
 if __name__ == "__main__":

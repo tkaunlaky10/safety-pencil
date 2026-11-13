@@ -3,6 +3,8 @@ and task NLL). --save writes merged checkpoints for 02_evaluate.py. --finalists 
 setting of each named method and saves it (the compare stage's test-tier finalists).
 
 Ours (same factors as the pencil, so the comparison isolates the curvature model):
+  wiseft           W0 + (1 − α)ΔW through delta.merge_deltas (native since 13 Nov; α pulls toward θ0)
+                                                                   α in {0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75}
   regmean          W1 − ΔW A_h (A_h + μA_t)⁺                       μ in [0.3, 1000], 13 log-spaced
   diag_fisher      per-weight Fisher merge (per-sequence diagonal if the factor pass ran with --diag,
                    else diag(G) diag(A)ᵀ; printed)                 μ in [1e-3, 3], 11 log-spaced
@@ -11,14 +13,22 @@ Ours (same factors as the pencil, so the comparison isolates the curvature model
   safelora         Safe LoRA projection C ΔW, C = VVᵀ/‖V‖, V = W_aligned − W_base
   safe_delta       SafeTune's Safe Delta fed our input factors
 SafeTune's (on the merged drifted model; aligned and base models in bf16 on the CPU):
-  wiseft, resta (DARE on), task_arithmetic, safemerge, lox
+  resta (DARE on), task_arithmetic, safemerge, lox
 SafeTune's Pre/Post merge is not run: it computes (1 − α)·post + α·pre, which is WiSE-FT when pre is the
 aligned model and pulls toward the unaligned model when pre is tiny-aya-base.
 
 Every setting starts from θ1: the working copy is reset, the setting is applied, then measured and recorded.
-A baseline that fails is recorded as an error row and the remaining baselines still run.
+A baseline that fails is recorded as {"unavailable": "<error>", "rows": [its rows so far]} and the remaining
+baselines still run.
+
+--match-nll TARGET --match-from NAME (13 Nov, P6): for each of --methods (wiseft, regmean, diag_fisher), start from
+its dev rows in result NAME and refine its knob toward dev task NLL = TARGET (pencil.finalists: regula falsi in
+the bracketing pair, at most MATCH_STEPS settings, NLL only), then save the closest setting's checkpoint as
+ckpt/baselines/run<run>_matched_<method> for the test tier.
 
     python scripts/07_baselines.py --run A --methods wiseft resta safelora safemerge regmean diag_fisher
+    python scripts/07_baselines.py --run A --methods wiseft regmean diag_fisher --match-nll 1.82 \
+        --match-from baselines_runA_scaled --out-name baselines_runA_matched
     python scripts/07_baselines.py --run A --dry-run
 """
 
@@ -26,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 from dataclasses import dataclass
 
@@ -38,9 +49,11 @@ from pencil.baselines import (
     kfac_diagonal,
     safe_delta_hessians,
     safe_lora_delta,
+    wise_ft,
 )
 from pencil.delta import as_dense, merge_deltas, model_weights, save_checkpoint, set_weights
 from pencil.factor_store import LazyFactors
+from pencil.finalists import MATCH_STEPS, baseline_rows, closest_setting, matched, next_setting_for_nll
 from pencil.repair import ModelRepair
 from pencil.results import write_result
 from pencil.runtime import (
@@ -69,11 +82,15 @@ def log_spaced(start: float, stop: float, count: int) -> list[float]:
 
 
 REGMEAN_MUS = log_spaced(0.3, 1000, 13)
+# WiSE-FT, natively since 13 Nov (W0 + (1 − α)ΔW, α pulls toward θ0); finer at small α: matching the pencil's dev
+# NLL needs α ≈ 0.3 (the old SafeTune grid was 0.25, 0.5, 0.75)
+WISEFT_ALPHAS = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75]
 DIAG_FISHER_MUS = log_spaced(1e-3, 3, 11)
 ALIGNMERGE_RANKS = (16, 64)
 SAFELORA_THRESHOLDS = (0.3, 0.5, 0.7)
 SAFE_DELTA_STRENGTHS = (0.05, 0.1, 0.2, 0.5)
 FINALIST_TOLERANCE = 1e-9  # a --finalists value matches a grid value within this
+LOG_SCALE_KNOBS = {"regmean", "diag_fisher"}  # matched in log μ; WiSE-FT's α is matched linearly
 
 
 @dataclass
@@ -87,7 +104,6 @@ class SafeTuneMethod:
 
 
 SAFETUNE = {
-    "wiseft": SafeTuneMethod("WiseFTTrainer", "alpha", [0.25, 0.5, 0.75], {"aligned_model"}),
     "resta": SafeTuneMethod("ReStaTrainer", "alpha", [0.1, 0.25, 0.5], {"base_model", "aligned_model"}),
     "task_arithmetic": SafeTuneMethod(
         "TaskArithmeticTrainer", "alpha", [0.1, 0.25, 0.5], {"base_model", "aligned_model"}
@@ -133,18 +149,23 @@ class BaselineRunner:
         self.row_set = single_row_set(self.pencil_cfg)
         self.probe = DevProbe(ctx, self.model0, self.inputs.tokenizer, self.inputs.langs)
         self._references = None
+        self._regmean = None
+        self._diag_fisher = None
         self.method = ""
         self.rows: list[dict] = []
         self.setting_started = 0.0
 
-    def reset(self) -> None:
-        """work ← θ1: every parameter from θ0 (SafeTune methods may touch embeddings and norms), then + ΔW.
-        Also starts the clock for the setting about to be applied."""
+    def reset_to_theta0(self) -> None:
+        """work ← θ0, every parameter (SafeTune methods may touch embeddings and norms). Starts the setting's clock."""
         with torch.no_grad():
             for param_work, param_theta0 in zip(self.work.parameters(), self.model0.parameters()):
                 param_work.copy_(param_theta0)
-        merge_deltas(self.work, self.deltas)
         self.setting_started = self.ctx.elapsed()
+
+    def reset(self) -> None:
+        """work ← θ1 = θ0 + ΔW (merge_deltas). Also starts the clock for the setting about to be applied."""
+        self.reset_to_theta0()
+        merge_deltas(self.work, self.deltas)
 
     def write_per_module(self, new_delta, value) -> None:
         """work ← W0 + new_delta(module, ΔW, value), one module at a time in layer order (ΔW in float64)."""
@@ -164,6 +185,38 @@ class BaselineRunner:
             self._references = (aligned, base)
         return self._references
 
+    def regmean(self) -> RegMean:
+        """RegMean on our factors, built on first use (its bases are solved once per input factor)."""
+        if self._regmean is None:
+            eig_device = repair_kwargs(self.pencil_cfg, self.inputs.rel_tol)["eig_device"]
+            self._regmean = RegMean(
+                self.inputs.harm_factors,
+                self.inputs.task_factors,
+                self.row_set,
+                top_k=self.pencil_cfg.get("top_k_mlp"),
+                eig_device=eig_device,
+            )
+        return self._regmean
+
+    def diag_fisher(self) -> DiagonalFisherMerge:
+        """The diagonal Fisher merge, built on first use; prints which diagonal it uses."""
+        if self._diag_fisher is None:
+            harm = self.inputs.harm_factors
+            task = self.inputs.task_factors
+            exact = harm.has_diag and task.has_diag
+            if exact:
+                print("diag_fisher: per-sequence diagonal from the factor pass")
+            else:
+                print("diag_fisher: diag(G) diag(A)ᵀ fallback")
+            self._diag_fisher = DiagonalFisherMerge(harm, task, self.row_set, exact)
+        return self._diag_fisher
+
+    def save(self, tag: str) -> None:
+        """Save `work` as ckpt/baselines/run<run>_<tag> (':' becomes '_')."""
+        folder = self.ctx.out("ckpt", "baselines", f"run{self.run}_{tag.replace(':', '_')}")
+        label = f"research artifact: baseline {tag} on run {self.run}"
+        save_checkpoint(self.work, self.inputs.tokenizer, folder, label)
+
     def grid(self, values) -> list[float]:
         """The current method's grid values to run: all of them, or just its --finalists pick."""
         return restrict_grid(list(values), self.finalists.get(self.method), self.method)
@@ -181,10 +234,7 @@ class BaselineRunner:
         print(f"{self.method} {setting}: S {row['S_mean']:.4g}, task NLL {row['task_nll']:.3f}")
         tag = save_tag(self.method, setting)
         if tag in self.save_tags:
-            folder = self.ctx.out("ckpt", "baselines", f"run{self.run}_{tag.replace(':', '_')}")
-            save_checkpoint(
-                self.work, self.inputs.tokenizer, folder, f"research artifact: baseline {tag} on run {self.run}"
-            )
+            self.save(tag)
 
 
 # ---------------------------------------------------------------- per-module merges
@@ -228,33 +278,15 @@ class SafeLoRAProjection:
 
 def run_regmean(runner: BaselineRunner) -> None:
     """RegMean on our factors: W1 − ΔW A_h (A_h + μA_t)⁺ for each μ."""
-    eig_device = repair_kwargs(runner.pencil_cfg, runner.inputs.rel_tol)["eig_device"]
-    regmean = RegMean(
-        runner.inputs.harm_factors,
-        runner.inputs.task_factors,
-        runner.row_set,
-        top_k=runner.pencil_cfg.get("top_k_mlp"),
-        eig_device=eig_device,
-    )
     for mu in runner.grid(REGMEAN_MUS):
-        runner.reset()
-        runner.write_per_module(regmean.delta, mu)
+        apply_setting(runner, "regmean", mu)
         runner.record(mu)
 
 
 def run_diag_fisher(runner: BaselineRunner) -> None:
-    """Diagonal Fisher merge (Matena & Raffel) for each μ; prints which diagonal it uses."""
-    harm = runner.inputs.harm_factors
-    task = runner.inputs.task_factors
-    exact = harm.has_diag and task.has_diag
-    if exact:
-        print("diag_fisher: per-sequence diagonal from the factor pass")
-    else:
-        print("diag_fisher: diag(G) diag(A)ᵀ fallback")
-    merge = DiagonalFisherMerge(harm, task, runner.row_set, exact)
+    """Diagonal Fisher merge (Matena & Raffel) for each μ."""
     for mu in runner.grid(DIAG_FISHER_MUS):
-        runner.reset()
-        runner.write_per_module(merge.delta, mu)
+        apply_setting(runner, "diag_fisher", mu)
         runner.record(mu)
 
 
@@ -316,8 +348,22 @@ def run_safe_delta(runner: BaselineRunner) -> None:
         runner.record(strength)
 
 
+def run_wiseft(runner: BaselineRunner) -> None:
+    """WiSE-FT natively, W0 + (1 − α)ΔW, for each α of WISEFT_ALPHAS."""
+    for alpha in runner.grid(WISEFT_ALPHAS):
+        apply_setting(runner, "wiseft", alpha)
+        runner.record(alpha)
+
+
 def run_safetune_trainer(runner: BaselineRunner, method: str) -> None:
     """One of SafeTune's recover trainers (table SAFETUNE) on the merged drifted model, over its grid."""
+    for value in runner.grid(SAFETUNE[method].grid):
+        apply_setting(runner, method, value)
+        runner.record(value)
+
+
+def apply_safetune(runner: BaselineRunner, method: str, value: float) -> None:
+    """One SafeTune recover trainer (table SAFETUNE) at one value of its swept argument, on `work`."""
     import safetune.runner.recover as recover  # optional dependency, imported only when this baseline runs
 
     aligned, base = runner.references()
@@ -327,13 +373,65 @@ def run_safetune_trainer(runner: BaselineRunner, method: str) -> None:
     if method == "resta":
         trainer_kwargs["dare"] = True
     trainer_class = getattr(recover, spec.trainer)
-    for value in runner.grid(spec.grid):
-        runner.reset()
-        trainer_class(runner.work, **trainer_kwargs, **{spec.swept_argument: value}).apply()
+    trainer_class(runner.work, **trainer_kwargs, **{spec.swept_argument: value}).apply()
+
+
+def apply_setting(runner: BaselineRunner, method: str, value: float) -> None:
+    """work ← θ1, then one setting of regmean or diag_fisher or a SafeTune trainer; WiSE-FT starts from θ0."""
+    if method == "wiseft":
+        runner.reset_to_theta0()
+        wise_ft(runner.work, runner.deltas, value)
+        return
+    runner.reset()
+    if method == "regmean":
+        runner.write_per_module(runner.regmean().delta, value)
+    elif method == "diag_fisher":
+        runner.write_per_module(runner.diag_fisher().delta, value)
+    else:
+        apply_safetune(runner, method, value)
+
+
+# ---------------------------------------------------------------- matched task NLL (P6)
+
+
+def match_method(runner: BaselineRunner, method: str, dev_rows: list[dict], target_nll: float) -> dict:
+    """Refine one baseline's knob toward dev task NLL = target_nll, then save its closest setting.
+
+    Returns {"refined": the new rows, "matched": the closest row of all, "within_tolerance": bool}."""
+    runner.start_method(method)
+    rows = [row for row in dev_rows if "task_nll" in row]
+    for _ in range(MATCH_STEPS):
+        value = next_setting_for_nll(rows + runner.rows, target_nll, log_scale=method in LOG_SCALE_KNOBS)
+        if value is None:
+            break
+        apply_setting(runner, method, value)
         runner.record(value)
+    best = closest_setting(rows + runner.rows, target_nll)
+    apply_setting(runner, method, best["setting"])
+    runner.save(f"matched_{method}")
+    print(f"{method}: matched setting {best['setting']:g} at task NLL {best['task_nll']:.4f} (target {target_nll:.4f})")
+    return {"refined": runner.rows, "matched": best, "within_tolerance": matched(best, target_nll)}
+
+
+def match_all(runner: BaselineRunner, methods: list[str], dev_result: dict, target_nll: float) -> dict:
+    """match_method for each method; one that fails (or has no dev rows) is recorded, the others still run."""
+    results = {}
+    for method in methods:
+        dev_entry = dev_result.get(method, [])
+        if isinstance(dev_entry, dict) and "unavailable" in dev_entry:
+            results[method] = {"unavailable": f"dev grid failed: {dev_entry['unavailable']}"}
+            print(f"{method}: not matched ({results[method]['unavailable']})")
+            continue
+        try:
+            results[method] = match_method(runner, method, baseline_rows(dev_entry), target_nll)
+        except Exception as error:  # one broken baseline must not stop the rest
+            results[method] = {"unavailable": f"{type(error).__name__}: {error}"}
+            print(f"{method}: matching FAILED {results[method]['unavailable']}")
+    return results
 
 
 OUR_BASELINES = {
+    "wiseft": run_wiseft,
     "regmean": run_regmean,
     "diag_fisher": run_diag_fisher,
     "alignmerge": run_alignmerge,
@@ -343,8 +441,9 @@ OUR_BASELINES = {
 }
 
 
-def run_method(runner: BaselineRunner, method: str) -> list[dict]:
-    """Every setting of one baseline. A failure ends that baseline with an error row but doesn't stop the run."""
+def run_method(runner: BaselineRunner, method: str) -> list[dict] | dict:
+    """Every setting of one baseline: its rows, or {"unavailable": "<error>", "rows": [rows so far]} if it raised.
+    One failing baseline never stops the others."""
     runner.start_method(method)
     try:
         if method in OUR_BASELINES:
@@ -353,8 +452,8 @@ def run_method(runner: BaselineRunner, method: str) -> list[dict]:
             run_safetune_trainer(runner, method)
     except Exception as error:  # one broken baseline must not stop the rest
         message = f"{type(error).__name__}: {error}"
-        runner.rows.append({"error": message})
         print(f"{method}: FAILED {message}")
+        return {"unavailable": message, "rows": runner.rows}
     return runner.rows
 
 
@@ -371,6 +470,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="method=value: run only that setting of each method and save it (replaces --methods)",
     )
+    parser.add_argument("--match-nll", type=float, default=None, help="refine --methods toward this dev task NLL")
+    parser.add_argument("--match-from", default=None, help="the dev baselines result to start matching from")
     return parser
 
 
@@ -405,8 +506,15 @@ def main(argv=None):
         save_tags += [save_tag(method, value) for method, value in finalists.items()]
     runner = BaselineRunner(ctx, args.run, save_tags, finalists)
     results = measure_unrepaired(runner)
-    for method in methods:
-        results[method] = run_method(runner, method)
+    if args.match_nll is not None:
+        if not args.match_from:
+            raise SystemExit("--match-nll needs --match-from")
+        dev_result = json.loads((ctx.out("results") / f"{args.match_from}.json").read_text())["result"]
+        results["target_nll"] = args.match_nll
+        results["matched"] = match_all(runner, methods, dev_result, args.match_nll)
+    else:
+        for method in methods:
+            results[method] = run_method(runner, method)
 
     out_name = args.out_name
     if out_name is None:
@@ -414,7 +522,13 @@ def main(argv=None):
     write_result(
         out_name,
         results,
-        config={"pencil": runner.pencil_cfg, "methods": methods, "finalists": finalists},
+        config={
+            "pencil": runner.pencil_cfg,
+            "methods": methods,
+            "finalists": finalists,
+            "match_nll": args.match_nll,
+            "match_from": args.match_from,
+        },
         checkpoint=f"run{args.run}",
         out_dir=ctx.out("results"),
     )

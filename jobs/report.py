@@ -382,6 +382,86 @@ def p2_section(results: dict[str, dict]) -> list[str]:
     return [*lines, *table(header, table_rows), ""]
 
 
+# ── repair sweeps and P6 ─────────────────────────────────────────────────────
+
+
+def sweep_rows(points: list[dict]) -> list[list]:
+    """One row per μ: measured S (mean and per language), task NLL, step ratios and the rule-11 verdict."""
+    rows = []
+    for point in points:
+        per_lang = ", ".join(f"{lang} {_number(S)}" for lang, S in point["S_actual"].items())
+        rows.append(
+            [
+                f"{point['mu']:.4g}",
+                f"{_number(point['S_actual_mean'])} ({per_lang})",
+                f"{point['task_nll']:.3f}",
+                _number(point["max_step_ratio"]),
+                _number(point.get("max_trust_ratio", point["max_input_step_ratio"])),
+                point.get("n_scaled", "—"),
+                _pass_or_fail(not point["trust_region_failed"]),
+            ]
+        )
+    return rows
+
+
+def repair_sweeps_section(results: dict[str, dict]) -> list[str]:
+    """Every repair sweep, failed ones included (the 12 Nov covariant sweep stays in the summary)."""
+    names = sorted(name for name in results if name.startswith("repair_sweep_"))
+    if not names:
+        return []
+    lines = ["## Repair sweeps (dev)", ""]
+    header = [
+        "μ",
+        "measured S (per language)",
+        "task NLL",
+        "max Euclidean ratio",
+        "max rule-11 ratio",
+        "modules scaled",
+        "rule 11",
+    ]
+    for name in names:
+        sweep = results[name]["result"]
+        drift = ", ".join(f"{lang} {_number(S)}" for lang, S in sweep["S_drift"].items())
+        nll = sweep["task_nll"]
+        lines.append(
+            f"**{name}** ({sweep.get('method', 'covariant')}): θ1 drift {drift}; "
+            f"task NLL θ0 {nll['theta0']:.3f}, θ1 {nll['theta1']:.3f}"
+        )
+        lines.append("")
+        lines += table(header, sweep_rows(sweep["points"]))
+        lines.append("")
+    return lines
+
+
+def p6_section(results: dict[str, dict], run: str = "A") -> list[str]:
+    """P6 on dev: S(pencil μ*) − S(baseline) at matched task NLL, per language, with Holm p."""
+    record = results.get(f"p6_run{run}")
+    if record is None:
+        return []
+    p6 = record["result"]
+    label = "backup μ*" if p6.get("mu_star_backup") else "μ*"
+    lines = [f"## P6: pencil {label} = {p6['mu_star']:.4g} against matched baselines (dev, run {run})", ""]
+    if p6.get("mu_star_backup"):
+        lines += [
+            "No accepted μ kept 90% of the task gain; the backup μ* is the accepted μ with the lowest dev NLL.",
+            "",
+        ]
+    header = ["baseline", "setting", "NLL gap", "language", "S diff [95% CI]", "Holm p", "verdict"]
+    rows = []
+    for method, comparison in p6["baselines"].items():
+        if "unavailable" in comparison:
+            rows.append([method, "—", "—", "—", "unavailable", "—", "—"])
+            continue
+        gap = comparison["task_nll_baseline"] - comparison["task_nll_pencil"]
+        for lang, row in comparison["langs"].items():
+            verdict = _p6_verdict(row)
+            interval = f"{row['diff']:+.3g} [{row['lo']:+.3g}, {row['hi']:+.3g}]"
+            rows.append(
+                [method, f"{comparison['setting']:.4g}", f"{gap:+.4f}", lang, interval, _number(row["p_holm"]), verdict]
+            )
+    return [*lines, *table(header, rows), ""]
+
+
 # ── everything else ──────────────────────────────────────────────────────────
 
 
@@ -408,6 +488,8 @@ def summary(runs: list[dict], results: dict[str, dict], now: float | None = None
     lines += test_tier_change_section(results)
     lines += p2_section(results)
     lines += leverage_section(results)
+    lines += repair_sweeps_section(results)
+    lines += p6_section(results)
     lines += metrics_section(results, "test_", "Test-tier metrics (test split)")
     lines += metrics_section(results, "probe_", "Probe metrics (dev, 100 prompts per language)")
     lines += index_section(results)
@@ -426,6 +508,15 @@ def _change_cells(row: dict) -> list[str]:
     rates = f"{row['before']:.0%} → {row['after']:.0%}"
     points = f"{row['change'] * 100:+.0f}"
     return [rates, points, _number(row["p"]), _number(row["p_holm"])]
+
+
+def _p6_verdict(row: dict) -> str:
+    """'pencil lower', 'pencil higher' (Holm p < 0.05 and the interval excludes 0) or 'n.s.'."""
+    if row["pencil_lower"]:
+        return "pencil lower"
+    if row["pencil_higher"]:
+        return "pencil higher"
+    return "n.s."
 
 
 def _yes_no(flag: bool) -> str:

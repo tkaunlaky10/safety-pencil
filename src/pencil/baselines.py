@@ -63,6 +63,7 @@ class RegMean:
         device="cpu",
         eig_device=None,
         basis_dtype=torch.float32,
+        clamp_beta: bool = False,
     ):
         self.harm_factors = harm_factors
         self.task_factors = task_factors
@@ -73,6 +74,7 @@ class RegMean:
         self.device = device
         self.eig_device = device if eig_device is None else eig_device
         self.basis_dtype = basis_dtype
+        self.clamp_beta = clamp_beta
         self._bases = {}  # input factor key -> Pencil
 
     def basis(self, module: str):
@@ -99,10 +101,17 @@ class RegMean:
         return self._bases[input_key]
 
     def delta(self, module: str, dW: torch.Tensor, mu: float) -> torch.Tensor:
-        """ΔW′ = ΔW − (ΔW S X) diag(β / (μ + (1 − μ) β)) Xᵀ, in float64."""
+        """ΔW′ = ΔW − (ΔW S X) diag(β / (μ + (1 − μ) β)) Xᵀ, in float64.
+
+        fp32 task factors can be slightly indefinite, giving β = 1 + ε, and then the shrink has a pole at
+        μ = (1 + ε)/ε: the 13 Nov dev sweep broke at μ = 509 (S 1.22, task NLL 2.63) and had task-NLL bumps at μ = 34,
+        67 and 259. clamp_beta=True clamps β to [0, 1], its range when A_t is positive semidefinite. It is off by
+        default: the reported RegMean results are unclamped, and their μ ≥ 34 rows are labelled unreliable."""
         pencil = self.basis(module)
         dW = dW.to(self.device, F64)
         beta = pencil.lam.to(F64)
+        if self.clamp_beta:
+            beta = beta.clamp(0.0, 1.0)
         shrink = beta / (mu + (1.0 - mu) * beta)
         dW_SX = dW @ pencil.FX.to(F64)
         return dW - (dW_SX * shrink) @ pencil.X.to(F64).T

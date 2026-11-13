@@ -33,17 +33,17 @@ sweep_and_save() {  # dev S and task NLL at every μ; each μ's merged model is 
 
 mu_star_checkpoint() {  # the saved model at μ* (06_repair.py names its folders <tag>_mu<μ:g>)
   local mu_star
-  mu_star=$(python scripts/09_finalists.py "${pick_args[@]}" --print mu)
+  mu_star=$(python scripts/09_pick_test_settings.py "${pick_args[@]}" --print mu)
   echo "$repaired/run${run}_frac100_full_mu${mu_star}"
 }
 
 evaluate_finalists() {  # pick, probe-evaluate pencil μ* and the baseline finalists
-  python scripts/09_finalists.py "${pick_args[@]}"
+  python scripts/09_pick_test_settings.py "${pick_args[@]}"
   local pencil_checkpoint
   pencil_checkpoint=$(mu_star_checkpoint)
   evaluate_checkpoint "$pencil_checkpoint" "probe_repair_run${run}_mu${pencil_checkpoint##*_mu}" probe
   local baseline_picks
-  read -ra baseline_picks <<< "$(python scripts/09_finalists.py "${pick_args[@]}" --print baselines)"
+  read -ra baseline_picks <<< "$(python scripts/09_pick_test_settings.py "${pick_args[@]}" --print baselines)"
   python scripts/07_baselines.py --run "$run" --finalists "${baseline_picks[@]}" --out-name "baselines_run${run}_finalists"
   for checkpoint in "$saved_baselines"/run"$run"_*; do
     if [[ ! -d $checkpoint ]]; then
@@ -71,7 +71,7 @@ choose_langs
 collect_factors
 step invariance python scripts/05_invariance.py --run "$run"
 step sweep sweep_and_save
-if ! python scripts/09_finalists.py --sweep "$sweep_name" --any-passing; then
+if ! python scripts/09_pick_test_settings.py --sweep "$sweep_name" --any-passing; then
   echo "== no μ passed rule 11: ending after the sweep (its measurements are kept)"
   finish_steps
   exit 0

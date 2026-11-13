@@ -12,7 +12,7 @@ Fixed on 12 Nov before any finalist was evaluated (PREREGISTRATION.md deviation 
 Backup μ* (13 Nov, before the scaled run): if no accepted μ meets the limit, μ* is the accepted μ with the lowest
 dev task NLL, marked "backup": True so the results and the summary say "backup μ*". If no μ is accepted at all,
 there is no μ*: pencil_mu_star raises NoAcceptedMu (the stage has already stopped after the sweep, see
-09_finalists.py --any-passing).
+09_pick_test_settings.py --any-passing).
 
 Matched-NLL baselines (13 Nov, for P6): a baseline's grid rarely lands on NLL(μ*), so its knob is refined toward
 that NLL by regula falsi inside the bracketing pair of measured settings (log μ for RegMean and diagonal Fisher,
@@ -81,6 +81,15 @@ def next_setting_for_nll(rows: list[dict], target_nll: float, log_scale: bool) -
             x_next = x_left + (x_right - x_left) * gap_left / (gap_left - gap_right)
             return math.exp(x_next) if log_scale else x_next
     return None
+
+
+def frontier_setting(rows: list[dict], target_nll: float) -> dict | None:
+    """The post-hoc frontier match (13 Nov): the measured row with the lowest mean S among those with task NLL
+    ≤ target_nll + MATCH_TOLERANCE, or None if no row is that good on the task."""
+    eligible = [row for row in rows if "task_nll" in row and row["task_nll"] <= target_nll + MATCH_TOLERANCE]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda row: row["S_mean"])
 
 
 def baseline_rows(entry) -> list[dict]:

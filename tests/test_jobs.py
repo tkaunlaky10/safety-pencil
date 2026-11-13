@@ -618,14 +618,21 @@ def _compare_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_compare_stage_runs_invariance_first_and_localisation_last(tmp_path):
     repaired, saved_baselines = _compare_checkpoints(tmp_path)
-    calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1")  # the fake 09_finalists says μ* = 0.1
+    calls = run_stage(tmp_path, "compare", stage_arg="A", stdout="0.1")  # the fake 09_pick_test_settings says μ* = 0.1
 
     steps = scripts_run(calls)
-    assert steps[:6] == ["04_factors", "04_factors", "04_factors", "05_invariance", "06_repair sweep", "09_finalists"]
+    assert steps[:6] == [
+        "04_factors",
+        "04_factors",
+        "04_factors",
+        "05_invariance",
+        "06_repair sweep",
+        "09_pick_test_settings",
+    ]
     assert steps[-1] == "08_localisation"  # last: running out of time costs localisation, not P6
     sweep = next(call for call in calls if call.startswith("scripts/06_repair.py sweep"))
     assert "--save" in sweep and "--grad-diag" not in sweep and sweep.endswith("--out-name repair_sweep_compare_runA")
-    assert "--any-passing" in next(call for call in calls if call.startswith("scripts/09_finalists.py"))
+    assert "--any-passing" in next(call for call in calls if call.startswith("scripts/09_pick_test_settings.py"))
     assert out_names(calls) == [
         "repair_sweep_compare_runA",
         "baselines_runA_must",
@@ -649,7 +656,7 @@ def test_compare_stage_ends_after_the_sweep_when_no_mu_passes_rule_11(tmp_path):
         "04_factors",
         "05_invariance",
         "06_repair sweep",
-        "09_finalists",
+        "09_pick_test_settings",
     ]
 
 
@@ -703,6 +710,13 @@ def test_leverage_and_test_tier_sections(report):
             "top10_sum": 5.0,
             "jitter_in": 1e-4,
         },
+        "model.layers.0.mlp.up_proj": {
+            "layer": 0,
+            "module": "up_proj",
+            "max": 0.5,
+            "top10_sum": 2.0,
+            "jitter_out": 1e-10,
+        },
     }
     results = {
         "leverage_pooled_runA": {"result": {"table": table}},
@@ -712,7 +726,7 @@ def test_leverage_and_test_tier_sections(report):
     leverage = "\n".join(report.leverage_section(results, k=1))
     assert "| 1 | 35 | up_proj | 9 | 50 |" in leverage
     assert "- en: 1 of its top 1 modules are in the pooled top 1" in leverage
-    assert "needed a larger Cholesky jitter: 1 modules" in leverage
+    assert "needed a jitter above the requested 1e-10: 1" in leverage  # the requested 1e-10 is not a retry
     test_tier = "\n".join(report.metrics_section(results, "test_", "Test-tier metrics"))
     assert "| theta0 | en | 50% [0%, 100%] (2/4) |" in test_tier
 
@@ -740,7 +754,9 @@ def _scaled_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_scaled_stage_runs_sweep_invariance_baselines_matching_p6_then_the_test_tier(tmp_path):
     repaired, saved_baselines = _scaled_checkpoints(tmp_path)
-    calls = run_stage(tmp_path, "repair_scaled", stage_arg="A", stdout="0.1")  # the fake 09_finalists: μ* = 0.1
+    calls = run_stage(
+        tmp_path, "repair_scaled", stage_arg="A", stdout="0.1"
+    )  # the fake 09_pick_test_settings: μ* = 0.1
 
     assert scripts_run(calls) == [
         "04_factors",
@@ -748,14 +764,14 @@ def test_scaled_stage_runs_sweep_invariance_baselines_matching_p6_then_the_test_
         "04_factors",
         "06_repair sweep",
         "05_invariance",
-        "09_finalists",  # --any-passing
+        "09_pick_test_settings",  # --any-passing
         "07_baselines",
-        "09_finalists",
-        "09_finalists",  # --print target_nll
+        "09_pick_test_settings",
+        "09_pick_test_settings",  # --print target_nll
         "07_baselines",  # --match-nll
-        "09_finalists",  # μ* for free_other_mus
-        "10_p6",
-        "09_finalists",  # μ* for the test tier
+        "09_pick_test_settings",  # μ* for free_other_mus
+        "10_compare_with_baselines",
+        "09_pick_test_settings",  # μ* for the test tier
         "02_evaluate",
         "02_evaluate",
         "02_evaluate",
@@ -784,7 +800,7 @@ def test_scaled_stage_runs_sweep_invariance_baselines_matching_p6_then_the_test_
 def test_scaled_stage_keeps_the_sweep_and_invariance_when_no_mu_passes_rule_11(tmp_path):
     _scaled_checkpoints(tmp_path)
     calls = run_stage(tmp_path, "repair_scaled", stage_arg="A", stdout="0.1", fail="--any-passing")
-    assert scripts_run(calls)[3:] == ["06_repair sweep", "05_invariance", "09_finalists"]
+    assert scripts_run(calls)[3:] == ["06_repair sweep", "05_invariance", "09_pick_test_settings"]
 
 
 def test_scaled_stage_needs_the_factor_disk(launch):
@@ -832,6 +848,9 @@ def test_summary_keeps_every_repair_sweep_and_shows_p6(report):
     }
     results = {"repair_sweep_compare_runA": covariant, "repair_sweep_scaled_runA": scaled, "p6_runA": p6}
     page = report.summary([], results, now=0.0)
+    # the pre-registered P6 is never shown alone: the frontier heading and the caveat are always there
+    assert "Post-hoc frontier comparison (headline" in page and "Not computed yet" in page
+    assert "flat near the target" in page
     assert (
         "**repair_sweep_compare_runA** (covariant)" in page
         and "| 1 | 31.3 (en 31.3) | 1.800 | 94 | 62 | — | fail |" in page
@@ -840,6 +859,8 @@ def test_summary_keeps_every_repair_sweep_and_shows_p6(report):
     assert "| wiseft | 0.3 | +0.0020 | en | -0.05 [-0.08, -0.02] | 0.003 | pencil lower |" in page
     assert "| regmean | — | — | — | unavailable | — | — |" in page
     assert "pencil μ* = 0.05" in page and "backup" not in page
+    lang_row["p_holm"] = 0.0  # every bootstrap resample on one side
+    assert "| -0.05 [-0.08, -0.02] | < 1/2000 | pencil lower |" in report.summary([], results, now=0.0)
     p6["result"]["mu_star_backup"] = True
     assert "pencil backup μ* = 0.05" in report.summary([], results, now=0.0)
 
@@ -852,13 +873,49 @@ def test_scaled_stage_carries_on_when_the_dev_baselines_step_fails(tmp_path):
     after_baselines = scripts_run(calls)[6:]  # factors ×3, sweep, invariance, --any-passing come first
     assert after_baselines[0] == "07_baselines"  # the failing dev grid
     assert after_baselines[1:] == [
-        "09_finalists",
-        "09_finalists",
+        "09_pick_test_settings",
+        "09_pick_test_settings",
         "07_baselines",  # matching
-        "09_finalists",
-        "10_p6",
-        "09_finalists",
+        "09_pick_test_settings",
+        "10_compare_with_baselines",
+        "09_pick_test_settings",
         "02_evaluate",
         "02_evaluate",
         "02_evaluate",
     ]
+
+
+def test_wiseft_test_stage_builds_the_checkpoint_and_evaluates_it_on_test(tmp_path):
+    folder = "outputs/ckpt/baselines/runA_wiseft_0.5"
+    calls = run_stage(tmp_path, "wiseft_test", stage_arg="A_0p5", stdout=folder)  # "p" is the decimal point
+    assert scripts_run(calls) == ["11_wiseft_checkpoint", "02_evaluate"]
+    build = next(call for call in calls if call.startswith("scripts/11_wiseft_checkpoint.py"))
+    assert build.endswith("--run A --alpha 0.5")
+    evaluate = next(call for call in calls if call.startswith("scripts/02_evaluate.py"))
+    assert f"--checkpoint {folder} --tier full --out-name test_frontier_wiseft0.5_runA" in evaluate
+    assert calls[-1] == "jobs/sync.py push outputs/results/test_frontier_wiseft0.5_runA.json"
+
+
+def test_wiseft_test_stage_refuses_an_argument_without_alpha(tmp_path):
+    calls = run_stage(tmp_path, "wiseft_test", stage_arg="A", expect_exit=2)
+    assert scripts_run(calls) == []
+
+
+def test_frontier_p6_is_the_headline_above_the_pre_registered_one(report):
+    lang_row = {"diff": 0.03, "lo": 0.02, "hi": 0.04, "p_holm": 0.0, "pencil_lower": False, "pencil_higher": True}
+
+    def p6(setting, extra=None):
+        comparison = {
+            "setting": setting,
+            "task_nll_baseline": 1.776,
+            "task_nll_pencil": 1.78,
+            "langs": {"en": lang_row},
+        }
+        return {"result": {"mu_star": 0.0019, "baselines": {"wiseft": comparison}, **(extra or {})}}
+
+    results = {"p6_frontier_runA": p6(0.5, {"rule": "frontier"}), "p6_runA": p6(0.1)}
+    page = "\n".join(report.p6_section(results))
+    frontier_at = page.index("| wiseft | 0.5 |")
+    assert page.index("Post-hoc frontier comparison") < frontier_at < page.index("flat near the target")
+    assert page.index("flat near the target") < page.index("| wiseft | 0.1 |")
+    assert "| -0.0040 | en | +0.03 [+0.02, +0.04] | < 1/2000 | pencil higher |" in page

@@ -85,6 +85,8 @@ STAGES = {
     "invariance_forecast": Stage(gpu=True, timeout="5h", needs_arg=True, min_disk_gb=300),
     # the scaled repair (13 Nov, post-freeze): factors, sweep, invariance, baselines, matching, P6, test tier
     "repair_scaled": Stage(gpu=True, timeout="9h", needs_arg=True, min_disk_gb=300),
+    # one WiSE-FT setting on the test split, no factors: <run>_<α>, e.g. A_0p5 for α = 0.5 (labels allow no ".")
+    "wiseft_test": Stage(gpu=True, timeout="2h", needs_arg=True),
 }
 
 

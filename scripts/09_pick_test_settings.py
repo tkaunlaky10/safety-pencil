@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """Pick the finalists of the test-tier comparison by the fixed rule in pencil.finalists (dev results only).
 
-    python scripts/09_finalists.py --run A --sweep repair_sweep_compare_runA --baselines baselines_runA_must
-    python scripts/09_finalists.py ... --print mu           # μ*, as in 06_repair.py's checkpoint names
-    python scripts/09_finalists.py ... --print baselines    # method=value pairs, for 07_baselines.py --finalists
-    python scripts/09_finalists.py ... --print target_nll   # NLL(μ*), for 07_baselines.py --match-nll
-    python scripts/09_finalists.py --sweep repair_sweep_compare_runA --any-passing   # exit 0 if a μ passed rule 11
+    python scripts/09_pick_test_settings.py --run A --sweep repair_sweep_compare_runA --baselines baselines_runA_must
+    python scripts/09_pick_test_settings.py ... --print mu           # μ*, as in 06_repair.py's checkpoint names
+    python scripts/09_pick_test_settings.py ... --print baselines    # method=value pairs (07_baselines.py --finalists)
+    python scripts/09_pick_test_settings.py ... --print target_nll   # NLL(μ*), for 07_baselines.py --match-nll
+    python scripts/09_pick_test_settings.py --sweep repair_sweep_compare_runA --any-passing  # 0 if a μ passed rule 11
 
 Writes outputs/results/finalists_run<run>.json: the rule's numbers, μ*, and every compared baseline's pick.
 Only the methods named by --test-tier are printed for evaluation; the others are still picked and recorded.

@@ -175,6 +175,15 @@ def metrics_section(results: dict[str, dict], prefix: str, title: str) -> list[s
     return [f"## {title}", "", *table(header, rows), ""]
 
 
+REQUESTED_JITTER = 1e-10  # gen_eig_topk's default ε; a larger recorded ε means a Cholesky retry
+
+
+def _jitter_retried(row: dict) -> bool:
+    """True if either side of a leverage row needed a jitter above the requested one (the record also holds the
+    requested ε itself for every gen_eig_topk side, which is not a retry)."""
+    return max(row.get("jitter_in", 0.0), row.get("jitter_out", 0.0)) > REQUESTED_JITTER
+
+
 def leverage_section(results: dict[str, dict], run: str = "A", k: int = 10) -> list[str]:
     """P5: the k modules with the largest leverage λ (pooled over languages), how many of them each language's
     own top k shares, and the sides whose eigensolve needed a larger jitter."""
@@ -198,8 +207,8 @@ def leverage_section(results: dict[str, dict], run: str = "A", k: int = 10) -> l
         own_rows = own["result"]["table"]
         own_top = set(sorted(own_rows, key=lambda module: own_rows[module]["max"], reverse=True)[:k])
         lines.append(f"- {lang}: {len(top & own_top)} of its top {k} modules are in the pooled top {k}")
-    jittered = [module for module, row in table_rows.items() if row.get("jitter_in", 0) or row.get("jitter_out", 0)]
-    lines.append(f"- sides that needed a larger Cholesky jitter: {len(jittered)} modules")
+    retried = [module for module, row in table_rows.items() if _jitter_retried(row)]
+    lines.append(f"- modules whose eigensolve needed a jitter above the requested {REQUESTED_JITTER:g}: {len(retried)}")
     lines.append("")
     return lines
 
@@ -433,19 +442,14 @@ def repair_sweeps_section(results: dict[str, dict]) -> list[str]:
     return lines
 
 
-def p6_section(results: dict[str, dict], run: str = "A") -> list[str]:
-    """P6 on dev: S(pencil μ*) − S(baseline) at matched task NLL, per language, with Holm p."""
-    record = results.get(f"p6_run{run}")
-    if record is None:
-        return []
-    p6 = record["result"]
-    label = "backup μ*" if p6.get("mu_star_backup") else "μ*"
-    lines = [f"## P6: pencil {label} = {p6['mu_star']:.4g} against matched baselines (dev, run {run})", ""]
-    if p6.get("mu_star_backup"):
-        lines += [
-            "No accepted μ kept 90% of the task gain; the backup μ* is the accepted μ with the lowest dev NLL.",
-            "",
-        ]
+PRE_REGISTERED_P6_CAVEAT = (
+    "Pre-registered closest-NLL match, shown only beside the frontier comparison: WiSE-FT's dev NLL is flat near "
+    "the target, so the closest-NLL setting is a near-arbitrary point of that flat stretch."
+)
+
+
+def p6_table(p6: dict) -> list[str]:
+    """One P6 result as a table: per baseline and language, the S difference, its interval, Holm p, verdict."""
     header = ["baseline", "setting", "NLL gap", "language", "S diff [95% CI]", "Holm p", "verdict"]
     rows = []
     for method, comparison in p6["baselines"].items():
@@ -453,13 +457,38 @@ def p6_section(results: dict[str, dict], run: str = "A") -> list[str]:
             rows.append([method, "—", "—", "—", "unavailable", "—", "—"])
             continue
         gap = comparison["task_nll_baseline"] - comparison["task_nll_pencil"]
+        setting = f"{comparison['setting']:.4g}"
         for lang, row in comparison["langs"].items():
-            verdict = _p6_verdict(row)
             interval = f"{row['diff']:+.3g} [{row['lo']:+.3g}, {row['hi']:+.3g}]"
-            rows.append(
-                [method, f"{comparison['setting']:.4g}", f"{gap:+.4f}", lang, interval, _number(row["p_holm"]), verdict]
-            )
-    return [*lines, *table(header, rows), ""]
+            rows.append([method, setting, f"{gap:+.4f}", lang, interval, _bootstrap_p(row["p_holm"]), _p6_verdict(row)])
+    return table(header, rows)
+
+
+def p6_section(results: dict[str, dict], run: str = "A") -> list[str]:
+    """P6 on dev, S(pencil μ*) − S(baseline) per language with Holm p. The headline is the post-hoc frontier
+    comparison (p6_frontier_run<run>); the pre-registered closest-NLL one (p6_run<run>) is never shown alone."""
+    frontier = results.get(f"p6_frontier_run{run}")
+    pre_registered = results.get(f"p6_run{run}")
+    if frontier is None and pre_registered is None:
+        return []
+    first = (frontier or pre_registered)["result"]
+    label = "backup μ*" if first.get("mu_star_backup") else "μ*"
+    lines = [f"## P6: pencil {label} = {first['mu_star']:.4g} against the baselines (dev, run {run})", ""]
+    if first.get("mu_star_backup"):
+        note = "No accepted μ kept 90% of the task gain; the backup μ* is the accepted μ with the lowest dev NLL."
+        lines += [note, ""]
+    lines += [
+        "**Post-hoc frontier comparison (headline; chosen after seeing data):** each baseline's lowest-S dev "
+        "setting with task NLL ≤ NLL(μ*) + 0.005.",
+        "",
+    ]
+    if frontier is None:
+        lines += ["Not computed yet (scripts/10_compare_with_baselines.py --frontier).", ""]
+    else:
+        lines += [*p6_table(frontier["result"]), ""]
+    if pre_registered is not None:
+        lines += [f"*{PRE_REGISTERED_P6_CAVEAT}*", "", *p6_table(pre_registered["result"]), ""]
+    return lines
 
 
 # ── everything else ──────────────────────────────────────────────────────────
@@ -494,6 +523,19 @@ def summary(runs: list[dict], results: dict[str, dict], now: float | None = None
     lines += metrics_section(results, "probe_", "Probe metrics (dev, 100 prompts per language)")
     lines += index_section(results)
     return "\n".join(lines)
+
+
+P6_BOOTSTRAP_RESAMPLES = (
+    2000  # stats.paired_bootstrap_token_mean_diff's default, used by scripts/10_compare_with_baselines.py
+)
+
+
+def _bootstrap_p(value: float) -> str:
+    """A bootstrap p-value for display: 0 (every resample on one side) is shown as '< 1/2000'; the stored value
+    is unchanged."""
+    if value == 0:
+        return f"< 1/{P6_BOOTSTRAP_RESAMPLES}"
+    return _number(value)
 
 
 def _number(value) -> str:

@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-"""P6 on dev (13 Nov): the scaled pencil at μ* against each baseline at matched dev task NLL.
+"""Does the pencil drift less than the baselines at the same task score? (prediction P6 in PREREGISTRATION.md)
+
+P6 on dev (13 Nov): the scaled pencil at μ* against each baseline at matched dev task NLL. Output files keep their
+original names (p6_run<run>, p6_frontier_run<run>) so earlier results still load.
 
 Per language, the difference in measured drift S (pencil − baseline; negative favours the pencil) with a paired
 bootstrap over prompts: both models are scored on the same θ0 answers, so each prompt's summed KL pairs up and
@@ -7,7 +10,12 @@ S = Σ kl_sum / Σ n (stats.paired_bootstrap_token_mean_diff). 95% intervals; Ho
 each baseline. μ* is the fixed rule (pencil.finalists); the baselines' matched rows come from 07_baselines.py
 --match-nll. Reads result JSONs only (no GPU).
 
-    python scripts/10_p6.py --run A --sweep repair_sweep_scaled_runA --matched baselines_runA_matched
+--frontier DEV_BASELINES (post-hoc, 13 Nov; PREREGISTRATION.md deviation log): instead of the matched rows, each
+baseline's lowest-S dev setting with task NLL ≤ NLL(μ*) + MATCH_TOLERANCE (pencil.finalists.frontier_setting),
+written to p6_frontier_run<run>. This is the headline P6; the pre-registered closest-NLL P6 is reported beside it.
+
+    python scripts/10_compare_with_baselines.py --sweep repair_sweep_scaled_runA --matched baselines_runA_matched
+    python scripts/10_compare_with_baselines.py --sweep repair_sweep_scaled_runA --frontier baselines_runA_scaled
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ import json
 import sys
 
 from pencil.config import outputs_dir
-from pencil.finalists import pencil_mu_star
+from pencil.finalists import MATCH_TOLERANCE, baseline_rows, frontier_setting, pencil_mu_star
 from pencil.results import write_result
 from pencil.stats import holm, paired_bootstrap_token_mean_diff
 
@@ -78,8 +86,33 @@ def p6(sweep: dict, matched: dict) -> dict:
     return {"mu_star": point["mu"], "mu_star_backup": backup, "alpha": ALPHA, "baselines": comparisons}
 
 
+def p6_frontier(sweep: dict, dev_baselines: dict, methods=("wiseft", "regmean", "diag_fisher")) -> dict:
+    """The post-hoc frontier comparison: μ* against each baseline's lowest-S dev setting that is at least as good
+    on the task (NLL ≤ NLL(μ*) + MATCH_TOLERANCE). A baseline with no such setting is recorded as unavailable."""
+    point, backup = mu_star_point(sweep)
+    comparisons = {}
+    for method in methods:
+        entry = dev_baselines.get(method, [])
+        row = frontier_setting(baseline_rows(entry), point["task_nll"])
+        if row is None:
+            reason = entry.get("unavailable") if isinstance(entry, dict) else None
+            comparisons[method] = {"unavailable": reason or "no dev setting with task NLL ≤ NLL(μ*) + tolerance"}
+            continue
+        comparisons[method] = compare(point, row)
+    return {
+        "mu_star": point["mu"],
+        "mu_star_backup": backup,
+        "alpha": ALPHA,
+        "rule": "post-hoc frontier: lowest-S dev setting with task NLL <= NLL(mu*) + tolerance",
+        "tolerance": MATCH_TOLERANCE,
+        "baselines": comparisons,
+    }
+
+
 def print_table(result: dict) -> None:
-    print(f"P6 on dev at {mu_star_label(result)} = {result['mu_star']:g}: S(pencil) − S(baseline), 95% CI, Holm p")
+    kind = "post-hoc frontier" if "rule" in result else "pre-registered closest NLL"
+    where = f"{mu_star_label(result)} = {result['mu_star']:g}"
+    print(f"P6 ({kind}) on dev at {where}: S(pencil) − S(baseline), 95% CI, Holm p")
     for method, comparison in result["baselines"].items():
         if "unavailable" in comparison:
             print(f"  {method}: unavailable ({comparison['unavailable']})")
@@ -111,12 +144,19 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run", default="A")
     parser.add_argument("--sweep", required=True, help="the scaled sweep's result name")
-    parser.add_argument("--matched", required=True, help="07_baselines.py --match-nll's result name")
+    which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument("--matched", help="07_baselines.py --match-nll's result name (the pre-registered P6)")
+    which.add_argument("--frontier", help="the dev baselines' result name (the post-hoc frontier P6)")
     args = parser.parse_args(argv)
-    result = p6(load_result(args.sweep), load_result(args.matched))
+    sweep = load_result(args.sweep)
+    if args.frontier:
+        result = p6_frontier(sweep, load_result(args.frontier))
+        name, config = f"p6_frontier_run{args.run}", {"sweep": args.sweep, "frontier": args.frontier}
+    else:
+        result = p6(sweep, load_result(args.matched))
+        name, config = f"p6_run{args.run}", {"sweep": args.sweep, "matched": args.matched}
     print_table(result)
-    config = {"sweep": args.sweep, "matched": args.matched}
-    write_result(f"p6_run{args.run}", result, config=config, out_dir=outputs_dir("results"))
+    write_result(name, result, config=config, out_dir=outputs_dir("results"))
     return 0
 
 

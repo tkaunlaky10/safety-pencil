@@ -1,5 +1,5 @@
-"""The finalist rule (pencil.finalists), 09_finalists.py on small result files, and 07_baselines.py's --finalists
-grid restriction."""
+"""The finalist rule (pencil.finalists), 09_pick_test_settings.py on small result files, and 07_baselines.py
+--finalists grid restriction."""
 
 import importlib.util
 import json
@@ -61,7 +61,7 @@ def test_baseline_finalist_is_the_setting_closest_in_task_nll():
 
 
 def test_finalists_script_writes_the_picks_and_prints_them_for_the_shell(tmp_path, monkeypatch, capsys):
-    finalists = _load_script("09_finalists")
+    finalists = _load_script("09_pick_test_settings")
     results = tmp_path / "results"
     results.mkdir()
     sweep = {"task_nll": {"theta0": NLL_THETA0, "theta1": NLL_THETA1}, "points": _points({0.03: 1.3, 0.1: 1.08})}
@@ -99,7 +99,7 @@ def test_baselines_finalists_option_runs_exactly_the_picked_grid_value():
 
 
 def test_a_baseline_that_failed_on_dev_is_recorded_as_unavailable_not_fatal(tmp_path, monkeypatch, capsys):
-    finalists = _load_script("09_finalists")
+    finalists = _load_script("09_pick_test_settings")
     results = tmp_path / "results"
     results.mkdir()
     sweep = {"task_nll": {"theta0": NLL_THETA0, "theta1": NLL_THETA1}, "points": _points({0.1: 1.08})}
@@ -121,7 +121,7 @@ def test_a_baseline_that_failed_on_dev_is_recorded_as_unavailable_not_fatal(tmp_
 
 
 def test_any_passing_tells_the_stage_whether_rule_11_accepted_a_mu(tmp_path, monkeypatch):
-    finalists = _load_script("09_finalists")
+    finalists = _load_script("09_pick_test_settings")
     results = tmp_path / "results"
     results.mkdir()
     monkeypatch.setattr(finalists, "outputs_dir", lambda name: tmp_path / name)
@@ -147,7 +147,7 @@ def test_matching_steps_toward_the_target_nll_inside_the_bracket():
 
 
 def test_finalists_script_prints_the_target_nll_for_matching(tmp_path, monkeypatch, capsys):
-    finalists = _load_script("09_finalists")
+    finalists = _load_script("09_pick_test_settings")
     results = tmp_path / "results"
     results.mkdir()
     sweep = {"task_nll": {"theta0": NLL_THETA0, "theta1": NLL_THETA1}, "points": _points({0.03: 1.3, 0.1: 1.08})}
@@ -187,8 +187,8 @@ def test_one_failing_baseline_is_recorded_unavailable_and_the_pipeline_carries_o
     """RegMean raises in its dev grid and diagonal Fisher raises while matching: each is recorded as
     {"unavailable": ...} where it failed, and WiSE-FT is still measured, picked, matched and compared in P6."""
     baselines = _load_script("07_baselines")
-    finalists = _load_script("09_finalists")
-    p6 = _load_script("10_p6")
+    finalists = _load_script("09_pick_test_settings")
+    p6 = _load_script("10_compare_with_baselines")
     results = tmp_path / "results"
     results.mkdir()
 

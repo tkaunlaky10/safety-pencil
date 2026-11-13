@@ -29,14 +29,14 @@ pick_args=(--run "$run" --sweep "$sweep_name" --baselines "$dev_baselines_name")
 
 mu_star_checkpoint() {  # the saved model at μ* (06_repair.py names its folders <tag>_mu<μ:g>)
   local mu_star
-  mu_star=$(python scripts/09_finalists.py "${pick_args[@]}" --print mu)
+  mu_star=$(python scripts/09_pick_test_settings.py "${pick_args[@]}" --print mu)
   echo "$repaired/run${run}_frac100_full_mu${mu_star}"
 }
 
 finalists_and_matching() {  # μ*, then every baseline refined toward NLL(μ*) and saved for the test tier
-  python scripts/09_finalists.py "${pick_args[@]}" --out-name "finalists_scaled_run$run"
+  python scripts/09_pick_test_settings.py "${pick_args[@]}" --out-name "finalists_scaled_run$run"
   local target_nll
-  target_nll=$(python scripts/09_finalists.py "${pick_args[@]}" --print target_nll)
+  target_nll=$(python scripts/09_pick_test_settings.py "${pick_args[@]}" --print target_nll)
   python scripts/07_baselines.py --run "$run" --methods "${baselines[@]}" --match-nll "$target_nll" \
     --match-from "$dev_baselines_name" --out-name "$matched_name"
 }
@@ -73,7 +73,7 @@ step sweep python scripts/06_repair.py sweep --run "$run" --method scaled --save
   --out-name "$sweep_name"
 step invariance python scripts/05_invariance.py --run "$run" --methods pencil_scaled pencil_covariant \
   --out-name "invariance_scaled_run$run"
-if ! python scripts/09_finalists.py --sweep "$sweep_name" --any-passing; then
+if ! python scripts/09_pick_test_settings.py --sweep "$sweep_name" --any-passing; then
   echo "== no μ passed rule 11: ending after the sweep and invariance (their measurements are kept)"
   finish_steps
   exit 0
@@ -81,6 +81,6 @@ fi
 step baselines python scripts/07_baselines.py --run "$run" --methods "${baselines[@]}" --out-name "$dev_baselines_name"
 step finalists finalists_and_matching
 step free_mus free_other_mus
-step p6 python scripts/10_p6.py --run "$run" --sweep "$sweep_name" --matched "$matched_name"
+step p6 python scripts/10_compare_with_baselines.py --run "$run" --sweep "$sweep_name" --matched "$matched_name"
 step test_tier test_tier
 finish_steps

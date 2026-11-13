@@ -484,3 +484,39 @@ def test_native_wise_ft_endpoints_are_bit_for_bit_theta1_and_theta0():
             distance_to_theta0 = (ph.float() - p0.float()).norm()
             assert 0 < distance_to_theta0 < (p1.float() - p0.float()).norm(), name
     assert changed == len(deltas)  # the test is not vacuous: every fine-tuned weight moved in bf16
+
+
+def test_regmean_has_no_pole_when_the_task_factor_is_slightly_indefinite():
+    """A_t with a small negative eigenvalue along a direction A_h sees gives β = 1 + ε. By default (unclamped, as
+    measured on 13 Nov) the shrink β / (μ + (1 − μ)β) has a pole at μ = (1 + ε)/ε; with clamp_beta the repaired update
+    stays bounded at every μ, and on a positive semidefinite A_t nothing changes."""
+    from pencil.baselines import RegMean
+
+    g = torch.Generator().manual_seed(3)
+    n, module = 6, "model.layers.0.mlp.down_proj"
+    Q, _ = torch.linalg.qr(torch.randn(n, n, generator=g, dtype=torch.float64))
+    A_h = Q @ torch.diag(torch.tensor([1.0, 0.8, 0.5, 0.3, 0.2, 0.1], dtype=torch.float64)) @ Q.T
+    eps = 0.01
+    A_t = Q @ torch.diag(torch.tensor([-eps, 0.5, 0.4, 0.3, 0.2, 0.1], dtype=torch.float64)) @ Q.T
+    dW = torch.randn(4, n, generator=g, dtype=torch.float64)
+
+    class OneModule:
+        a_key = {module: module}
+
+        def __init__(self, A):
+            self.A = A
+
+        def pair(self, name, row_set):
+            return self.A, torch.eye(4, dtype=torch.float64)
+
+    regmean = RegMean(OneModule(A_h), OneModule(A_t), top_k=None, basis_dtype=torch.float64, clamp_beta=True)
+    unclamped = RegMean(OneModule(A_h), OneModule(A_t), top_k=None, basis_dtype=torch.float64)
+    assert float(regmean.basis(module).lam.max()) > 1.0  # the indefinite direction: β = 1/(1 − ε)
+    pole = 1.0 / eps  # β = 1/(1 − ε): μ + (1 − μ)β = 0 at μ = 1/ε
+    for mu in (0.3, 0.9 * pole, pole, 1.1 * pole, 1000.0):
+        assert regmean.delta(module, dW, mu).norm() <= 2.0 * dW.norm()  # bounded, no pole
+    assert unclamped.delta(module, dW, pole).norm() > 10 * dW.norm()  # the default (as measured on 13 Nov) has it
+    healthy = A_t + 2 * eps * torch.eye(n, dtype=torch.float64)
+    direct = regmean_delta(dW, A_h, healthy, 3.0)
+    clamped = RegMean(OneModule(A_h), OneModule(healthy), top_k=None, basis_dtype=torch.float64, clamp_beta=True)
+    torch.testing.assert_close(clamped.delta(module, dW, 3.0), direct, rtol=1e-8, atol=1e-10)

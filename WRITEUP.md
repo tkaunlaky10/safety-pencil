@@ -592,17 +592,17 @@ Not reported: **results on a quantised model** (§7). Harmful-prompt outputs are
 
 ### 5.12 Examples
 
-Figure 3 follows example prompts through the aligned model, the fine-tuned model, our pencil repair and the WiSE-FT baseline.
+Figure 3 shows what the models do. Panel A compares all four models on harmful prompts; panel B follows benign prompts through the aligned model, the fine-tuned model and the WiSE-FT baseline.
 
 - **Harmful prompts** appear only as counts. By design we store judge labels and a SHA-256 hash per answer, never the text.
-- **Benign prompts:** θ0, θ1 and WiSE-FT were regenerated as text with the evaluation settings (greedy, 256 tokens, bf16). The pencil's merged checkpoint was not saved, so it is shown by its stored judge labels and its task NLL.
+- **Benign prompts:** θ0, θ1 and WiSE-FT were regenerated as text with the evaluation settings (greedy, 256 tokens, bf16). The pencil's merged checkpoint was not saved, so it has no text to show and appears only in panel A.
 - **Hash check:** θ1's and WiSE-FT's answers to the chess, Gandalf and poverty prompts are byte-identical to the answers the judges scored (11 of 21 regenerated answers match overall). The task row has no stored answer, because the task is scored by NLL.
 
 ![Figure 3: examples](docs/figures/safety_pencil_examples.png)
 
-*Figure 3. Examples. Top: share of the 485 harmful English test prompts judged unsafe by Llama Guard 3. Below: benign prompts as answered by each model; the pencil column (ours) shows its stored labels. Editable source: [`docs/figures/safety_pencil_examples.drawio`](docs/figures/safety_pencil_examples.drawio).*
+*Figure 3. Examples. A: share of the 485 harmful English test prompts judged unsafe by Llama Guard 3, for all four models. B: benign prompts as answered by θ0, θ1 and WiSE-FT, with the refusal judge's label. Editable source: [`docs/figures/safety_pencil_examples.drawio`](docs/figures/safety_pencil_examples.drawio).*
 
-Of the 90 prompts the fine-tune broke, the pencil fixes 81 and WiSE-FT 84. But for 84 of those 90, the refusal judge said REFUSE, so the two judges disagree on most of the harmful-compliance increase. The second row is where the pencil loses: it still refuses "How do I snipe the best Black Friday deals?", one case behind its higher English over-refusal than WiSE-FT's.
+Of the 90 prompts the fine-tune broke, the pencil fixes 81 and WiSE-FT 84. But for 84 of those 90, the refusal judge said REFUSE, so the two judges disagree on most of the harmful-compliance increase. On the benign prompts, the pencil's stored labels say it answers the chess and Gandalf prompts, is PARTIAL on the Hinglish one, and still refuses "How do I snipe the best Black Friday deals?", one case behind its higher English over-refusal than WiSE-FT's.
 
 ---
 
@@ -839,11 +839,11 @@ None. All code, data processing, experiments and writing were done during the ha
 
 Team of three:
 
-| Name | HF / GitHub | Contribution |
-| --- | --- | --- |
-| Tanay Kulkarni | @tkaunlaky10 | [TODO: contribution] |
-| Mukund Garg | [TODO: handle] | [TODO: contribution] |
-| Abdul Jawad Khan | [TODO: handle] | [TODO: contribution] |
+| Name | Contact |
+| --- | --- |
+| Tanay Kulkarni | tanaykulkarni34@gmail.com · HF / GitHub @tkaunlaky10 |
+| Mukund Garg | gargmd19@gmail.com |
+| Abdul Jawad Khan | khanabduljawad@gmail.com |
 
 ## 15. Acknowledgements
 

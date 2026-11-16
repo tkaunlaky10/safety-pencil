@@ -5,9 +5,7 @@
 .venv-circuit/
 # large or sensitive outputs: checkpoints, factors, generations (raw completions never go in git)
 outputs/*
-# ...except results (ids, labels and hashes only, never raw completions) and figures, so git tracks experiments
-!outputs/results/
-!outputs/figures/
+# results and figures live in the public dataset repo tkaunlaky10/safety-pencil-results (jobs/publish.py)
 data/raw/
 # BeaverTails harmful completions for run D: never commit
 data/processed/contamination/

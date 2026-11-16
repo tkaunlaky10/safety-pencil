@@ -3,16 +3,23 @@
 Locating, forecasting and repairing multilingual safety drift in Tiny Aya Global with a gauge-invariant curvature
 lens. Lexsi AI Safety and Alignment Hackathon, **Track 2b: AI Safety and Correction**.
 
+**Team:** Tanay Kulkarni (@tkaunlaky10), Mukund Garg, Abdul Jawad Khan.
+
+**Judges, start here:** [`WRITEUP.md`](WRITEUP.md) has a one-minute summary at the top, then the full submission. The results table is in [Results](#results) below; every prediction and every deviation from it is in [`PREREGISTRATION.md`](PREREGISTRATION.md).
+
 > **Research artifact.** Every fine-tuned or repaired checkpoint this code produces is labelled
 > "research artifact: unrepaired, do not deploy". No raw generations or harmful completions are in this repo.
 
-- **Explainer:** [Pencil Maths from Scratch](https://claude.ai/artifact/Un3U3iLdPGPnC5aUYptRVk), every idea below
-  built up from vectors, with worked examples and sliders. The damping and ceiling section is
-  [part C6](https://claude.ai/artifact/Un3U3iLdPGPnC5aUYptRVk#c6).
+- **Write-up:** [`WRITEUP.md`](WRITEUP.md), the full submission: problem, data, metrics, method, results,
+  limitations.
+- **The maths, step by step:** [`docs/MATH_STEP_BY_STEP.md`](docs/MATH_STEP_BY_STEP.md), every idea below with
+  worked examples. Damping and the eigenvalue ceiling are
+  [part 6](docs/MATH_STEP_BY_STEP.md#6-damping-range-restriction-truncation-and-the-ceiling).
 - **Pre-registration and deviation log:** [`PREREGISTRATION.md`](PREREGISTRATION.md) (predictions P1–P7, written
   before measurement).
 - **Run log:** [`EXPERIMENTS.md`](EXPERIMENTS.md) (every GPU job, its code version and its outcome).
-- **Result JSONs:** the Hugging Face dataset repo `tkaunlaky10/safety-pencil-runs` (`outputs/results/`).
+- **Public artifacts on Hugging Face:** [`safety-pencil-data`](https://huggingface.co/datasets/tkaunlaky10/safety-pencil-data) (data splits), [`safety-pencil-results`](https://huggingface.co/datasets/tkaunlaky10/safety-pencil-results) (every result JSON, run logs, figures), LoRA adapters [`safety-pencil-lora-runA`](https://huggingface.co/tkaunlaky10/safety-pencil-lora-runA), [`-runC`](https://huggingface.co/tkaunlaky10/safety-pencil-lora-runC), [`-runD`](https://huggingface.co/tkaunlaky10/safety-pencil-lora-runD).
+  - Repaired model to use: [`tkaunlaky10/safety-pencil-runA-wiseft-0.5`](https://huggingface.co/tkaunlaky10/safety-pencil-runA-wiseft-0.5) (WiSE-FT α = 0.5 on run A; see WRITEUP §6.7)
 
 ## The problem
 
@@ -38,7 +45,7 @@ harmless prompts. The project asks three questions about that damage:
 
 | Statement | What it asks | What we did | Outcome |
 | --- | --- | --- | --- |
-| **Track 2b #6** (primary) | Repair safety drift without retraining | Closed-form curvature repair (the "pencil"), bounded by a per-module trust region, against WiSE-FT, RegMean and diagonal Fisher at equal task score | **Done.** Restores English harmful compliance to the aligned model's 7% with the full task gain. Ties RegMean on harmful compliance and beats it on the pre-registered metric (Hinglish refusal 39.2% vs 34.3%, Holm p 0.034), but plain interpolation (WiSE-FT α = 0.5) is as good or better on every test metric |
+| **Track 2b #6** (primary) | Repair safety drift without retraining | Closed-form curvature repair (the "pencil"), bounded by a per-module trust region, against WiSE-FT, RegMean and diagonal Fisher at equal task score | **Done.** Restores English harmful compliance to the aligned model's 7% with the full task gain. Ties RegMean on harmful compliance, and plain interpolation (WiSE-FT α = 0.5) matches it on harmful compliance and worst-language refusal and halves its English over-refusal. The pre-registered comparison (P6) is **not met in substance** (see Results) |
 | **Track 2b #9** | Locate where safety lives in the model | A leverage map: each module's largest safety-per-task-cost eigenvalue | **Partly done.** The top 10 modules are all in layers 32–35, and 9 of them are MLP projections, as predicted. The refusal-direction check and the CircuitKIT cross-check were not run |
 | **Track 2a #4** (lens) | Multilingual safety | Every measurement is per language: English, Hindi and romanised Hinglish (built from aya_redteaming) | **Done.** The drift is language-dependent: it shows up as harmful compliance in English, and as extra refusal and over-refusal in Hindi and Hinglish |
 | Track 2b #5 | Safety-preserving fine-tuning | Planned as P4 ("preserve ≈ repair") | **Not done** (cut on 9 Nov) |
@@ -60,9 +67,9 @@ along its direction v. Then:
 WiSE-FT (interpolating back toward θ0) shrinks every direction by the same factor; the pencil shrinks each one
 according to its own λ. In a toy 2-D case the pencil leaves 7.6× less drift than WiSE-FT at the same task cost.
 
-## How the method is built (and what each part of the explainer covers)
+## How the method is built (and where each part is explained)
 
-| Explainer part | Topic | In the code |
+| Part of [`MATH_STEP_BY_STEP.md`](docs/MATH_STEP_BY_STEP.md) | Topic | In the code |
 | --- | --- | --- |
 | 1–2 | Drift S = KL(θ0 ‖ θ) on θ0's own answers; its curvature is the Fisher F_h. The task Fisher H_t and the regret R at θ1 | `invariance.output_kl`, `runtime.measure_S`, `factors.py` |
 | 3–4 | The pencil F_h v = λ H_t v; the closed-form repair z = μ/(λ+μ)·c; the drift–task frontier | `geneig.py`, `repair.py` |
@@ -74,7 +81,7 @@ according to its own λ. In a toy 2-D case the pencil leaves 7.6× less drift th
 | 10 | The fix: output-side damping plus a per-module trust region (each step scaled so its effect on the module's real inputs is at most the fine-tune's). Still exactly gauge-invariant | `repair.scaled_trust_region_repair` |
 | 11 | Baselines as other curvature models in the same objective: WiSE-FT (all λ equal), RegMean (input side only), diagonal Fisher | `baselines.py`, `scripts/07_baselines.py` |
 | 12 | Statistics: Wilson intervals, exact McNemar, Holm across languages, paired bootstrap over prompts for drift | `stats.py` |
-| 13–14 | Results and honest takeaways | below, and `04-submission` in the team folder |
+| 13–14 | Results and honest takeaways | below, and [`WRITEUP.md`](WRITEUP.md) |
 
 ## Results
 
@@ -83,11 +90,11 @@ Pre-registered predictions ([`PREREGISTRATION.md`](PREREGISTRATION.md)):
 | | Prediction | Outcome |
 | --- | --- | --- |
 | P1 | The pencil repair is invariant under the V/O gauge; Euclidean methods are not | **Pass.** Pencil, RegMean and ReSta give the same function in both gauges (output KL ≤ 2e-9); Euclidean pencil, diagonal Fisher, AlignMerge-style and Safe LoRA do not (KL 6e-7 to 1e-3) |
-| P2 | ½ΔᵀF_hΔ ranks measured drift (Spearman ρ ≥ 0.6) | **Fail.** ρ = 0.17 [−0.17, 0.49]; forecasts are 24–39× too low. Drift along the fine-tune grows like (1 − α)^0.72 [0.71, 0.74], not the quadratic (1 − α)² |
+| P2 | ½ΔᵀF_hΔ ranks measured drift (Spearman ρ ≥ 0.6) | **Fail.** ρ = 0.17 [−0.17, 0.49]; forecasts are 24–39× too low on run A's final checkpoint (24–111× across all 36 checkpoint–language pairs). Drift along the fine-tune grows like (1 − α)^0.72 [0.71, 0.74], not the quadratic (1 − α)² |
 | P3 | Refusal and task score move with μ as predicted | **Fail** for the unbounded repair (every μ rejected by the trust-region rule). Bounded repair: drift falls with μ as predicted; task loss does not follow the predicted regret |
 | P4 | Preserve ≈ repair | Not run |
 | P5 | Leverage concentrates in late MLP blocks and aligns with the refusal direction | **Partial.** Top 10 modules all in layers 32–35, 9 of them MLP; alignment not measured |
-| P6 | The pencil beats at least one weight-space baseline on worst-language refusal at equal task score | **Met on the formal metric vs RegMean only.** Not better than WiSE-FT on any test metric; behind all three baselines on dev KL drift |
+| P6 | The pencil beats at least one weight-space baseline on worst-language refusal at equal task score | **Not met in substance.** The fine-tune raised refusal, so on this metric the unrepaired model (44.4% Hinglish) beats the aligned one (19.2%); the pencil's extra Hinglish refusal over RegMean (39.2% vs 34.3%) comes with more over-refusal (34.8% vs 28.3%). Not significantly better than WiSE-FT α = 0.5 on any safety metric; behind all three baselines on dev KL drift ([`WRITEUP.md`](WRITEUP.md) §5.9) |
 | P7 | Per-language pencils share a subspace | Not run |
 
 **The repair on test** (bounded pencil at μ* = 0.0019, versus the fine-tuned model θ1 and the aligned model θ0):
@@ -110,7 +117,7 @@ What this means:
   quadratic forecast (the real fine-tune is far outside the quadratic regime), and the output-side eigenbasis is
   numerically fragile.
 
-Full tables, intervals and every caveat are in the results write-up. `jobs/report.py` regenerates
+Full tables, intervals and every caveat are in [`WRITEUP.md`](WRITEUP.md). `jobs/report.py` regenerates
 `outputs/summary.md` from the result JSONs.
 
 ## Lexsi tools and models used
@@ -134,7 +141,7 @@ Full tables, intervals and every caveat are in the results write-up. `jobs/repor
 | `src/pencil/` | The library (below) |
 | `scripts/` | One script per stage, every one with `--dry-run` (below) |
 | `jobs/` | Hugging Face Jobs: `launch.py` (stages, hardware, cost), `stages/*.sh`, `sync.py`, `report.py` |
-| `tests/` | 238 tests: numpy maths, torch equivalence, factor hooks, whole-model repair and invariance, data, evaluation, statistics, job stages |
+| `tests/` | 270 tests: numpy maths, torch equivalence, factor hooks, whole-model repair and invariance, data, evaluation, statistics, job stages |
 | `patches/`, `scripts/setup_lexsi.sh` | Our bug fixes to the four Lexsi libraries, and the script that installs the patched versions |
 | `verification/` | The toy-transformer verification: write-up, scripts, results |
 
@@ -186,7 +193,7 @@ python3.12 -m venv .venv && . .venv/bin/activate && pip install -U pip uv
 uv pip install -r requirements-main.lock.txt
 bash scripts/setup_lexsi.sh main            # swaps in the patched SafeTune, AuditKIT, CuratorKIT
 uv pip install -e . --no-deps               # this package (the scripts import it)
-python -m pytest                            # 238 passed, 8 skipped (CPU, under a minute)
+python -m pytest                            # 270 passed, 8 skipped (CPU, under a minute and a half)
 bash scripts/dry_run_all.sh                 # the whole pipeline on a tiny offline model, about a minute on CPU
 ```
 
@@ -222,6 +229,6 @@ Each script also runs on its own; `--help` shows its options, and `--dry-run` ru
 
 ## Licences
 
-- Our code: to be decided.
+- Our code: MIT ([`LICENSE`](LICENSE)).
 - Tiny Aya derivatives: CC-BY-NC 4.0 plus Cohere Labs' acceptable-use policy.
 - The Lexsi libraries: LSAL. See `IMPLEMENTATION.md` §0.

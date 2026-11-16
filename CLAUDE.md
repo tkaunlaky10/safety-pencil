@@ -1,6 +1,8 @@
 # Safety Pencil: project memory
 
-Lexsi AI Safety and Alignment Hackathon, Track 2b. Team of three. Submission is due at the end of 14 Nov 2026 AoE; the team's real deadline is **23:59 IST on 14 Nov**, with a complete draft submitted by 23:59 IST on Fri 13 Nov. Experiments freeze at 23:59 IST on Thu 12 Nov. **Scope and dates follow the five-day plan (`03-team/PLAN_5DAY.md` in the team folder):** task T1 only; four runs (A: 4000 rows seed 0; B: 4000 rows seed 1; C: 1000 rows seed 0; D: 1000 rows + 2% contamination seed 0), each with adapters saved at 25/50/75/100%; English and Hindi first, Hinglish from Wed. Cut: T2, preserve (P4), worst-language repair, compression.
+> This file is the working memory of the AI coding assistant (Claude Code) used on this project, kept in the repo for transparency (see `WRITEUP.md` §19). It records conventions and decisions as they were made, so some plans in it were later changed. The submission itself is [`WRITEUP.md`](WRITEUP.md).
+
+Lexsi AI Safety and Alignment Hackathon, Track 2b. Team of three: Tanay Kulkarni and two teammates. Submission deadline: **15 Nov 2026, 11:59 PM AoE (Mon 16 Nov, 17:29 IST)**. Experiments freeze at 23:59 IST on Thu 12 Nov. **Scope and dates follow the five-day plan (`03-team/PLAN_5DAY.md` in the team folder):** task T1 only; four runs (A: 4000 rows seed 0; B: 4000 rows seed 1; C: 1000 rows seed 0; D: 1000 rows + 2% contamination seed 0), each with adapters saved at 25/50/75/100%; English and Hindi first, Hinglish from Wed. Cut: T2, preserve (P4), worst-language repair, compression.
 
 ## What we are building
 

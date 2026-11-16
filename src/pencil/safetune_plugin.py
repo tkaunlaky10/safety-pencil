@@ -3,7 +3,12 @@
     from pencil.safetune_plugin import register
     register()                                     # adds the alias "pencil" -> PencilTrainer
     PencilTrainer(drifted, aligned_model=aligned, adapter_path=..., harm_factors=..., task_factors=...,
-                  mu=0.1).apply()
+                  mu=0.0019).apply()
+
+The default is the bounded (scaled) repair with the settings of `06_repair.py sweep --method scaled`, read from
+configs/experiment.yaml (pencil.scaled): covariant input side, output damping ν = output_nu_rel × mean diag G_t′,
+every module's step scaled so its trust ratio is at most 1, v_proj exempt. `method="covariant"` gives the
+unbounded 12 Nov repair, which broke Tiny Aya at every μ (WRITEUP §5.5); use it only to reproduce that.
 
 Like every SafeTune recover trainer it changes the merged drifted model in place and returns it. ΔW comes
 from the fp32 adapter (`adapter_path` or `deltas`); differencing merged bf16 weights is only a fallback, with
@@ -14,9 +19,11 @@ from __future__ import annotations
 
 import warnings
 
+from .config import load_config
 from .delta import lora_delta, set_weights
 from .factor_store import FactorStore, prepare_for_repair
 from .repair import ModelRepair
+from .runtime import scaled_repair_kwargs
 
 try:
     from safetune.runner.recover._base import _RecoverBase
@@ -27,8 +34,22 @@ except ImportError:  # keeps this module importable without SafeTune
             self.model = model
 
 
-# ModelRepair settings used unless the caller overrides them
-DEFAULT_REPAIR_KW = {"row_set": "full", "top_k_mlp": 512, "rel_tol_other": 1e-10}
+METHODS = ("scaled", "covariant")
+# the unbounded 12 Nov repair (method="covariant"); kept to reproduce WRITEUP §5.5, not for use
+COVARIANT_REPAIR_KW = {"row_set": "full", "top_k_mlp": 512, "rel_tol_other": 1e-10}
+
+
+def default_repair_kw(method: str = "scaled", config: dict | None = None) -> dict:
+    """ModelRepair settings for `method`. "scaled": exactly what `06_repair.py sweep --method scaled` builds from
+    the config (default configs/experiment.yaml), minus rel_tol, which apply() measures from the factors."""
+    if method not in METHODS:
+        raise ValueError(f"method must be one of {METHODS}, got {method!r}")
+    if method == "covariant":
+        return dict(COVARIANT_REPAIR_KW)
+    pencil_cfg = (config or load_config())["pencil"]
+    kwargs = scaled_repair_kwargs(pencil_cfg, rel_tol=0.0)
+    del kwargs["rel_tol"]
+    return kwargs
 
 
 def _as_factors(factors_or_folder):
@@ -56,9 +77,12 @@ class PencilTrainer(_RecoverBase):
         deltas=None,
         mu: float = 0.1,
         modules: list[str] | None = None,
+        method: str = "scaled",
+        config: dict | None = None,
         **repair_kw,
     ):
-        """repair_kw go to ModelRepair (row_set, damping, gamma, top_k_mlp, rel_tol_other, ...)."""
+        """method: "scaled" (bounded, the default) or "covariant" (unbounded). repair_kw override single
+        ModelRepair settings (row_set, gamma, top_k_mlp, output_nu_rel, ...) on top of the method's defaults."""
         super().__init__(model)
         self.aligned_model = aligned_model
         self.harm_factors = harm_factors
@@ -67,7 +91,8 @@ class PencilTrainer(_RecoverBase):
         self.deltas = deltas
         self.mu = mu
         self.modules = modules
-        self.repair_kw = {**DEFAULT_REPAIR_KW, **repair_kw}
+        self.method = method
+        self.repair_kw = {**default_repair_kw(method, config), **repair_kw}
         self.report: dict = {}
 
     def _deltas(self, names):

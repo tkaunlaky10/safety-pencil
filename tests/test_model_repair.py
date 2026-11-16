@@ -360,7 +360,15 @@ def test_safetune_plugin_matches_model_repair(setup):
     m0, m1, d, fh, ft = setup["m0"], setup["m1"], setup["deltas"], setup["fh"], setup["ft"]
     drifted = copy.deepcopy(m1)
     tr = PencilTrainer(
-        drifted, aligned_model=m0, deltas=d, harm_factors=fh, task_factors=ft, mu=0.1, row_set="full", top_k_mlp=None
+        drifted,
+        aligned_model=m0,
+        deltas=d,
+        harm_factors=fh,
+        task_factors=ft,
+        mu=0.1,
+        method="covariant",
+        row_set="full",
+        top_k_mlp=None,
     )
     out = tr.apply()
     assert out is drifted and tr.report["S_after_pred"] < tr.report["S_before_pred"]
@@ -370,6 +378,37 @@ def test_safetune_plugin_matches_model_repair(setup):
     )
     got = model_weights(out, d)
     assert all(torch.allclose(got[n], ref[n]) for n in d)
+
+
+def test_safetune_plugin_defaults_to_the_scaled_repair_of_the_config():
+    from pencil.config import load_config
+    from pencil.safetune_plugin import default_repair_kw
+
+    cfg = load_config()["pencil"]
+    kw = default_repair_kw()
+    assert kw["damping"] == "covariant" and kw["scale_steps"] is True
+    assert kw["output_nu_rel"] == cfg["scaled"]["output_nu_rel"]
+    assert kw["exempt_leaves"] == tuple(cfg["scaled"]["exempt_leaves"])
+    assert kw["gamma"] == cfg["gamma_c"] and kw["top_k_mlp"] == cfg["top_k_mlp"]
+    assert kw["row_set"] == cfg["repair_row_set"] and kw["rel_tol_other"] == cfg["rel_tol"]
+    assert "rel_tol" not in kw  # measured from the factors in apply()
+    assert default_repair_kw("covariant").get("scale_steps", False) is False
+
+
+def test_safetune_plugin_default_repair_is_bounded(setup):
+    from pencil.safetune_plugin import PencilTrainer
+
+    m0, m1, d, fh, ft = setup["m0"], setup["m1"], setup["deltas"], setup["fh"], setup["ft"]
+    for mu in (1e-3, 0.1):
+        trainer = PencilTrainer(copy.deepcopy(m1), aligned_model=m0, deltas=d, harm_factors=fh, task_factors=ft, mu=mu)
+        trainer.apply()
+        assert trainer.report["max_trust_ratio"] <= 1.0 + 1e-9
+        assert trainer.report["S_after_pred"] < trainer.report["S_before_pred"]
+    unbounded = PencilTrainer(
+        copy.deepcopy(m1), aligned_model=m0, deltas=d, harm_factors=fh, task_factors=ft, mu=0.1, method="covariant"
+    )
+    unbounded.apply()
+    assert unbounded.report["max_trust_ratio"] > 1.0  # what the old default did
 
 
 def test_cached_predictions_match_direct_computation(setup):

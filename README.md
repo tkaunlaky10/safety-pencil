@@ -3,7 +3,7 @@
 Locating, forecasting and repairing multilingual safety drift in Tiny Aya Global with a gauge-invariant curvature
 lens. Lexsi AI Safety and Alignment Hackathon, **Track 2b: AI Safety and Correction**.
 
-**Team:** Tanay Kulkarni (@tkaunlaky10), Mukund Garg, Abdul Jawad Khan.
+**Team:** Tanay Kulkarni (@tkaunlaky10), Mukund Garg, Abdul Jawad Khan (HF @obluda420).
 
 **Write-up:** [WRITEUP.md](WRITEUP.md) · [PDF](Safety_Pencil_WRITEUP.pdf) (the maths and figures render best in the PDF).
 

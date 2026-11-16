@@ -390,30 +390,9 @@ All four libraries are pinned to an upstream commit plus our patches (`patches/`
 | AuditKIT | `GuardJudge("llama_guard")` | Llama Guard 3 8B, default policy; first-line verdict safe/unsafe |
 | AuditKIT | `LLMJudge` | Aya Expanse 8B, choices REFUSE / PARTIAL / COMPLY, pinned rubric (Appendix A) |
 
-```mermaid
-flowchart LR
-  subgraph Data["CuratorKIT"]
-    D1["aya_redteaming en/hi<br/>stratified 40/10/50 splits"] --> D2["HinglishTask<br/>(Aya Expanse 32B)"]
-    D3["aya_dataset Hindi<br/>+ Aya Collection top-up"] --> D4["T1 task: train_4000 / heldout 300"]
-    D5["XSTest safe prompts"] --> D2
-  end
-  subgraph Tune["SafeTune"]
-    T1["LoRA fine-tunes A, C, D<br/>(adapters at 25/50/75/100%)"]
-    T2["PencilTrainer recover method<br/>+ ReSta / Safe LoRA controls"]
-  end
-  subgraph Audit["AuditKIT"]
-    A1["generate (greedy, 256 tok)"] --> A2["Llama Guard 3: unsafe?"]
-    A1 --> A3["Aya Expanse 8B rubric:<br/>REFUSE / PARTIAL / COMPLY"]
-  end
-  D4 --> T1
-  T1 --> K["K-FAC factors (ours)<br/>F_h at θ0, H_t at θ1"]
-  D2 --> K
-  K --> T2
-  T1 --> A1
-  T2 --> A1
-  A2 --> S["stats: Wilson, McNemar, Holm, bootstrap"]
-  A3 --> S
-```
+![The Safety Pencil pipeline: CuratorKIT, SafeTune, AuditKIT](docs/figures/safety_pencil_pipeline.png)
+
+*The pipeline. Data from CuratorKIT feeds the SafeTune fine-tunes; our K-FAC factors (F_h at θ0, H_t at θ1) feed the PencilTrainer repair; AuditKIT generates and judges every checkpoint. Mermaid source: [`docs/figures/safety_pencil_pipeline.mmd`](docs/figures/safety_pencil_pipeline.mmd).*
 
 ### 4.8 Models and licences
 
@@ -845,7 +824,7 @@ Team of three:
 | --- | --- |
 | Tanay Kulkarni | tanaykulkarni34@gmail.com · HF / GitHub @tkaunlaky10 |
 | Mukund Garg | gargmd19@gmail.com |
-| Abdul Jawad Khan | khanabduljawad@gmail.com |
+| Abdul Jawad Khan | khanabduljawad@gmail.com · HF [@obluda420](https://huggingface.co/obluda420) |
 
 ## 15. Acknowledgements
 

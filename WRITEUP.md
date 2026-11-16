@@ -63,11 +63,11 @@ Tiny Aya is multilingual, so the damage need not look the same in each language.
 
 A fine-tune moves the weights along many directions at once. Some directions carry the task, some damage safety, and some do both. Suppose we could measure, for every direction, how much it hurts safety and how much it helps the task. Then the ratio of the two tells us which parts of the update to undo: those that cost a lot of safety and buy little task performance.
 
-Two curvature matrices provide exactly these measurements. One, F_h, measures how quickly the model's answers to harmful prompts move away from the aligned model's answers as the weights move. The other, H_t, measures how quickly the task loss changes. Their **generalised eigenvectors** are the directions in which both are diagonal at once, and each **eigenvalue** λ is the ratio "safety damage per unit of task cost" in that direction. Everything in this project is read off that one basis:
+Two curvature matrices provide exactly these measurements. One, F_h, measures how quickly the model's answers to harmful prompts move away from the aligned model's answers as the weights move. The other, H_t, measures how quickly the task loss changes. Their **generalised eigenvectors** are the directions in which both are diagonal at once, and each **eigenvalue** λ is the ratio "safety damage per unit of task cost" in that direction. Everything in this project is read off that one basis (Figure 1): large λ **locates** safety, ½Σλc² **forecasts** drift, and shrinking each coordinate by μ/(λ+μ) **repairs** the update.
 
-- **Locate:** modules with very large λ are where safety is concentrated.
-- **Forecast:** the drift of any update is a weighted sum of its squared coordinates, with weights λ.
-- **Repair:** shrink each coordinate of the update by μ/(λ+μ). High-λ parts are removed and low-λ parts kept, and μ sets the exchange rate.
+![Figure 1: the Safety Pencil framework](docs/figures/safety_pencil_framework.png)
+
+*Figure 1. The framework. Two curvatures, F_h at the aligned model and H_t at the fine-tuned one, define one generalised eigenproblem; locate, forecast and repair are read off its eigenvalues λ. ✓ and ✗ mark what held on the real model. Editable source: [`docs/figures/safety_pencil_framework.drawio`](docs/figures/safety_pencil_framework.drawio).*
 
 ### 1.3 Research questions
 
@@ -443,7 +443,7 @@ Each subsection states the question, what the theory predicts, what we measured,
 | Global-MMLU | 58.0% → 59.0% | 50.0% → 47.5% | — |
 | Task NLL (Hindi held-out) | 2.136 → 1.780 | | |
 
-**Finding 1: the drift is a loss of discrimination, and it differs by language.** The fine-tune did its job: task loss fell by 0.36 nats per token and MMLU barely moved. But the model now refuses more *and* complies with harmful requests more. In English, harmful compliance tripled and over-refusal quadrupled. In Hindi and Hinglish the damage is mainly extra refusal and over-refusal. Hinglish harmful compliance was already high at θ0 (23%) and did not change. All three runs showed rising refusal at the dev probe; run A was the only one with a significant change in harmful compliance, so it became the main run (Appendix B). Measured dev drift at θ1 is S = 0.261 (en), 0.222 (hi), 0.243 (Hinglish) nats per token.
+**Finding 1: the drift is a loss of discrimination, and it differs by language.** The fine-tune did its job: task loss fell by 0.36 nats per token and MMLU barely moved. But the model now refuses more *and* complies with harmful requests more. In English, harmful compliance tripled and over-refusal quadrupled. In Hindi and Hinglish the damage is mainly extra refusal and over-refusal. Hinglish harmful compliance was already high at θ0 (23%) and did not change. All three runs showed rising refusal at the dev probe; run A was the only one with a significant change in harmful compliance, so it became the main run (Appendix B). Measured dev drift at θ1 is S = 0.261 (en), 0.222 (hi), 0.243 (Hinglish) nats per token. The examples in §5.12 qualify the English numbers: θ1's "refusals" of safe English prompts that we inspected were translations of the prompt into Hindi, and the two judges disagree on most of the newly unsafe English answers.
 
 ### 5.2 Invariance (P1)
 
@@ -588,7 +588,21 @@ P6's pre-registered metric is worst-language refusal at equal task score. The wo
 - **Pre-registered refusal as a safety metric** for this fine-tune (§5.9).
 - **Predicted regret:** the first-order term dominates (ρ_g 0.7–14).
 
-Not reported: **results on a quantised model** (not run; §7), and **sample inputs and outputs**. By design we store only judge labels and SHA-256 hashes of completions, never their text, so no outputs exist to show.
+Not reported: **results on a quantised model** (§7). Harmful-prompt outputs are never shown, because by design only judge labels and SHA-256 hashes are stored for them; §5.12 shows benign examples in full and harmful ones as labels.
+
+### 5.12 Examples
+
+Figure 3 follows example prompts through the aligned model, the fine-tuned model, our pencil repair and the WiSE-FT baseline.
+
+- **Harmful prompts** appear only as counts. By design we store judge labels and a SHA-256 hash per answer, never the text.
+- **Benign prompts:** θ0, θ1 and WiSE-FT were regenerated as text with the evaluation settings (greedy, 256 tokens, bf16). The pencil's merged checkpoint was not saved, so it is shown by its stored judge labels and its task NLL.
+- **Hash check:** θ1's and WiSE-FT's answers to the chess, Gandalf and poverty prompts are byte-identical to the answers the judges scored (11 of 21 regenerated answers match overall). The task row has no stored answer, because the task is scored by NLL.
+
+![Figure 3: examples](docs/figures/safety_pencil_examples.png)
+
+*Figure 3. Examples. Top: share of the 485 harmful English test prompts judged unsafe by Llama Guard 3. Below: benign prompts as answered by each model; the pencil column (ours) shows its stored labels. Editable source: [`docs/figures/safety_pencil_examples.drawio`](docs/figures/safety_pencil_examples.drawio).*
+
+Of the 90 prompts the fine-tune broke, the pencil fixes 81 and WiSE-FT 84. But for 84 of those 90, the refusal judge said REFUSE, so the two judges disagree on most of the harmful-compliance increase. The second row is where the pencil loses: it still refuses "How do I snipe the best Black Friday deals?", one case behind its higher English over-refusal than WiSE-FT's.
 
 ---
 
@@ -667,125 +681,66 @@ It ties or beats every curvature repair we ran (§5.7–5.8). Corollary 1 says w
 - **The pencil was never measured at the 90%-task-gain limit**, because its predicted-regret grid stopped at task NLL 1.780. Its drift moved only from 0.208 to 0.185 across three decades of μ, so it is unlikely to reach diagonal Fisher's 0.060 at 1.803, but we did not test it.
 - **Not done:** P4 (preserve during fine-tuning), P7, the refusal-direction and CircuitKIT checks for P5, further baselines on dev (Safe Delta, LoX, SafeMERGE, task arithmetic), a quantised model, a public demo Space.
 - **Hinglish is synthetic:** converted by Aya Expanse 32B, with ~31% of conversions rejected.
+- **The judges measure refusal and harm, not answer quality.** The refusal rubric scores a Hindi translation of an English prompt as REFUSE, so part of θ1's English over-refusal is the model translating instead of answering (§5.12). The refusal judge also labels 84 of the 90 newly unsafe English answers as REFUSE, so the harm and refusal judges disagree on most of the harmful-compliance increase. We have not measured either effect across the full test split.
 
 ## 8. With more credits
 
-**One mechanism ties our failures together, and it reaches beyond our method.** An aligned model's Fisher information is nearly blind to its most confident refusals. So every second-order safety tool protects least where the model is most safe: curvature forecasts, Fisher-weighted merges, EWC-style safe fine-tuning and curvature repairs, ours included. The sections below go in order:
+**In one paragraph.** Our failures share one cause. Every second-order safety tool relies on the curvature (Fisher information), and that curvature is almost blind to the refusals an aligned model is most sure about. Our forecast, our repair and EWC, the standard penalty for fine-tuning safely, all inherit this blind spot. With more credits we would replace the curvature approximation with the exact quantity it approximates, which costs only extra forward passes. Small CPU pilots already support each step. We commit to running and reporting every experiment, whatever the outcome. Derivations are in [`docs/WITH_MORE_CREDITS.md`](docs/WITH_MORE_CREDITS.md), pilot code in [`pilots/`](pilots/).
 
-- §8.1 states the research direction this points to, in mathematical terms;
-- §8.2 reports four CPU pilots that test it (code and results in [`pilots/`](pilots/));
-- §8.3 lists the experiments, among them safe fine-tuning (E9);
-- §8.4 separates what we promise from what we only forecast.
+### 8.1 The idea
 
-Full derivations are in [`docs/WITH_MORE_CREDITS.md`](docs/WITH_MORE_CREDITS.md).
+Take a refusal the model gives with 99.9% confidence. Its curvature weight is p(1 − p) ≈ 0.001, almost zero. So a curvature-based tool sees almost no cost in moving it, until the fine-tune flips it and the real damage turns out far larger than predicted.
 
-### 8.1 The direction, mathematically
+In symbols, let K be the exact drift (the KL divergence from the aligned model on harmful prompts) and Q = ½δᵀF_hδ its quadratic approximation. Q weights each answer token by about e^(−m), where m is the model's confidence margin. For a refusal that the update flips,
 
-Let K(θ) = E_x KL(p_θ0(·|x) ‖ p_θ(·|x)) be the drift on harmful prompts (Definition 1), and L(θ) the held-out task loss. Round one used one surrogate of K for everything: its second-order expansion at θ0,
+$$\frac{K}{Q}=\frac{\sinh m_0}{m_0}\qquad(11\times\text{ at 99\% confidence},\ 72\times\text{ at 99.9\%}),$$
 
-$$K(\theta_0+\delta)\;\approx\;Q(\delta)=\tfrac12\,\delta^\top F_h\,\delta .$$
+which is the size of our 24–111× forecast gap (§6.1).
 
-The forecast was Q(Δ); the repair minimised Q(Δ′) + μR(Δ′ − Δ); and EWC, the standard penalty for fine-tuning safely, is λQ(θ − θ0).
+**The direction: keep K, drop Q.** Wherever round one used Q, we use K, or the refusal margin it protects, instead (Figure 2). Unlike Q, the curvature of K is measured at the current model, so its pull grows as a refusal weakens rather than staying frozen at the aligned model's tiny value.
 
-**Why Q fails exactly where it matters.** For one answer token, write f for its logits, $m=f_{y^*}-\max_{y\ne y^*}f_y$ for its margin, and u = JΔ for the change of its logits along the update. If the logits move linearly, the drift along the line is exactly
+![Figure 2: keep K, drop Q](docs/figures/safety_pencil_direction.png)
 
-$$K_{\mathrm{lin}}(t)=\mathbb{E}\big[A(f^0+t\,u)-A(f^0)-t\,\mathbb{E}_{p^0}u\big],\qquad K_{\mathrm{lin}}''(t)=\mathbb{E}\,\mathrm{Var}_{p_t}(u),$$
+*Figure 2. The research direction. Each use of the quadratic approximation Q in round one (left) is replaced by the exact drift K or the refusal margin (right), with the pilot result for each. Editable source: [`docs/figures/safety_pencil_direction.drawio`](docs/figures/safety_pencil_direction.drawio).*
 
-with A the log-partition function. At θ0 that variance is tiny for confident tokens. For a two-way choice, $\mathrm{Var}_{p^0}(u)=p(1-p)(\Delta u)^2$, and p(1 − p) ≈ e^(−m). So Q weights each token by roughly e^(−m): **the more confidently the model refuses, the less Q protects that refusal.** When the update reverses a token, K/Q = sinh(m₀)/m₀. This one fact accounts for three things:
+### 8.2 Evidence from CPU pilots
 
-- the size of the 24–111× forecast gap (§6.1);
-- why Fisher-weighted merging and EWC were blind in our pilots;
-- why more curvature detail did not help (§6.4).
+The pilot model is a 2-layer transformer trained on a synthetic language in which prompts with a trigger token must be refused. A benign LoRA fine-tune on another task destroys the refusal (harmful compliance 0% → 97–100%), as our Hindi fine-tune did. At this size everything can be computed exactly. The pilots use 3 seeds, except the fine-tuning pilot (1 seed), and contain no natural-language or harmful text.
 
-**The direction: keep K, drop Q.** Use K itself, or the decision margin it protects, and pay with forward passes instead of curvature:
+| Question | Pilot answer |
+| --- | --- |
+| Is the quadratic forecast too low on confident answers? | Yes: 1,200–12,000× too low, as the blind spot predicts |
+| Does EWC protect refusals during fine-tuning? | No: harmful compliance stays at 78–100% at every strength. An exact-KL or refusal-margin penalty gives 0% with the task kept |
+| Do learned merge weights beat plain interpolation (WiSE-FT)? | Yes: 0.2–8.6% harmful compliance against 25–99%, at the same task gain |
+| Does cross-fitting fix noisy curvature? | Yes: it loses 4–12% of the possible improvement instead of 18–50%, and never overshoots |
 
-| Use | Round one (quadratic surrogate) | With more credits (exact objective) |
+### 8.3 What we would run
+
+1. **E1. Diagnose first.** On Tiny Aya, split the forecast gap exactly into its three causes (the curvature approximation, the confidence blind spot and non-linearity), using Jacobian–vector products. The result decides what runs next.
+2. **E2. Learned safety merge.** Learn one weight per module (252) on the exact objective, starting from the best interpolation point. Each weight can only shrink the update, so the repair cannot blow up as round one's did.
+3. **E9. Fine-tune safely.** Train the Hindi fine-tune with an exact-KL or refusal-margin penalty instead of EWC, and compare all three on the same data.
+4. **E3. Better curvature, where still used.** Cross-fitted eigenvalues, fp64 factors and more data.
+5. **Also:** a discrimination metric (the refusal Youden index, E4), predicting the best interpolation point in advance (E5), quantised models (E6), cross-lingual transfer (E7), and human labels with more seeds (E8).
+
+### 8.4 What we promise, and what we expect
+
+**Promises**, which hold whatever the results:
+
+- Pre-register every prediction and its failure condition, and report every outcome, including refutations.
+- E1 always produces the full three-way split of the gap, because the split is an exact identity.
+- E2 and E3 never take steps larger than the original update allows: E2 by construction, E3 by a proven bound. E2 is also never worse than interpolation on its fitting objective.
+- Run E9, E6 and E8 as described, and release everything new under the same rule as round one: labels and hashes only for harmful prompts.
+
+**Forecasts**, which the experiments may refute:
+
+| Quantity | Now | Expected |
 | --- | --- | --- |
-| Forecast | Q(Δ) | K_lin(1) from one Jacobian–vector product, plus the measured non-linearity factor K(θ1)/K_lin(1) (E1) |
-| Repair | argmin Q(Δ′) + μR(Δ′ − Δ) | argmin over s ∈ [0,1]^252 of K(θ0 + Σ_m s_m ΔW_m) + μL, started at the best WiSE-FT point (E2) |
-| Fine-tuning safely | L_task(θ) + λQ(θ − θ0), i.e. EWC | L_task(θ) + βK(θ), or L_task(θ) + β·E max(0, m\* − m_θ(x)) (E9) |
-| Curvature, where still used | in-sample generalised eigenvalues | cross-fitted, shrunk eigenvalues (E3) |
+| Share of the forecast gap due to the blind spot (E1) | unmeasured | a factor ≥ 10× |
+| English harmful compliance with the learned merge (E2) | pencil 7.4% | ≤ 5% |
+| Harmful compliance after the Hindi fine-tune with a KL or margin penalty (E9) | 22.5% | ≤ 8%, with EWC worse |
+| English over-refusal (E4) | pencil 31.5% | ≤ 20% |
 
-**Why these choices: compare the gradients.**
-
-- **EWC:** ∇ = λF_h(θ − θ0). Its weight on a refusal is frozen at θ0's value, ∝ e^(−m₀), however far the refusal has already fallen.
-- **Exact KL:** ∇K = E[Jᵀ(p_θ − p_θ0)]. For a confident refusal its size is about σ(−m_θ), so the pull grows as the margin falls. It measures the damage at the current model, not at θ0.
-- **Margin hinge:** ∇ = −∇m_θ whenever m_θ < m\*. That is O(1) at any confidence. It protects the decision and leaves the rest of the answer free to change, which matters when the fine-tune is meant to change language or style.
-- **Learned merge:** with coefficients s ∈ [0,1]^M, every step shrinks the original update, so the oblique blow-up of §5.5 cannot happen. Interpolation (s = c·1) is a special case, so starting at the best interpolation and descending can only improve the fitting objective.
-
-### 8.2 What the pilots showed
-
-The pilot model is a 2-layer transformer, trained from scratch on a synthetic language in which prompts containing a trigger token must be refused. It is then LoRA-fine-tuned on an unrelated benign task. That erodes the refusal exactly as our Hindi fine-tune did: harmful compliance goes from 0% to 97–100%. At this size everything can be computed exactly, so the pilots test mechanisms, not Tiny Aya numbers. Ranges are over 3 seeds; the safe fine-tuning pilot uses 1 seed. No natural-language or harmful text is involved.
-
-| Question | What the pilots showed |
-| --- | --- |
-| How wrong is the exact second-order forecast? | 1,200–12,000× too low (aligned margins ≈ 12). Drift starts quadratic (local exponent 2.0–2.2), then grows far faster than quadratically (local exponent up to 7–10) as confident answers flip. Of the gap, 43–3,500× is the confidence effect itself and 0.3–280× is non-linearity of the logits |
-| Is Fisher-weighted merging blind? | Yes: diagonal-Fisher merging leaves harmful compliance at 96–97% at every μ |
-| Can learned per-module weights beat interpolation? | Keeping 75% of the task gain, 8 learned module weights give harmful compliance of 0.2%, 0.2% and 8.6%, against 25%, 64% and 99% for WiSE-FT. At 90% of the task gain: 1.0% and 1.4% against 55% and 95% (the third seed had no setting that reached 90%). Started from the best WiSE-FT point, the fitting objective never got worse. A linearised version fails (56–99%), because the logits are too non-linear along the path |
-| Can fine-tuning be made safe without the blind spot? | EWC with λ from 10 to 10⁴ leaves harmful compliance at 78–100%. An exact KL penalty (0% at 99.1% task accuracy) and a refusal-margin penalty (0% at 99.9%) both work |
-| Does cross-fitting fix noisy curvature? | In a simulated pencil, in-sample eigenvalues lose 18–50% of the achievable improvement and overshoot (steps up to 2× the update). Cross-fitted ones lose 4–12% and never overshoot; with shrinkage they equal WiSE-FT when there is no signal. Noise band observed [0.17, 6.1] against Wachter's predicted [0.15, 6.9] |
-| When do quadratic forecasts work? | For 4- and 3-bit rounding error: within 1.0–2.4× of the measured drift. At 30% of the update's size, the fine-tune direction is 17–640× off, against 3–6× for random directions |
-
-### 8.3 What we would build
-
-**E1. Measure the blind spot on Tiny Aya.** On the 36 checkpoint–language pairs, decompose the measured/forecast ratio exactly into K-FAC error × confidence amplification × logit non-linearity, using Jacobian–vector products. The pilot predicts that confidence amplification is ≥ 10×, and the size of the non-linearity tells us whether any linearised tool can work.
-
-**E2. Learn the safety merge** (the pilot's strongest result). Learn one coefficient per module (252), then one per curvature-whitened component of each update, by minimising K + μL as in §8.1. This guarantees:
-
-- never worse than interpolation on the fitting objective;
-- no oversized steps, since each module only shrinks;
-- exact gauge invariance.
-
-The closest prior work, AdaMerging, learns layer-wise merging coefficients by minimising prediction entropy on unlabelled test data. Ours is a supervised safety objective with a guarantee relative to interpolation.
-
-**E9. Fine-tune safely, beyond EWC.** Instead of repairing afterwards, protect refusals while fine-tuning. EWC is the second-order Taylor expansion of the KL penalty at θ0, so it inherits the blind spot: it under-weights a refusal in danger by sinh(m₀)/m₀, and no single λ suits both confident and uncertain tokens. Train the Hindi fine-tune with the exact KL on harmful prompts (one extra forward pass per step), or with the refusal-margin hinge. Compare both against EWC and against data mixing, using the same data, seed and batch order.
-
-**E3. Calibrated curvature.** Cross-fitted, shrunk generalised eigenvalues, with fp64 factors, factors estimated without the shared preamble, and 4× more sequences.
-
-**E4. Target discrimination, not just drift.** Score with the refusal Youden index J = P(refuse | harmful) − P(refuse | safe), which does not reward the damage. Computed post hoc from §5.8, English J is θ0 46.3, θ1 17.8, pencil 31.0 and WiSE-FT 51.5 points.
-
-**E5–E8.**
-
-- E6: quantised deployment (NF4, GGUF Q4_K_M), with the trace forecast the pilot says should hold for rounding error;
-- E5: predict the task-optimal interpolation point from the held-out gradient, s\* = 1 − gᵀΔ/ΔᵀHΔ, against the measured s = 0.7;
-- E7: cross-lingual transfer of single-language repairs;
-- E8: human labels for the judges (Cohen's κ) and three seeds.
-
-E1 runs first. If confidence amplification dominates, E2 and E9 come next; if K-FAC error dominates, E3 does. With limited credits, E1, E5 and the module-level E2 come first.
-
-### 8.4 Expected before/after: what we promise, and what we only forecast
-
-We separate commitments that we can keep whatever the results show from forecasts that the experiments may refute.
-
-**Commitments.**
-
-| We commit to | Why we can keep it |
-| --- | --- |
-| Pre-register every experiment's prediction and failure condition before running it, keep a dated deviation log, and report every outcome, refutations included | It is procedure, not a result, and round one did exactly this (`PREREGISTRATION.md`, Appendix B) |
-| Tune only on dev, and touch each test split once per method | Procedure, as in round one |
-| **E1:** an exact three-factor decomposition of the forecast gap on all 36 checkpoint–language pairs | The decomposition is an identity: one Jacobian–vector product and one forward pass per checkpoint give every factor, so it always produces an answer |
-| **E2:** a learned merge that is never worse than the best interpolation on its fitting objective, never steps beyond the original update, and is exactly gauge-invariant | By construction (§8.1; plan, Proposition 2): it starts at the best WiSE-FT point, only descends, and keeps every coefficient in [0, 1]. We promise these properties, not a win on test |
-| **E3:** no step larger than (1 + πL_B/8) times the update, and an exact fall-back to WiSE-FT when no curvature direction is reliable | Proven bounds (plan, Lemma 2 and Proposition 3), checked numerically per module |
-| **E9:** EWC, exact KL, margin hinge and data mixing compared on the same Hindi fine-tune, with the same data, seed and batch order | Procedure: four fine-tunes of the run A recipe |
-| **E6:** test results for NF4 and GGUF Q4_K_M versions of θ0, θ1, the pencil and WiSE-FT | Procedure; it closes the Track 2b gap noted in §7 |
-| **E8:** 150 human labels per language per judge, with Cohen's κ, and three seeds | Procedure |
-| Every new adapter, checkpoint, result file and pilot made public on Hugging Face and GitHub, under the same rule: labels and hashes only for harmful prompts | The release scripts exist and were used in round one (`jobs/publish*.py`) |
-
-**Forecasts (expected, not promised).**
-
-| Quantity | Now | Forecast | Why we expect it |
-| --- | --- | --- | --- |
-| Forecast gap, run A final, English | 39× too low | confidence factor ≥ 10× (E1) | sinh(m₀)/m₀ is 11–72× at realistic confidence; pilot 43–3,500× |
-| English harmful compliance at the pencil's task loss, test | pencil 7.4%; WiSE-FT 5.4% | ≤ 5% with learned weights (E2) | In the pilot, learned weights cut harmful compliance far below WiSE-FT at equal task gain |
-| Harmful compliance after the Hindi fine-tune with a margin or exact-KL penalty | 22.5% with no penalty | ≤ 8% at equal task loss; EWC worse at every λ (E9) | Pilot: EWC 78–100%; exact KL and margin 0% |
-| English over-refusal / harmful compliance, test | 31.5% / 7.4% | ≤ 20% / ≤ 8% (E4) | WiSE-FT already reaches 15.5% / 5.4%; the two-sided objective targets over-refusal directly |
-| English refusal Youden J | 31.0 | ≥ 45 (E4) | WiSE-FT already reaches 51.5 |
-| Dev drift at task NLL 1.803 | diagonal Fisher 0.060 | ≤ 0.060 (E2, components) | Diagonal Fisher shows the separation exists in the same factors |
-| Ceiling breaks | 2 | 0 (E3) | fp64 accumulation and factors without the shared preamble remove the suspected cancellation |
-| WiSE-FT task optimum | measured s = 0.7 | predicted within ±0.1 (E5) | One JVP gives gᵀΔ and ΔᵀHΔ exactly |
-| Quantisation drift forecast | not measured | within 2–3× (E6) | Pilot: 1.0–2.4× for 4- and 3-bit rounding |
-
-A forecast that fails is a result, not a broken promise: each has a stated failure condition and conclusion in `docs/WITH_MORE_CREDITS.md`.
+A forecast that fails is a result, not a broken promise.
 
 ## 9. Conclusion
 
@@ -913,7 +868,7 @@ Lexsi Labs for the hackathon, the four libraries and Hugging Face credits; Coher
 
 ## 17. LLM usage statement
 
-Much of the code and of this write-up was drafted with AI assistance (Claude, including Claude Code), under the authors' direction and review. [TODO: approximate share, for example "about X% of the code and Y% of the write-up".] Every number comes from a logged run and a result file in the public results repo.
+All of the work in this project was AI-assisted. The code, the experiment and job scripts, the analysis and this write-up were drafted with Claude (including Claude Code), under the authors' direction, and reviewed by the authors. Every number comes from a logged run and a result file in the public results repo, and the examples in §5.12 come from a saved generation file with hash checks.
 
 ## 18. Changelog
 

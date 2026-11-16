@@ -2,6 +2,8 @@
 
 **One-line claim.** A closed-form, gauge-invariant curvature repair undoes the English safety damage of a benign Hindi fine-tune of Tiny Aya Global with no retraining and no task loss. Plain weight interpolation does as well, and we show mathematically and empirically why.
 
+> **PDF version:** [`Safety_Pencil_WRITEUP.pdf`](Safety_Pencil_WRITEUP.pdf). The equations and figures render reliably there; GitHub's Markdown renderer garbles some of the maths.
+>
 > **Content note.** This work evaluates models on harmful prompts (aya_redteaming, in English, Hindi and Hinglish). No harmful completions appear in this write-up or in any released artifact: we store only judge labels and SHA-256 hashes of completions.
 
 ## Tracks and problem statements

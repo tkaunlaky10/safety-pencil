@@ -1,4 +1,5 @@
 # With more credits: a mathematical plan for Safety Pencil v2
+> **PDF version:** [Safety_Pencil_WITH_MORE_CREDITS.pdf](Safety_Pencil_WITH_MORE_CREDITS.pdf). The equations render reliably there.
 
 The first round left five measured failures (§1). This plan answers each with an experiment that has a stated mathematical reason to work, a prediction fixed before running, and a way to be wrong. Section numbers like §5.4 refer to [`WRITEUP.md`](../WRITEUP.md). CPU pilots on a controlled toy model (§1.5; code in [`pilots/`](../pilots/)) have already tested the central claims, and the plan was revised wherever they disagreed with it.
 

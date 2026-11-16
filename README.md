@@ -5,6 +5,8 @@ lens. Lexsi AI Safety and Alignment Hackathon, **Track 2b: AI Safety and Correct
 
 **Team:** Tanay Kulkarni (@tkaunlaky10), Mukund Garg, Abdul Jawad Khan.
 
+**Write-up:** [WRITEUP.md](WRITEUP.md) · [PDF](Safety_Pencil_WRITEUP.pdf) (the maths and figures render best in the PDF).
+
 **Judges, start here:** [`WRITEUP.md`](WRITEUP.md) has a one-minute summary at the top, then the full submission. The results table is in [Results](#results) below; every prediction and every deviation from it is in [`PREREGISTRATION.md`](PREREGISTRATION.md).
 
 > **Research artifact.** Every fine-tuned or repaired checkpoint this code produces is labelled
